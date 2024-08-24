@@ -1,7 +1,7 @@
 """
 Copyright (C) 2024, Amazon.com. All Rights Reserved
 
-RMSNorm NKI Pytorch implementation.
+RMSNorm NKI PyTorch implementation.
 
 """
 

@@ -53,9 +53,7 @@ The [integration tests](tests/integration) folder contains integration tests of 
 and publish end-to-end performance results into the [integration benchmarks](docs/benchmarks/integration) folder.
 
 ## Maintenance Policy
-NKI is currently released as **beta** while we gather feedback from our users and integrate it into the API. We will also be updating the NKI API as needed 
-to support new Neuron and Neuron Compiler features. While NKI is in beta we may need to make backwards-incompatible changes to incorporate feedback from 
-our users or to support new use-cases of NKI on Neuron devices. Upon releasing NKI as generally available (GA), we will commit to [Neuron SDK Maintenance Policy](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/sdk-policy.html).
+NKI is currently released as **beta** while we gather feedback from our users and integrate it into the API. NKI API follow the [Neuron SDK Maintenance Policy](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/sdk-policy.html).
 
 ## Getting Help
 Have a look at the GitHub issues for this repository where you will find past issues customers have encountered with workarounds and clarifications. 

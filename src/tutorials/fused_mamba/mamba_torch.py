@@ -1,7 +1,7 @@
 """
 Copyright (C) 2024, Amazon.com. All Rights Reserved
 
-Mamba-v1 Pytorch Reference Implementation.
+Mamba-v1 PyTorch Reference Implementation.
 
 """
 
@@ -12,7 +12,7 @@ import os
 import argparse
 
 os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
-os.environ["NEURON_CC_FLAGS"]= " --model-type=transformer --disable-internal-io-dge "
+os.environ["NEURON_CC_FLAGS"]= " --model-type=transformer --disable-dge "
 
 
 def associative_scan(deltaA, deltaB_u):
@@ -55,15 +55,15 @@ def mamba_layer(delta, A, B, u, C):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-    """Run Mamba Pytorch implementation. Hard-coded small example only since
-       Pytorch implementation is very slow for larger configs.
+    """Run Mamba PyTorch implementation. Hard-coded small example only since
+       PyTorch implementation is very slow for larger configs.
     """)
     parser.add_argument("--mode",
                         choices=["accuracy", "perf"],
                         default="accuracy",
                         help="""Do accuracy test or perf test.
-                                Accuracy test compares mamba_v1 kernel against Pytorch implementation.
-                                Perf test will generate a NEFF for the Pytorch implementation in local directory
+                                Accuracy test compares mamba_v1 kernel against PyTorch implementation.
+                                Perf test will generate a NEFF for the PyTorch implementation in local directory
                                 for a manual run of neuron-profile.
                              """)
     args = parser.parse_args()

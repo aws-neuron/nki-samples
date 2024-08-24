@@ -62,7 +62,7 @@ if __name__ == "__main__":
     # Compute torch layernorm layer in cpu
     output_torch = layernorm_layer(input_tensor, epsilon, gamma_vector, beta_vector)
 
-    # Copy tensors to neuron device
+    # Copy tensors to NeuronDevice
     input_tensor = input_tensor.to(device=device)
     gamma_vector = gamma_vector.to(device=device)
     beta_vector = beta_vector.to(device=device)
@@ -74,7 +74,7 @@ if __name__ == "__main__":
     # add nki_jit decorator
     nki_layernorm_kernel = nki_jit(func)
 
-    # Compute NKI layernorm kernel in neuron device
+    # Compute NKI layernorm kernel in NeuronDevice
     xm.mark_step()
     nki_layernorm_kernel(input_tensor, epsilon, gamma_vector, beta_vector, output_nki)
     xm.mark_step()

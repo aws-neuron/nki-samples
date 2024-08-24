@@ -77,8 +77,8 @@ if __name__ == "__main__":
 
   allclose = np.allclose(output_np, output_nki, atol=1e-4, rtol=1e-2)
   if allclose:
-    print("NKI and Numpy match")
+    print("NKI and NumPy match")
   else:
-    print("NKI and Numpy differ")
+    print("NKI and NumPy differ")
 
   assert allclose

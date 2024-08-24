@@ -6,7 +6,7 @@ JAX implementation for tensor addition NKI tutorial.
 """
 import jax
 import jax.numpy as jnp
-from neuron_jax import nki_call
+from jax_neuronx import nki_call
 
 from tensor_addition_nki_kernels import nki_tensor_add_kernel_
 

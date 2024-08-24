@@ -248,7 +248,7 @@ def parse_args():
                         default="accuracy",
                         help="""Do accuracy test or perf test.
                                 Accuracy test uses mamba_v1 output as golden reference.
-                                Accuracy of mamba_v1 is tested by mamba_torch.py against native Pytorch implementation.
+                                Accuracy of mamba_v1 is tested by mamba_torch.py against native PyTorch implementation.
                              """)
     parser.add_argument("--version",
             nargs='+',

@@ -7,7 +7,7 @@ RMSNorm NKI JAX implementation.
 
 import jax
 import jax.numpy as jnp
-from neuron_jax import nki_call
+from jax_neuronx import nki_call
 from rmsnorm_nki_kernels import nki_rmsnorm_kernel
 
 # Reference JAX implementation

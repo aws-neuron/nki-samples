@@ -1,7 +1,7 @@
 """
 Copyright (C) 2024, Amazon.com. All Rights Reserved
 
-Pytorch implementation for tensor addition NKI tutorial.
+PyTorch implementation for tensor addition NKI tutorial.
 
 """
 import torch
@@ -30,7 +30,7 @@ def nki_tensor_add(a_input, b_input):
   grid_y = a_input.shape[1] // 512
   c_output = torch.zeros(a_input.shape, dtype=a_input.dtype).to(device=device)
 
-  # Decorate the NKI kernel for Pytorch tracing
+  # Decorate the NKI kernel for PyTorch tracing
   nki_tensor_add_kernel_torch = nki_jit(nki_tensor_add_kernel_)
   nki_tensor_add_kernel_torch[grid_x, grid_y](a_input, b_input, c_output)
 

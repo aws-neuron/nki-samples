@@ -5,7 +5,7 @@ JAX implementation for average pool 2D NKI tutorial.
 
 """
 from functools import partial
-from neuron_jax import nki_call
+from jax_neuronx import nki_call
 import jax
 import jax.numpy as jnp
 

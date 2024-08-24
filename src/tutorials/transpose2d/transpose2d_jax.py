@@ -8,7 +8,7 @@ JAX implementation for transpose2d NKI tutorial.
 import jax
 import jax.numpy as jnp
 from functools import partial
-from neuron_jax import nki_call
+from jax_neuronx import nki_call
 
 from transpose2d_nki_kernels import tensor_transpose2D_kernel_
 

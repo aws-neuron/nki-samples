@@ -1,7 +1,7 @@
 """
 Copyright (C) 2024, Amazon.com. All Rights Reserved
 
-Pytorch implementation for matrix multiplication NKI tutorial.
+PyTorch implementation for matrix multiplication NKI tutorial.
 
 """
 

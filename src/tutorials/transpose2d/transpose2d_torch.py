@@ -1,7 +1,7 @@
 """
 Copyright (C) 2024, Amazon.com. All Rights Reserved
 
-Pytorch implementation for transpose2d NKI tutorial.
+PyTorch implementation for transpose2d NKI tutorial.
 """
 
 import torch
@@ -27,8 +27,8 @@ if __name__ == "__main__":
 
   allclose = torch.allclose(a_t_torch, a_t_nki)
   if allclose:
-    print("NKI and Pytorch match")
+    print("NKI and PyTorch match")
   else:
-    print("NKI and Pytorch differ")
+    print("NKI and PyTorch differ")
 
   assert allclose

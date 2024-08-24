@@ -139,8 +139,8 @@ def parse_args():
                         choices=["accuracy", "perf"],
                         default="accuracy",
                         help="""Do accuracy test or perf test.
-                                Accuracy test compares LayerNorm kernel against Pytorch implementation.
-                                Perf test will generate a NEFF for the Pytorch implementation in local directory
+                                Accuracy test compares LayerNorm kernel against PyTorch implementation.
+                                Perf test will generate a NEFF for the PyTorch implementation in local directory
                                 for a manual run of neuron-profile.
                              """)
     args = parser.parse_args()

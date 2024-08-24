@@ -60,7 +60,7 @@ def tensor_avgpool_kernel_(in_tensor, out_tensor, pool_size):
   nl.store(out_tensor[i_p, i_hout, i_wout], value=out_tile)
 
 
-# Reference Numpy implementation
+# Reference NumPy implementation
 def np_average_pool_2D(in_tensor, pool_size):
   c, h_in, w_in = in_tensor.shape
   reshaped = in_tensor.reshape(c, h_in // pool_size, pool_size, w_in // pool_size, pool_size)
@@ -86,8 +86,8 @@ if __name__ == "__main__":
   match = (out_nki == out_nki).all()
 
   if match:
-    print("NKI and Numpy match")
+    print("NKI and NumPy match")
   else:
-    print("NKI and Numpy differ")
+    print("NKI and NumPy differ")
 
   assert match
