@@ -1,0 +1,3 @@
+neuronx_distributed==0.9.0
+transformers==4.40.0
+sentencepiece
