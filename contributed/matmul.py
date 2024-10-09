@@ -1,86 +1,131 @@
-from neuronxcc.nki import baremetal, benchmark
+from neuronxcc import nki
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as ni
 import numpy as np
 
-@benchmark(save_neff_name='file.neff', save_trace_name='profile.ntff', additional_compile_opt=' --disable-internal-io-dge ')
-def matmul(A_DRAM, B_DRAM, O_DRAM, K2, K1, K0, M2, M1, M0, N2, N1, N0):
-  for n2 in nl.affine_range(N2):
-    for m2 in nl.affine_range(M2):
+def matmul(A_DRAM, B_DRAM, Z_DRAM):
+  """
+  Optimized matrix multiplication kernel
 
-      O_SBUF = nl.zeros((M1, nl.par_dim(M0), N1 * N0), dtype=O_DRAM.dtype, buffer=nl.sbuf)
+   Args:
 
-      for k2 in nl.affine_range(K2):
-        A_SBUF = nl.ndarray((K1, nl.par_dim(K0), M1 * M0), dtype=A_DRAM.dtype, buffer=nl.sbuf)
-        B_SBUF = nl.ndarray((K1, nl.par_dim(K0), N1 * N0), dtype=B_DRAM.dtype, buffer=nl.sbuf)
+      A_DRAM: an input tensor of shape [K, M], where K is a multiple of 1024
+      and M is a multiple of 512.  It is the left-hand-side argument of the
+      matrix multiplication, delivered transposed for optimal performance.
 
-        for k1 in nl.affine_range(K1):
-          k_start = k2 * K1 * K0 + k1 * K0
-          k_end = k_start + K0
+      B_DRAM: an input tensor of shape [K, N],  where K is a multiple of 1024
+        and N is a multiple of 2048.  It is the right-hand-side argument of
+        the matrix multiplication.
 
-          m_start = m2 * M1 * M0
-          m_end = m_start + M1 * M0
+      result: the resulting output tensor of shape [M, N]
 
-          n_start = n2 * N1 * N0
-          n_end = n_start + N1 * N0
+  """
+  K, M = A_DRAM.shape
+  _, N = B_DRAM.shape
 
+  TILE_K = nl.tile_size.pmax
+  TILE_M = nl.tile_size.gemm_stationary_fmax
+  TILE_N = nl.tile_size.gemm_moving_fmax
+
+  TILES_IN_BLOCK_M = 4
+  TILES_IN_BLOCK_N = 4
+  TILES_IN_BLOCK_K = 8
+
+  NUM_BLOCK_K = K // (TILES_IN_BLOCK_K * TILE_K)
+  NUM_BLOCK_M = M // (TILES_IN_BLOCK_M * TILE_M)
+  NUM_BLOCK_N = N // (TILES_IN_BLOCK_N * TILE_N)
+
+  assert NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K == K
+  assert NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M == M
+  assert NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N == N
+
+  for n2 in nl.affine_range(NUM_BLOCK_N):
+    for m2 in nl.affine_range(NUM_BLOCK_M):
+
+      # Partition Z and then ensure that we are Z-block stationary
+      # This way, no matter how large K, M, and N are, Z is never spilled/loaded
+      # We only need to store once
+      Z_SBUF = nl.zeros((TILES_IN_BLOCK_M, nl.par_dim(TILE_M), TILES_IN_BLOCK_N * TILE_N), dtype=Z_DRAM.dtype, buffer=nl.sbuf)
+
+      for k2 in nl.affine_range(NUM_BLOCK_K):
+        A_SBUF = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_M * TILE_M), dtype=A_DRAM.dtype, buffer=nl.sbuf)
+        B_SBUF = nl.ndarray((TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_N * TILE_N), dtype=B_DRAM.dtype, buffer=nl.sbuf)
+
+        # Load in a block of A and a block of B
+        for k1 in nl.affine_range(TILES_IN_BLOCK_K):
+          k_start = k2 * TILES_IN_BLOCK_K * TILE_K + k1 * TILE_K
+          k_end = k_start + TILE_K
+
+          m_start = m2 * TILES_IN_BLOCK_M * TILE_M
+          m_end = m_start + TILES_IN_BLOCK_M * TILE_M
+
+          n_start = n2 * TILES_IN_BLOCK_N * TILE_N
+          n_end = n_start + TILES_IN_BLOCK_N * TILE_N
+
+          # We coalesce memory accesses by loading TILES_IN_BLOCK_M * TILE_M
+          # values of A at a time. We cannot coalesce across K because K gets
+          # split across the partition dimension
           A_SBUF[k1] = nl.load(A_DRAM[k_start:k_end, m_start:m_end])
+
+          # We coalesce memory accesses by loading TILES_IN_BLOCK_N * TILE_N
+          # values of B at a time. We cannot coalesce across K because K gets
+          # split across the partition dimension
           B_SBUF[k1] = nl.load(B_DRAM[k_start:k_end, n_start:n_end])
 
-        for m1 in nl.affine_range(M1):
-          for n1 in nl.affine_range(N1):
-            PO_PSUM = nl.zeros((M0, N0), dtype=nl.float32, buffer=nl.psum)
+        for m1 in nl.affine_range(TILES_IN_BLOCK_M):
+          for n1 in nl.affine_range(TILES_IN_BLOCK_N):
+            # Keep the tile of Z stationary in the PSUM buffer to minimize the
+            # number of calls to nl.loop_reduce
+            Z_PSUM = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-            m_start = m1 * M0
-            m_end = m_start + M0
+            m_start = m1 * TILE_M
+            m_end = m_start + TILE_M
 
-            n_start = n1 * N0
-            n_end = n_start + N0
+            n_start = n1 * TILE_N
+            n_end = n_start + TILE_N
 
-            for k1 in nl.affine_range(K1):
-              PO_PSUM += ni.nc_matmul(A_SBUF[k1, :, m_start:m_end], B_SBUF[k1, :, n_start:n_end])
+            for k1 in nl.affine_range(TILES_IN_BLOCK_K):
+              Z_PSUM += ni.nc_matmul(A_SBUF[k1, :, m_start:m_end], B_SBUF[k1, :, n_start:n_end])
 
-            O_SBUF[m1, :, n_start:n_end] = nl.loop_reduce(PO_PSUM, op=np.add, loop_indices=[k2], dtype=O_DRAM.dtype)
+            Z_SBUF[m1, :, n_start:n_end] = nl.loop_reduce(Z_PSUM, op=np.add, loop_indices=[k2], dtype=Z_DRAM.dtype)
 
-      for m1 in nl.affine_range(M1):
-        m_start = m2 * M1 * M0 + m1 * M0
-        m_end = m_start + M0
+      for m1 in nl.affine_range(TILES_IN_BLOCK_M):
+        m_start = m2 * TILES_IN_BLOCK_M * TILE_M + m1 * TILE_M
+        m_end = m_start + TILE_M
 
-        n_start = n2 * N1 * N0
-        n_end = n_start + N1 * N0
+        n_start = n2 * TILES_IN_BLOCK_N * TILE_N
+        n_end = n_start + TILES_IN_BLOCK_N * TILE_N
 
-        nl.store(O_DRAM[m_start:m_end, n_start:n_end], value=O_SBUF[m1])
+        # We coalesce memory accesses by storing TILES_IN_BLOCK_N * TILE_N
+        # values of Z at a time. We cannot coalesce across M because M gets
+        # split across the partition dimension
+        nl.store(Z_DRAM[m_start:m_end, n_start:n_end], value=Z_SBUF[m1])
 
-def launch():
-  K, M, N = (8192, 4096, 8192)
-
-  K0 = 128
-  M0 = 128
-  N0 = 512
-
-  M1 = 4
-  N1 = 4
-  K1 = 8
-
-  K2 = K // (K1 * K0)
-  M2 = M // (M1 * M0)
-  N2 = N // (N1 * N0)
-
-  assert K2 * K1 * K0 == K
-  assert M2 * M1 * M0 == M
-  assert N2 * N1 * N0 == N
-
+def check_correct():
+  K, M, N = 1024, 4096, 2048
   A = np.random.random_sample([K, M]).astype(np.float16)
   B = np.random.random_sample([K, N]).astype(np.float16)
-  O = np.ndarray(shape=[M, N], dtype=np.float16)
+  Z = np.ndarray(shape=[M, N], dtype=np.float16)
 
-  matmul(A, B, O, K2, K1, K0, M2, M1, M0, N2, N1, N0)
+  baremetal_func = nki.baremetal()(matmul)
+  baremetal_func(A, B, Z)
 
-  return A, B, O
+  Z_corr = A.T @ B
+
+  print("Is close?", np.all(np.isclose(Z, Z_corr, atol=1e-4, rtol=1e-2)))
+
+def benchmark_kernel():
+  K, M, N = 8192, 4096, 8192
+  A = np.random.random_sample([K, M]).astype(np.float16)
+  B = np.random.random_sample([K, N]).astype(np.float16)
+  Z = np.ndarray(shape=[M, N], dtype=np.float16)
+
+  benchmark_func = nki.benchmark(warmup=5, iters=10)(matmul)
+  benchmark_func(A, B, Z)
 
 def main():
-  A, B, O = launch()
-  print(O[0, 0])
+  check_correct()
+  benchmark_kernel()
 
 if __name__ == "__main__":
   main()
