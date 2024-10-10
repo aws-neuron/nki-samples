@@ -3,7 +3,7 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as ni
 import numpy as np
 
-def matmul(A_DRAM, B_DRAM, Z_DRAM):
+def matmul(A_DRAM, B_DRAM, Z_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4):
   """
   Optimized matrix multiplication kernel
 
@@ -17,7 +17,7 @@ def matmul(A_DRAM, B_DRAM, Z_DRAM):
         and N is a multiple of 2048.  It is the right-hand-side argument of
         the matrix multiplication.
 
-      result: the resulting output tensor of shape [M, N]
+      Z_DRAM: the resulting output tensor of shape [M, N]
 
   """
   K, M = A_DRAM.shape
@@ -26,10 +26,6 @@ def matmul(A_DRAM, B_DRAM, Z_DRAM):
   TILE_K = nl.tile_size.pmax
   TILE_M = nl.tile_size.gemm_stationary_fmax
   TILE_N = nl.tile_size.gemm_moving_fmax
-
-  TILES_IN_BLOCK_M = 4
-  TILES_IN_BLOCK_N = 4
-  TILES_IN_BLOCK_K = 8
 
   NUM_BLOCK_K = K // (TILES_IN_BLOCK_K * TILE_K)
   NUM_BLOCK_M = M // (TILES_IN_BLOCK_M * TILE_M)
