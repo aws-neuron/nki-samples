@@ -1,0 +1,140 @@
+name: Update repository labels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      LABELS: |
+        [
+        {
+            "name": "bug",
+            "color": "d73a4a",
+            "description": "This is a bug report"
+        },
+        {
+            "name": "feature-request",
+            "color": 8672,
+            "description": "This is regarding a missing feature"
+        },
+        {
+            "name": "documentation",
+            "color": "f7bc35",
+            "description": "This is a problem with published documentation"
+        },
+        {
+            "name": "announcement",
+            "color": "ff9900",
+            "description": "This is an announcement issue"
+        },
+        {
+            "name": "automation-exempt",
+            "color": "c5def5"
+        },
+        {
+            "name": "blocked",
+            "color": "86499b",
+            "description": "Work on this issue is blocked"
+        },
+        {
+            "name": "closed-for-staleness",
+            "color": "ededed",
+            "description": "This issue was closed due to inactivity"
+        },
+        {
+            "name": "closing-soon",
+            "color": 0,
+            "description": "This issue will close soon unless further comments are made"
+        },
+        {
+            "name": "duplicate",
+            "color": "cfd3d7",
+            "description": "This issue or pull request already exists"
+        },
+        {
+            "name": "investigating",
+            "color": "0000ff",
+            "description": "This issue is under investigation"
+        },
+        {
+            "name": "needs-review",
+            "color": "f996e2",
+            "description": "This issue needs to be reviewed by a core team member"
+        },
+        {
+            "name": "needs-triage",
+            "color": "c7cafc",
+            "description": "This issue has not yet been looked at by the team"
+        },
+        {
+            "name": "p0",
+            "color": "ff0000",
+            "description": "This issue is of the highest priority"
+        },
+        {
+            "name": "p1",
+            "color": "ff4500",
+            "description": "This is a high priority issue"
+        },
+        {
+            "name": "p2",
+            "color": "ff8c00",
+            "description": "This is a standard priority issue"
+        },
+        {
+            "name": "p3",
+            "color": "f5deb3",
+            "description": "This is a low priority issue"
+        },
+        {
+            "name": "potential-regression",
+            "color": "ff6700",
+            "description": "This issue may be a regression"
+        },
+        {
+            "name": "queued",
+            "color": "c6c8c6",
+            "description": "This issue is in our backlog"
+        },
+        {
+            "name": "service-api",
+            "color": "e06a18",
+            "description": "This issue is related to the service API"
+        },
+        {
+            "name": "needs-reproduction",
+            "color": "0052cc",
+            "description": "This issue needs reproduction steps or further work to reproduce"
+        },
+        {
+            "name": "no-pr-activity",
+            "color": "f7c6c7",
+            "description": "This pull request has not received recent activity"
+        }
+        ]
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = JSON.parse(process.env.LABELS);
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                  description: label.description || '',
+                  color: label.color
+                });
+              } catch (error) {
+                if (error.status === 422) {
+                  core.info(`Label "${label.name}" already exists`);
+                } else {
+                  core.warning(`Failed to create label "${label.name}": ${error.message}`);
+                }
+              }
+            }

@@ -1,0 +1,38 @@
+name: 'Close stale issues'
+on:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    name: Stale issue cleanup
+    steps:
+      - uses: aws-actions/stale-issue-cleanup@v6
+        with:
+          issue-types: 'issues,pull_requests'
+          ancient-issue-message: >
+            This issue has been automatically closed due to inactivity. If you
+            believe this was closed in error, please create a new issue and
+            link to this auto-closed issue. Thank you.
+          stale-issue-message: >
+            This issue has not received a response in one week. If you wish to
+            keep this open, please leave a comment and auto-close will be
+            cancelled.
+          stale-pr-message: >
+            This pull request has not received a response in one week. If you
+            wish to keep this open, please leave a comment and auto-close will
+            be cancelled.
+          stale-issue-label: closing-soon
+          exempt-issue-labels: automation-exempt
+          stale-pr-label: no-pr-activity
+          response-requested-label: response-requested
+          closed-for-staleness-label: closed-for-staleness
+          days-before-stale: 10
+          days-before-close: 4
+          days-before-ancient: 36500
+          minimum-upvotes-to-exempt: 2
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          use-created-date-for-ancient: false
+          dry-run: false
+          #loglevel: debug
