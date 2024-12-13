@@ -5,9 +5,14 @@ kernels - Builtin high performance NKI kernels used in tutorial
 
 """
 
+from neuronxcc import nki
 import neuronxcc.nki.language as nl
 
-def add_kernel_nx8x128x512(a_ptr, b_ptr, c_ptr, n_elements):
+
+@nki.jit
+def add_kernel_nx8x128x512(a_ptr, b_ptr, n_elements):
+  c_ptr = nl.ndarray(a_ptr.shape, dtype=a_ptr.dtype, buffer=nl.shared_hbm)
+
   ix = nl.arange(128)[:, None]
   iy = nl.arange(512)[None, :]
 
@@ -18,12 +23,9 @@ def add_kernel_nx8x128x512(a_ptr, b_ptr, c_ptr, n_elements):
 
   for i in nl.affine_range(8):
     offset = j * block_size + i * tile_size + 512 * ix + iy
-    mask = offset < n_elements
-    a_ptr = a_ptr.ptr + offset
-    b_ptr = b_ptr.ptr + offset
-    c_ptr = c_ptr.ptr + offset
+    a = nl.load(a_ptr[j, i, ix, iy], mask=offset < n_elements)
+    b = nl.load(b_ptr[j, i, ix, iy], mask=offset < n_elements)
+    c = nl.add(a, b, mask=offset < n_elements)
+    nl.store(c_ptr[j, i, ix, iy], value=c, mask=offset < n_elements)
 
-    a = nl.load(a_ptr, mask=mask)
-    b = nl.load(b_ptr, mask=mask)
-    c = a + b
-    nl.store(c_ptr, value=c, mask=mask)
+  return c_ptr

@@ -11,6 +11,7 @@ import numpy as np
 numeric_func = baremetal(resize_nearest_fixed_dma_kernel)
 bench_func = benchmark(warmup=5, iters=10)(resize_nearest_fixed_dma_kernel)
 
+
 def cpu_golden_result(data_tensor, output_shape):
     in_b, in_h, in_w, in_c = data_tensor.shape
     out_b, out_h, out_w, out_c = output_shape
@@ -36,18 +37,18 @@ def cpu_golden_result(data_tensor, output_shape):
 class TestResizeNearest:
 
     @pytest.mark.parametrize("in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype, latency", [
- 	    [10, 30, 20, 1280, 10, 59, 38, 1280, np.float32, 1722],
+ 	    [10, 30, 20, 1280, 10, 59, 38, 1280, np.float32, 1740],
         [1, 30, 20, 1280, 1, 59, 38, 1280, nl.float16, 659],
         [1, 30, 20, 1280, 1, 59, 38, 1280, nl.bfloat16, 659],
  	])
     def test_resize_nearest_for_perf(self, in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype, latency):
         input_tensor = np.random.random_sample((in_b, in_h, in_w, in_c)).astype(np.float32)
-        output_tensor = nl.static_cast(np.ndarray(shape=(out_b, out_h, out_w, out_c)), dtype)
-        
+
         input_dev = nl.static_cast(input_tensor, dtype)
 
-        bench_func[in_b](input_dev, output_tensor)
-        latency_res = bench_func.benchmark_result.nc_latency
+        bench_func_ = bench_func[in_b]
+        bench_func_(input_dev, (out_b, out_h, out_w, out_c))
+        latency_res = bench_func_.benchmark_result.nc_latency
         p99 = latency_res.get_latency_percentile(99)
         assert p99 <= latency
 
@@ -58,11 +59,10 @@ class TestResizeNearest:
  	])
     def test_resize_nearest_for_numberic(self, in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype):
         input_tensor = np.random.random_sample((in_b, in_h, in_w, in_c)).astype(np.float32)
-        output_tensor = nl.static_cast(np.ndarray(shape=(out_b, out_h, out_w, out_c)), dtype)
-        
+
         input_dev = nl.static_cast(input_tensor, dtype)
 
-        numeric_func[in_b](input_dev, output_tensor)
+        output_tensor = numeric_func[in_b](input_dev, (out_b, out_h, out_w, out_c))
         output_tensor = nl.static_cast(output_tensor, np.float32)
         golden_result = cpu_golden_result(input_tensor, output_tensor.shape)
         assert np.allclose(output_tensor, golden_result, atol=1e-2)

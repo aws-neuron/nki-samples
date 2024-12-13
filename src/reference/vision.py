@@ -8,10 +8,13 @@ import numpy as np
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
+from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 import neuronxcc.nki.typing as nt
 
-def select_and_scatter_kernel(operand_tensor, source_tensor, out_tensor):
+
+@nki.jit
+def select_and_scatter_kernel(operand_tensor, source_tensor):
   """
   Implementation of a select-and-scatter kernel.
 
@@ -51,7 +54,10 @@ def select_and_scatter_kernel(operand_tensor, source_tensor, out_tensor):
   assert C == 64 and N % 2 == 0
 
   kernel_dtype = operand_tensor.dtype
-  assert operand_tensor.dtype == source_tensor.dtype == out_tensor.dtype
+  assert operand_tensor.dtype == source_tensor.dtype
+
+  out_tensor = nl.ndarray((N, C, H, W), dtype=operand_tensor.dtype,
+                          buffer=nl.shared_hbm)
 
   p = 128  # num of partitions to use
   for ib in nl.affine_range(N // 2):
@@ -156,8 +162,11 @@ def select_and_scatter_kernel(operand_tensor, source_tensor, out_tensor):
       nl.store(out_tensor[2 * ib + ib_1, 0:64, 0:H, 0:W],
                value=out_local[(ib_1 * 64):((ib_1 + 1) * 64), 0:H, 0:W])
 
+  return out_tensor
 
-def resize_nearest_fixed_dma_kernel(data_tensor, out_tensor):
+
+@nki.jit
+def resize_nearest_fixed_dma_kernel(data_tensor, out_shape):
   """
   Resize the input image to the given size using the nearest interpolation mode. This kernel is designed to be used when the scaling factor is not an integer. 
 
@@ -174,7 +183,9 @@ def resize_nearest_fixed_dma_kernel(data_tensor, out_tensor):
   
   """
   in_b, in_h, in_w, in_c = data_tensor.shape
-  out_b, out_h, out_w, out_c = out_tensor.shape
+  out_b, out_h, out_w, out_c = out_shape
+  out_tensor = nl.ndarray(out_shape, dtype=data_tensor.dtype,
+                          buffer=nl.shared_hbm)
 
   assert in_b == out_b, "Input batch and output batch must be identical"
   assert in_c == out_c, "Input channel and output channel must be identical"
@@ -198,3 +209,5 @@ def resize_nearest_fixed_dma_kernel(data_tensor, out_tensor):
     local_data = nl.load(target_addr)
     dst_addr_0 = out_tile[b_map, i, c_map]
     nl.store(dst_addr_0, value=local_data)
+
+  return out_tensor

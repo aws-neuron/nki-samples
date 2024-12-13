@@ -6,12 +6,23 @@ kernels - Builtin high performance attention kernels
 """
 import numpy as np
 
-from neuronxcc.nki import trace
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
+from neuronxcc import nki
 
 from neuronxcc.nki.language import par_dim
 from dataclasses import dataclass
+from functools import reduce as functools_reduce
+from operator import mul as operator_mul
+
+def n_elts(shape):
+  return functools_reduce(operator_mul, shape, 1)
+
+
+def linearize(shape, indices):
+  return sum(i * (n_elts(shape[dim + 1:]))
+             for dim, i in enumerate(indices))
+
 
 def div_ceil(n, d):
   return (n + d - 1) // d
@@ -31,9 +42,8 @@ class FlashConfig:
     'should_transpose_v': bool
   }
 
-@trace
 def _flash_attention_core(q_local_tile, k, v,
-                          q_h_per_k_h,
+                          q_h_per_k_h, seqlen_q, nheads,
                           o_buffer, l_buffer, m_buffer,
                           batch_id, head_id, gqa_head_idx, q_tile_idx,
                           local_k_large_tile_idx,
@@ -48,7 +58,7 @@ def _flash_attention_core(q_local_tile, k, v,
   """
   The flash attention core function to calcualte self attention between a tile of q and a block of K and V.
   The q_local_tile has (B_P_SIZE, B_F_SIZE), which is loaded into the SBUF already. The block size of K and V
-  is defined in the seq_tile_size of the flash_config. The results are stored in the following there buffers
+  is defined in the seq_tile_size of the flash_config. The results are stored in the following three buffers
   o_buffer: (num_large_k_tile, B_P_SIZE, d)
   l_buffer: (num_large_k_tile, B_P_SIZE, 1)
   m_buffer: (num_large_k_tile, B_P_SIZE, 1)
@@ -56,8 +66,9 @@ def _flash_attention_core(q_local_tile, k, v,
   LARGE_TILE_SZ = flash_config.seq_tile_size
   REDUCTION_TILE = min(2048, LARGE_TILE_SZ // 2)
   num_k_tile_per_large_tile = LARGE_TILE_SZ // B_F_SIZE
-  seq_len = k.shape[-1]
-  seq_q_num_tiles = seq_len // B_P_SIZE
+  seqlen_k = k.shape[-1]
+  seq_q_num_tiles = seqlen_q // B_P_SIZE
+  seq_k_num_tiles = seqlen_k // B_F_SIZE
 
   # Indices used by the distributed attention
   if global_k_large_tile_idx is None:
@@ -100,7 +111,7 @@ def _flash_attention_core(q_local_tile, k, v,
       q_pos = q_tile_idx * B_P_SIZE + i_q_p
       k_pos = global_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
       pred = q_pos >= k_pos
-      # For tiles on and on the right of the diagonal, need to do affine_select.
+      # For tiles on and to the right of the diagonal, need to do affine_select.
       # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
       qk_res_buf[i_q_p, k_i * B_F_SIZE + i_q_f] = nisa.affine_select(
         pred=pred,
@@ -154,9 +165,9 @@ def _flash_attention_core(q_local_tile, k, v,
       for k_d_i in nl.sequential_range(REDUCTION_TILE // B_F_SIZE):
         offset = k_d_i + k_r_i * (REDUCTION_TILE // B_F_SIZE) \
                   + global_k_large_tile_idx * (LARGE_TILE_SZ // B_F_SIZE) \
-                  + q_tile_idx * (seq_len // B_F_SIZE) \
-                  + (head_id * q_h_per_k_h + gqa_head_idx) * (seq_len // B_F_SIZE) * seq_q_num_tiles \
-                  + batch_id * nl.num_programs(1) * (seq_len // B_F_SIZE) * seq_q_num_tiles
+                  + q_tile_idx * seq_k_num_tiles \
+                  + (head_id * q_h_per_k_h + gqa_head_idx) * seq_k_num_tiles * seq_q_num_tiles \
+                  + batch_id * nheads * seq_k_num_tiles * seq_q_num_tiles
         offset_seed = nl.add(seed_tensor[0, 0], offset, mask=forward_mask)
         nl.random_seed(seed=offset_seed, mask=forward_mask)
         softmax_dropout = nl.dropout(p_local[i_q_p, k_r_i * REDUCTION_TILE + k_d_i * B_F_SIZE + i_q_f],
@@ -172,9 +183,9 @@ def _flash_attention_core(q_local_tile, k, v,
   for i_p_t in nl.affine_range(LARGE_TILE_SZ // 512):
     p_local_t_tmp = nl.ndarray((par_dim(B_P_SIZE), 512), buffer=nl.psum, dtype=np.float32)
     for i_p_t_local in nl.affine_range(512//128):
-      p_local_t_tmp[i_q_p, i_p_t_local*128 + i_f_128] = nisa.nc_transpose(p_local[i_q_p, i_p_t*512+i_p_t_local * B_P_SIZE + i_f_128])
+      p_local_t_tmp[i_q_p, i_p_t_local*128 + i_f_128] = nisa.nc_transpose(p_local[i_q_p, i_p_t*512+i_p_t_local * B_P_SIZE + i_f_128], mask=forward_mask)
     i_f_512 = nl.arange(512)[None, :]
-    p_local_transposed[i_q_p, i_p_t * 512 + i_f_512 ] = nl.copy(p_local_t_tmp[i_q_p, i_f_512], dtype=kernel_dtype)
+    p_local_transposed[i_q_p, i_p_t * 512 + i_f_512 ] = nl.copy(p_local_t_tmp[i_q_p, i_f_512], dtype=kernel_dtype, mask=forward_mask)
 
   ps = nl.sum(p_partial_sum, axis=1, dtype=acc_type, mask=forward_mask)
   pv_psum = nl.zeros((par_dim(B_P_SIZE), B_D_SIZE), dtype=np.float32, buffer=nl.psum)
@@ -199,7 +210,8 @@ def _flash_attention_core(q_local_tile, k, v,
       l_buffer[olm_buffer_idx, i_q_p, 0] = nl.copy(l_buffer[olm_buffer_idx-1, i_q_p, 0], mask=negation_mask)
 
 
-def flash_fwd(q, k, v, seed, o, lse=None,
+@nki.jit
+def flash_fwd(q, k, v, seed,
               softmax_scale=None,
               use_causal_mask=True,
               mixed_precision=True,
@@ -213,8 +225,8 @@ def flash_fwd(q, k, v, seed, o, lse=None,
     - v: shape   (bs, nv_heads, d, seq_v) if config.should_transpose_v  else (bs, nv_heads, seq_v, d)
     - seed: shape (1,)
     - o: shape (bs, n_heads, seq_q, d)
-    - lse: shape (bs, nheads, nl.tile_size.pmax, seq // nl.tile_size.pmax) if training else None
-    - We use seq_q and seq_k just for clarity, this kernel requires seq_q == seq_k
+    - lse: shape (bs, n_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax) if training else None
+    - This kernel requires seq_k == seq_v
 
   IO tensor dtypes:
     - This kernel assumes all IO tensors have the same dtype
@@ -246,36 +258,48 @@ def flash_fwd(q, k, v, seed, o, lse=None,
   config = config or FlashConfig()
   B_F_SIZE=512
   B_P_SIZE=128
-  b , h, d, n  = q.shape
+  b, h, d, seqlen_q  = q.shape
   B_D_SIZE = d
-  k_h = k.shape[1]
-  v_shape = v.shape
+  _, k_h, _, seqlen_k = k.shape
   if config.should_transpose_v:
-    assert tuple(v_shape) == (b, k_h, d, n), f"V shape does not match layout requirements, expect: {(b, k_h, d, n)} but got {v_shape}"
-    assert tuple(k.shape) == (b, k_h, d, n), f" k and v shape does not match the layout defined in the function, but got {k.shape}"
+    assert tuple(v.shape) == (b, k_h, d, seqlen_k), f"Expect shape of V to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {v.shape}"
+    assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
   else:
-    assert tuple(v_shape) == (b, k_h, n, d), f"V shape does not match layout requirements, expect: {(b, k_h, n, d)} but got {v_shape}"
-    assert tuple(k.shape) == (b,k_h, d, n), f" k and v shape does not match the layout defined in the function, but got {k.shape}"
+    assert tuple(v.shape) == (b, k_h, seqlen_k, d), f"Expect shape of V to be {(b, k_h, seqlen_k, d)} (batch, heads, seqlen_k, d_head) but got {v.shape}"
+    assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
   assert d <= 128, f" we do not support head_dim > 128, got head dim {d}"
   kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
-  acc_type =  np.dtype(np.float32) if mixed_precision else kernel_dtype
+  acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
+
+  o = nl.ndarray((b, h, seqlen_q, d), dtype=q.dtype, buffer=nl.shared_hbm)
+  if config.training:
+    lse = nl.ndarray((b, h, nl.tile_size.pmax, seqlen_q // nl.tile_size.pmax),
+                     dtype=acc_type, buffer=nl.shared_hbm)
+  else:
+    lse = None
 
   i_q_p = nl.arange(B_P_SIZE)[:,None]
   i_0_f = nl.arange(1)[None, :]
-  n_tile_q = n//B_P_SIZE # since q will be loaded on PE
 
   batch_id = nl.program_id(axis=0)
-  head_id = nl.program_id(axis=1)
+
+  head_dims = list(range(1, nl.program_ndim()))
+  head_dims_shape = list(nl.num_programs(i) for i in head_dims)
+  head_dims_idx = list(nl.program_id(i) for i in head_dims)
+  head_id = linearize(head_dims_shape, head_dims_idx)
+
   softmax_scale = softmax_scale or (1.0 / (d ** 0.5))
+
+  n_tile_q = seqlen_q // B_P_SIZE # since q will be loaded on tensor engine
 
   LARGE_TILE_SZ = config.seq_tile_size
   # FIXME: Add masking for different seqlen values.
   assert config.seq_tile_size >= 512, f" seq tile_size {config.seq_tile_size} cannot be less than 512"
-  assert n % LARGE_TILE_SZ == 0, f"seqlen is not divisible by {LARGE_TILE_SZ}"
-  num_large_k_tile = n // LARGE_TILE_SZ
+  assert seqlen_k % LARGE_TILE_SZ == 0, f"Need seqlen_k to be divisible by {LARGE_TILE_SZ} but got {seqlen_k}"
+  num_large_k_tile = seqlen_k // LARGE_TILE_SZ
 
   # inference flag, check if lse is none
-  inference = not(config.training)
+  inference = not config.training
   if inference:
     assert lse is None, "lse should be none for inference"
     assert seed is None, f"seed should be None for inference, but got {seed}"
@@ -331,11 +355,13 @@ def flash_fwd(q, k, v, seed, o, lse=None,
       i_f_d = nl.arange(B_D_SIZE)[None, :]
       i_p_d = nl.arange(B_D_SIZE)[:,None]
       q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
-      q_tile[i_p_d, i_f_128] = nl.load(q[batch_id, head_id * q_h_per_k_h + i_q_h, i_p_d, i*B_P_SIZE+i_f_128], dtype=kernel_dtype) \
-                                * softmax_scale # load (d, 128) tile in SBUF
+      q_tile[i_p_d, i_f_128] = nl.load(q[batch_id,
+                                        head_id * q_h_per_k_h + i_q_h, i_p_d,
+                                        i * B_P_SIZE + i_f_128],
+                                      dtype=kernel_dtype) * softmax_scale # load (d, 128) tile in SBUF
       # handle first tile and compute max and lse explicitly by passing initialize=True
       _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
-                            q_h_per_k_h=q_h_per_k_h,
+                            q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
                             o_buffer=o_buffer[i], l_buffer=l_buffer[i], m_buffer=m_buffer[i],
                             batch_id=batch_id, head_id=head_id,
                             gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=0,
@@ -376,10 +402,12 @@ def flash_fwd(q, k, v, seed, o, lse=None,
         i_f_d = nl.arange(B_D_SIZE)[None, :]
         i_p_d = nl.arange(B_D_SIZE)[:,None]
         q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
-        q_tile[i_p_d, i_f_128] = nl.load(q[batch_id, head_id * q_h_per_k_h + i_q_h, i_p_d, i*B_P_SIZE+i_f_128], dtype=kernel_dtype) \
-                                  * softmax_scale # load (d, 128) tile in SBUF
+        q_tile[i_p_d, i_f_128] = nl.load(q[batch_id,
+                head_id * q_h_per_k_h + i_q_h, i_p_d,
+                i * B_P_SIZE + i_f_128],
+              dtype=kernel_dtype) * softmax_scale # load (d, 128) tile in SBUF
         _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
-                              q_h_per_k_h=q_h_per_k_h,
+                              q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
                               o_buffer=o_buffer[i], l_buffer=l_buffer[i], m_buffer=m_buffer[i],
                               batch_id=batch_id, head_id=head_id,
                               gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=j,
@@ -396,19 +424,23 @@ def flash_fwd(q, k, v, seed, o, lse=None,
                                       nl.exp(m_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f] - l_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f]),
                                       dtype=kernel_dtype)
 
-      nl.store(o[batch_id, head_id * q_h_per_k_h + i_q_h, i * B_P_SIZE + i_q_p, i_f_d], out[i_q_p, i_f_d])
+      nl.store(o[batch_id, head_id * q_h_per_k_h + i_q_h, i*B_P_SIZE + i_q_p, i_f_d], out[i_q_p, i_f_d])
       if not inference:
         lse_local = nl.zeros((par_dim(B_P_SIZE), 1), dtype=acc_type)
         lse_local[i_q_p, i_0_f] = nl.copy(l_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f], dtype=acc_type)
         nl.store(lse[batch_id, head_id * q_h_per_k_h + i_q_h, i_q_p, i + i_0_f], lse_local[i_q_p, i_0_f])
 
+  if config.training:
+    return o, lse
 
+  return o
+
+@nki.jit
 def flash_attn_bwd(
   q_ref, k_ref, v_ref, o_ref,
   dy_ref,
   lse_ref,
   seed_ref,
-  out_dq_ref, out_dk_ref, out_dv_ref,
   use_causal_mask=False,
   mixed_precision=False,
   dropout_p=0.0,
@@ -454,56 +486,60 @@ def flash_attn_bwd(
   kernel_dtype = q_ref.dtype
   mixed_dtype = np.dtype(np.float32) if mixed_precision else kernel_dtype
 
-  assert q_ref.dtype == k_ref.dtype == v_ref.dtype == o_ref.dtype == dy_ref.dtype \
-         == out_dq_ref.dtype == out_dk_ref.dtype == out_dv_ref.dtype
+  assert q_ref.dtype == k_ref.dtype == v_ref.dtype == o_ref.dtype == dy_ref.dtype
   assert lse_ref.dtype == mixed_dtype
 
   # Shape checking
-  bs, nheads, d_head, seqlen = q_ref.shape
-  assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen), \
+  bs, nheads, d_head, seqlen_q = q_ref.shape
+  _, _, _, seqlen_k = k_ref.shape
+  assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen_k), \
     f"Input K shape mismatch, got {k_ref.shape}"
-  assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen), \
+  assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen_k), \
     f"Input V shape mismatch, got {v_ref.shape}"
-  assert tuple(o_ref.shape) == (bs, nheads, d_head, seqlen), \
+  assert tuple(o_ref.shape) == (bs, nheads, d_head, seqlen_q), \
     f"Input o shape mismatch, got {o_ref.shape}"
-  assert tuple(dy_ref.shape) == (bs, nheads, d_head, seqlen), \
+  assert tuple(dy_ref.shape) == (bs, nheads, d_head, seqlen_q), \
     f"Input dy shape mismatch, got {dy_ref.shape}"
-  assert tuple(lse_ref.shape) == (bs, nheads, nl.tile_size.pmax, seqlen // nl.tile_size.pmax), \
+  assert tuple(lse_ref.shape) == (bs, nheads, nl.tile_size.pmax, seqlen_q // nl.tile_size.pmax), \
     f"Input lse shape mismatch, got {lse_ref.shape}"
   if seed_ref is not None:
     assert tuple(seed_ref.shape) == (1,), \
       f"Input seed shape mismatch, got {seed_ref.shape}"
 
-  assert tuple(out_dq_ref.shape) == (bs, nheads, d_head, seqlen), \
-    f"Output dQ shape mismatch, got {out_dq_ref.shape}"
-  assert tuple(out_dk_ref.shape) == (bs, nheads, d_head, seqlen), \
-    f"Output dK shape mismatch, got {out_dk_ref.shape}"
-  assert tuple(out_dv_ref.shape) == (bs, nheads, d_head, seqlen), \
-    f"Output dV shape mismatch, got {out_dv_ref.shape}"
+  out_dq_ref = nl.ndarray((bs, nheads, d_head, seqlen_q), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  out_dk_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  out_dv_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
 
   # FIXME: Add masking for different seqlen values.
-  assert seqlen % 128 == 0, \
-    f"Input sequence length must be divisible by 128, got {seqlen}"
+  assert seqlen_q % 128 == 0 and seqlen_k % 128 == 0, \
+    f"Input sequence lengths must be divisible by 128, got seqlen_q == {seqlen_q} and seqlen_k == {seqlen_k}"
 
   # Softmax scaling factor, multiplied onto Q
   softmax_scale = softmax_scale or 1.0 / float(d_head ** 0.5)
 
   # Different batch samples/attention heads have independent attention
   batch_id = nl.program_id(axis=0)
-  head_id = nl.program_id(axis=1)
 
-  assert nl.num_programs(1) == nheads, \
-    f"The grid shape mismatch, got {nl.num_programs(1)} but should be {nheads}"
+  head_dims = list(range(1, nl.program_ndim()))
+  head_dims_shape = list(nl.num_programs(i) for i in head_dims)
+  head_dims_idx = list(nl.program_id(i) for i in head_dims)
+  head_id = linearize(head_dims_shape, head_dims_idx)
 
-  q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen, 128), 128
+  assert n_elts(head_dims_shape) == nheads, \
+    f"The grid shape mismatch, got {n_elts(head_dims_shape)} but should be {nheads}"
+
+  q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen_q, 128), 128
   d_head_n_tiles, d_head_tile_size = div_ceil(d_head, 128), min(d_head, 128)
 
-  if seqlen >= 512:
-    k_seq_n_tiles, k_seq_tile_size = seqlen // 512, 512
+  if seqlen_k >= 512:
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 512, 512
   else:
-    k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 128, 128
 
-  k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen // 128, 128
+  k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen_k // 128, 128
   k_seq_fwd_bwd_tile_multipler = k_seq_tile_size // k_seq_tile_size_backward
 
   ##############################################################
@@ -615,7 +651,7 @@ def flash_attn_bwd(
         dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced,
         softmax_exp_bias=softmax_exp_bias, dy_o_sum=dy_o_sum,
         local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
-        seqlen=seqlen, d_head=d_head,
+        seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
         use_causal_mask=use_causal_mask,
         kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
         softmax_scale=softmax_scale,
@@ -654,36 +690,43 @@ def flash_attn_bwd(
         value=dq_local_reduced[i_q_seq_tile, i_d_head_tile, ip_dq, if_dq],
       )
 
-@trace
+  return out_dq_ref, out_dk_ref, out_dv_ref
+
+
 def _flash_attn_bwd_core(
   q_local, k_local, transposed_k_local, v_local, dy_local,
   dk_psum, dv_psum, dq_local_reduced,
   softmax_exp_bias, dy_o_sum,
   local_i_q_seq_tile, local_i_k_seq_tile,
-  seqlen, d_head,
+  seqlen_q, seqlen_k, d_head, nheads,
   use_causal_mask,
   kernel_dtype, mixed_dtype,
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
   global_i_q_seq_tile = None,
   global_i_k_seq_tile = None,
+  # Used for nl.loop_reduce on dQ if local_i_k_seq_tile is not an index e.g. if it has an offset
+  local_i_k_seq_tile_for_dq_reduce = None,
 ):
   """
-  The flash backward core funciton to calculate the gradients of Q, K and V
+  The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
   """
-  q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen, 128), 128
+  q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen_q, 128), 128
   d_head_n_tiles, d_head_tile_size = div_ceil(d_head, 128), min(d_head, 128)
-  if seqlen >= 512:
-    k_seq_n_tiles, k_seq_tile_size = seqlen // 512, 512
+  if seqlen_k >= 512:
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 512, 512
   else:
-    k_seq_n_tiles, k_seq_tile_size = seqlen // 128, 128
-  k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen // 128, 128
+    k_seq_n_tiles, k_seq_tile_size = seqlen_k // 128, 128
+  k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen_k // 128, 128
   k_seq_fwd_bwd_tile_multipler = k_seq_tile_size // k_seq_tile_size_backward
 
   if global_i_q_seq_tile is None:
     global_i_q_seq_tile = local_i_q_seq_tile
     global_i_k_seq_tile = local_i_k_seq_tile
+  
+  if local_i_k_seq_tile_for_dq_reduce is None:
+    local_i_k_seq_tile_for_dq_reduce = local_i_k_seq_tile
 
   mask = global_i_q_seq_tile * q_seq_tile_size >= global_i_k_seq_tile * k_seq_tile_size if use_causal_mask else None
   # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
@@ -735,7 +778,7 @@ def _flash_attn_bwd_core(
   if dropout_p > 0.0:
     offset = global_i_k_seq_tile + global_i_q_seq_tile * k_seq_n_tiles \
               + head_id * k_seq_n_tiles * q_seq_n_tiles \
-              + batch_id * nl.num_programs(1) * k_seq_n_tiles * q_seq_n_tiles
+              + batch_id * nheads * k_seq_n_tiles * q_seq_n_tiles
     offset_seed = nl.add(seed_local[0, 0], offset, mask=mask)
     nl.random_seed(seed=offset_seed, mask=mask)
     softmax_y[ip_q, if_k] = nl.dropout(softmax_y[ip_q, if_k], rate=dropout_p_local[ip_q, 0], mask=mask)
@@ -778,12 +821,12 @@ def _flash_attn_bwd_core(
   #####################################################################
   softmax_dx_local = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
   softmax_dx_local[ip_q, if_k] = \
-    nisa.tensor_scalar(data=softmax_dy[ip_q, if_k],
-                        op0=np.subtract,
-                        operand0=dy_o_sum[local_i_q_seq_tile, ip_q, 0],
-                        op1=np.multiply,
-                        operand1=softmax_y[ip_q, if_k],
-                        mask=mask)
+    nisa.scalar_tensor_tensor(data=softmax_dy[ip_q, if_k],
+                              op0=np.subtract,
+                              operand0=dy_o_sum[local_i_q_seq_tile, ip_q, 0],
+                              op1=np.multiply,
+                              operand1=softmax_y[ip_q, if_k],
+                              mask=mask)
 
   #####################################################################
   # Step 5.1 Calculate dK, with matmul(stationary=Q, moving=softmax_dx)
@@ -820,10 +863,12 @@ def _flash_attn_bwd_core(
           mask=mask)
     dq_local = nl.multiply(dq_psum[ip_dq, if_dq], softmax_scale, dtype=kernel_dtype, mask=mask)
     dq_local_reduced[local_i_q_seq_tile, i_d_head_tile, ip_dq, if_dq] = nl.loop_reduce(
-      dq_local, op=np.add, loop_indices=(local_i_k_seq_tile,),
+      dq_local, op=np.add, loop_indices=(local_i_k_seq_tile_for_dq_reduce,),
       dtype=mixed_dtype, mask=mask)
 
-def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, out_ref, use_causal_mask=False,
+
+@nki.jit
+def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False,
                                            mixed_percision=True):
   """
   Fused self attention kernel for small head size Stable Diffusion workload.
@@ -853,16 +898,17 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, out_ref, use_cau
   # Assume all IO tensors have the same dtype
   kernel_dtype = q_ref.dtype
   pe_in_dt = nl.bfloat16 if mixed_percision else np.float32
-  assert q_ref.dtype == k_ref.dtype == v_ref.dtype == out_ref.dtype
+  assert q_ref.dtype == k_ref.dtype == v_ref.dtype
 
   # Shape checking
   bs, d_head, seqlen = q_ref.shape
   assert d_head <= 128, "Cannot use this kernel for d_head > 128"
   assert tuple(q_ref.shape) == (bs, d_head, seqlen), 'Input shape mismatch!'
   assert tuple(k_ref.shape) == (bs, seqlen, d_head), 'Input shape mismatch!'
-  assert tuple(v_ref.shape) == (bs, seqlen,
-                                d_head), f'Input shape mismatch! Expected: {(bs, seqlen, d_head)} Actual: {tuple(v_ref.shape)}'
-  assert tuple(out_ref.shape) == (bs, seqlen, d_head), 'Output shape mismatch!'
+  assert tuple(v_ref.shape) == (bs, seqlen,  d_head), \
+    f'Input shape mismatch! Expected: {(bs, seqlen, d_head)} Actual: {tuple(v_ref.shape)}'
+
+  out_ref = nl.ndarray((bs, seqlen, d_head), dtype=q_ref.dtype, buffer=nl.shared_hbm)
 
   # Softmax scaling factor, multiplied onto Q
   softmax_scale = 0.125
@@ -1028,4 +1074,5 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, out_ref, use_cau
     nl.store(
       out_ref[batch_id, i_q_seq_tile * q_seq_tile_size + if_out, ip_out],
       value=attn_res_div)
-    
+
+  return out_ref

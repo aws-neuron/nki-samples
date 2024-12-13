@@ -14,6 +14,8 @@ from neuronxcc.starfish.support.util import allclose
 
 from flash_attention import nki_flash_attn_func
 
+parent_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.append(parent_dir)
 from perf_utils.LatencyCollector import benchmark
 
 if len(sys.argv) != 2:

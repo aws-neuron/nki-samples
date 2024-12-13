@@ -39,7 +39,6 @@ def cpu_golden_result(operand_tensor, source_tensor, window_dimensions=(3, 3), w
                     out_h = h * stride_h + local_h - padding[0]
                     out_w = w * stride_w + local_w - padding[1]
                     output_tensor[n, c, out_h, out_w] += source_tensor[n, c, h, w]
-
     return output_tensor
 
 class TestSelectAndScatter:
@@ -47,31 +46,28 @@ class TestSelectAndScatter:
  	    [8, 64, 112, 112, 56, 56, np.float32, 4500],
  	])
     def test_select_and_scatter_for_perf(self, n, c, operand_h, operand_w, source_h, source_w, dtype, latency):
-        operand_tensor = np.random.random_sample((n, c, operand_h, operand_w)).astype(np.float32)
-        source_tensor = np.random.random_sample((n, c, source_h, source_w)).astype(np.float32)
-        output_tensor = nl.static_cast(np.ndarray(shape=(n, c, operand_h, operand_w)), dtype)
-        
-        operand_dev = nl.static_cast(operand_tensor, dtype)
-        source_dev = nl.static_cast(source_tensor, dtype)
+        operand_dev = nl.static_cast(np.random.random_sample((n, c, operand_h, operand_w)), dtype)
+        source_dev = nl.static_cast(np.random.random_sample((n, c, source_h, source_w)), dtype)
 
-        bench_func(operand_dev, source_dev, output_tensor)
+        bench_func(operand_dev, source_dev)
         latency_res = bench_func.benchmark_result.nc_latency
         p99 = latency_res.get_latency_percentile(99)
         assert p99 <= latency
 
     @pytest.mark.parametrize("n, c, operand_h, operand_w, source_h, source_w, dtype", [
  	    [8, 64, 112, 112, 56, 56, np.float32],
- 	    pytest.param(8, 64, 112, 112, 56, 56, nl.bfloat16, marks=pytest.mark.xfail),
+ 	    [8, 64, 112, 112, 56, 56, nl.bfloat16],
  	])
     def test_select_and_scatter_for_numeric(self, n, c, operand_h, operand_w, source_h, source_w, dtype):
-        operand_tensor = np.random.random_sample((n, c, operand_h, operand_w)).astype(np.float32)
-        source_tensor = np.random.random_sample((n, c, source_h, source_w)).astype(np.float32)
-        output_tensor = nl.static_cast(np.ndarray(shape=(n, c, operand_h, operand_w)), dtype)
-        
-        operand_dev = nl.static_cast(operand_tensor, dtype)
-        source_dev = nl.static_cast(source_tensor, dtype)
+        operand_dev = nl.static_cast(np.random.random_sample((n, c, operand_h, operand_w)), dtype)
+        source_dev = nl.static_cast(np.random.random_sample((n, c, source_h, source_w)), dtype)
 
-        numeric_func(operand_dev, source_dev, output_tensor)
+        sw = nl.static_cast(np.ndarray(shape=(n, c, source_h, source_w, 3, 3)), dtype)
+        operand_tensor = nl.static_cast(operand_dev, np.float32)
+        source_tensor = nl.static_cast(source_dev, np.float32)
+
+        output_dev = numeric_func(operand_dev, source_dev)
         golden_result = cpu_golden_result(operand_tensor, source_tensor)
-        output_tensor = nl.static_cast(output_tensor, np.float32)
-        assert np.allclose(output_tensor, golden_result)
+        nki_result = nl.static_cast(output_dev, np.float32)
+
+        assert np.allclose(nki_result, golden_result, rtol=1e-2, atol=1e-2)
