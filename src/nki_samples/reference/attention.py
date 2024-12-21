@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from functools import reduce as functools_reduce
 from operator import mul as operator_mul
 
+
 def n_elts(shape):
   return functools_reduce(operator_mul, shape, 1)
 
@@ -27,21 +28,59 @@ def linearize(shape, indices):
 def div_ceil(n, d):
   return (n + d - 1) // d
 
+
 @dataclass(frozen=True)
 class FlashConfig:
   """
     Config class for flash attention with default values
   """
   seq_tile_size:int = 2048
+  attn_core_tile_size:int = 256
   training:bool = True
   should_transpose_v:bool = False
+  lse_dtype: str = ""
 
-  __annotations__ = {
-    'seq_tile_size': int,
-    'training': bool,
-    'should_transpose_v': bool
-  }
 
+@nki.jit(mode='trace')
+def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ):
+  for i in nl.affine_range(LARGE_TILE_SZ // 512):
+    if nisa.get_nc_version() == nisa.nc_version.gen3:
+      p_local_t_tmp = nl.ndarray((par_dim(128), 512), buffer=nl.sbuf, dtype=p_local.dtype)
+    else:
+      p_local_t_tmp = nl.ndarray((par_dim(128), 512), buffer=nl.psum, dtype=np.float32)
+
+    for j in nl.affine_range(512 // 128):
+      j_128_slice = nl.ds(j * 128, 128)
+      i_j_128_slice = nl.ds(i * 512 + j * 128, 128)
+
+      if nisa.get_nc_version() == nisa.nc_version.gen3:
+        p_local_t_tmp[:, j_128_slice] = nisa.dma_transpose(
+          p_local[:, i_j_128_slice])
+      else:
+        p_local_t_tmp[:, j_128_slice] = nisa.nc_transpose(
+          p_local[:, i_j_128_slice])
+
+    p_local_transposed[:, nl.ds(i * 512, 512)] = nl.copy(
+      p_local_t_tmp, dtype=p_local_transposed.dtype)
+
+
+@nki.jit(mode='trace')
+def dropout_p_local(p_local, dropout_p, dropout_p_tensor, seed_tensor,
+                    seed_offset_base, k_r_i, REDUCTION_TILE):
+  B_F_SIZE = 512
+  for k_d_i in nl.sequential_range(REDUCTION_TILE // B_F_SIZE):
+    p_local_f_slice = nl.ds(k_r_i * REDUCTION_TILE + k_d_i * B_F_SIZE, B_F_SIZE)
+
+    offset = k_d_i + seed_offset_base
+    offset_seed = nl.add(seed_tensor, offset, dtype=nl.int32)
+    nl.random_seed(seed=offset_seed)
+    softmax_dropout = nl.dropout(p_local[:, p_local_f_slice],
+                                 rate=dropout_p_tensor[:, 0])
+    p_local[:, p_local_f_slice] = nl.multiply(
+      softmax_dropout, 1 / (1 - dropout_p))
+
+
+@nki.jit(mode='trace')
 def _flash_attention_core(q_local_tile, k, v,
                           q_h_per_k_h, seqlen_q, nheads,
                           o_buffer, l_buffer, m_buffer,
@@ -49,169 +88,212 @@ def _flash_attention_core(q_local_tile, k, v,
                           local_k_large_tile_idx,
                           kernel_dtype, acc_type,
                           flash_config: FlashConfig,
-                          olm_buffer_idx=None,
-                          global_k_large_tile_idx=None,
-                          use_causal_mask=False, initialize=False,
+                          use_causal_mask, initialize,
                           B_P_SIZE=128, B_F_SIZE=512, B_D_SIZE=128,
-                          dropout_p=0.0, dropout_p_tensor=None, seed_tensor=None
-                          ):
+                          dropout_p=0.0, dropout_p_tensor=None, seed_tensor=None,
+                          logit_bias_tile=None):
   """
   The flash attention core function to calcualte self attention between a tile of q and a block of K and V.
   The q_local_tile has (B_P_SIZE, B_F_SIZE), which is loaded into the SBUF already. The block size of K and V
   is defined in the seq_tile_size of the flash_config. The results are stored in the following three buffers
-  o_buffer: (num_large_k_tile, B_P_SIZE, d)
-  l_buffer: (num_large_k_tile, B_P_SIZE, 1)
-  m_buffer: (num_large_k_tile, B_P_SIZE, 1)
+  o_buffer: (B_P_SIZE, d)
+  l_buffer: (B_P_SIZE, 1)
+  m_buffer: (B_P_SIZE, 1)
   """
   LARGE_TILE_SZ = flash_config.seq_tile_size
-  REDUCTION_TILE = min(2048, LARGE_TILE_SZ // 2)
   num_k_tile_per_large_tile = LARGE_TILE_SZ // B_F_SIZE
   seqlen_k = k.shape[-1]
   seq_q_num_tiles = seqlen_q // B_P_SIZE
   seq_k_num_tiles = seqlen_k // B_F_SIZE
 
-  # Indices used by the distributed attention
-  if global_k_large_tile_idx is None:
-    global_k_large_tile_idx = local_k_large_tile_idx
-  if olm_buffer_idx is None:
-    olm_buffer_idx = local_k_large_tile_idx
-
-  i_q_p = nl.arange(B_P_SIZE)[:, None]
-  i_q_f = nl.arange(B_F_SIZE)[None, :]
-  i_d_p = nl.arange(B_D_SIZE)[:, None]
-  i_d_f = nl.arange(B_D_SIZE)[None, :]
-  i_f_128 = nl.arange(B_P_SIZE)[None, :]
-  i_f_k_tiles = nl.arange(num_k_tile_per_large_tile)[None, :]
-
-  # mask are used to only apply computation to the lower half of the matrix,
-  # which reduce the arthimetic intensity by half
-  forward_mask = q_tile_idx * B_P_SIZE >= global_k_large_tile_idx * LARGE_TILE_SZ if use_causal_mask else None
-  # Negation mask is the negation of `forward_mask`, which is used for the
-  # instructions executed on the blocks in the upper triangular section
-  # of the matrix.
-  # These instructions should not be executed when causual mask is disabled.
-  #
-  # For example, the o_buffer still needs to be propagated from o[j-1] to o[j] in
-  # the upper triangular of the matrix.
-  negation_mask = q_tile_idx * B_P_SIZE < global_k_large_tile_idx * LARGE_TILE_SZ if use_causal_mask else None
-
   qk_res_buf = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), buffer=nl.sbuf, dtype=acc_type)
   max_local = nl.ndarray((par_dim(B_P_SIZE), num_k_tile_per_large_tile), dtype=acc_type)
+
   for k_i in nl.affine_range(num_k_tile_per_large_tile):
-    qk_psum = nl.zeros((par_dim(B_P_SIZE), B_F_SIZE),
+    k_i_b_f_slice = nl.ds(k_i * B_F_SIZE, B_F_SIZE)
+
+    qk_psum = nl.ndarray((par_dim(B_P_SIZE), B_F_SIZE),
                         dtype=np.float32, buffer=nl.psum)  # (128, 512)
-    multiplication_required_selection = global_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE <= q_tile_idx * B_P_SIZE if use_causal_mask else None
-    qk_psum[i_q_p, i_q_f] += nl.matmul(q_local_tile, k[i_d_p, k_i * B_F_SIZE + i_q_f], transpose_x=True,
-                                       mask=multiplication_required_selection) # (p(128), 512)
+    if use_causal_mask:
+      multiplication_required_selection = q_tile_idx * B_P_SIZE >= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE
+    else:
+      multiplication_required_selection = True
+
+    if multiplication_required_selection:
+      qk_psum[:, :] = nl.matmul(q_local_tile, k[:, k_i_b_f_slice], transpose_x=True) # (p(128), 512)
+    else:
+      qk_psum[:, :] = 0
 
     if use_causal_mask:
-      left_diagonal_selection = q_tile_idx * B_P_SIZE >= global_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE
-      diagonal_and_right_selection = (q_tile_idx * B_P_SIZE < global_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE) & forward_mask
+      left_diagonal_selection = q_tile_idx * B_P_SIZE >= local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE
+      diagonal_and_right_selection = (q_tile_idx * B_P_SIZE < local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE)
+      right_diagonal_selection = ((q_tile_idx + 1) * B_P_SIZE <= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE)
+      diagonal = ((q_tile_idx * B_P_SIZE < local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE) &
+                  ((q_tile_idx + 1) * B_P_SIZE > local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE))
 
+      i_q_p, i_q_f = nl.mgrid[0:B_P_SIZE, 0:B_F_SIZE]
       q_pos = q_tile_idx * B_P_SIZE + i_q_p
-      k_pos = global_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
+      k_pos = local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
       pred = q_pos >= k_pos
-      # For tiles on and to the right of the diagonal, need to do affine_select.
-      # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
-      qk_res_buf[i_q_p, k_i * B_F_SIZE + i_q_f] = nisa.affine_select(
-        pred=pred,
-        on_true_tile=qk_psum[i_q_p, i_q_f], on_false_value=-9984.0, dtype=kernel_dtype,
-        mask=diagonal_and_right_selection)
 
-      # For tiles on the left of the diagonal, direct copy, no select required.
-      qk_res_buf[i_q_p, k_i * B_F_SIZE + i_q_f] = \
-        nl.copy(qk_psum[i_q_p, i_q_f], dtype=kernel_dtype, mask=left_diagonal_selection)
+      qk_select_tmp = nl.ndarray(qk_psum.shape, dtype=qk_psum.dtype, buffer=nl.sbuf)
+
+      if logit_bias_tile is not None:
+        if right_diagonal_selection:
+          qk_select_tmp[...] = qk_psum
+
+          # For tiles to the right of the diagonal, do affine_select.
+          # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
+          qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
+              pred=pred,
+              on_true_tile=qk_select_tmp, on_false_value=-9984.0, dtype=acc_type)
+
+        # For tiles on the diagonal, add logit bias and need to do affine_select.
+        intermediate = \
+            nl.add(qk_psum, logit_bias_tile[:, k_i_b_f_slice],
+                   dtype=acc_type, mask=diagonal)
+        qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
+            pred=pred,
+            on_true_tile=intermediate, on_false_value=-9984.0, dtype=acc_type,
+            mask=diagonal)
+
+        # For tiles on the left of the diagonal, just add logit bias, no select required.
+        qk_res_buf[:, k_i_b_f_slice] = \
+            nl.add(qk_psum, logit_bias_tile[:, k_i_b_f_slice],
+                   dtype=acc_type, mask=left_diagonal_selection)
+      else:
+        # For tiles on and to the right of the diagonal, need to do affine_select.
+        # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
+        if diagonal_and_right_selection:
+          qk_select_tmp[...] = qk_psum
+
+          qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
+            pred=pred,
+            on_true_tile=qk_select_tmp, on_false_value=-9984.0, dtype=acc_type)
+
+        # For tiles on the left of the diagonal, direct copy, no select required.
+        qk_res_buf[:, k_i_b_f_slice] = \
+          nl.copy(qk_psum, dtype=acc_type, mask=left_diagonal_selection)
     else:
-      # Simply send psum result back to sbuf
-      qk_res_buf[i_q_p, k_i * B_F_SIZE + i_q_f] = \
-        nl.copy(qk_psum[i_q_p, i_q_f], dtype=kernel_dtype)
+      if logit_bias_tile is not None:
+        # Simply add logit bias which copies back to sbuf at the same time
+        qk_res_buf[:, k_i_b_f_slice] = \
+            nl.add(qk_psum, logit_bias_tile[:, k_i_b_f_slice], dtype=acc_type)
+      else:
+        # Simply send psum result back to sbuf
+        qk_res_buf[:, k_i_b_f_slice] = nl.copy(qk_psum, dtype=acc_type)
 
     # Calculate max of the current tile
-    max_local[i_q_p, k_i] = nisa.tensor_reduce(np.max, qk_res_buf[i_q_p, k_i * B_F_SIZE + i_q_f], axis=(1,),
-                                        dtype=acc_type, negate=False, mask=forward_mask)
+    max_local[:, k_i] = nisa.tensor_reduce(
+      np.max, qk_res_buf[:, k_i_b_f_slice], axis=(1,), dtype=acc_type,
+      negate=False)
 
-  max_ = nisa.tensor_reduce(np.max, max_local[i_q_p, i_f_k_tiles], axis=(1, ),
-                    dtype=acc_type, negate=False, mask=forward_mask)
-  if not initialize:
-    m_previous = nl.copy(m_buffer[olm_buffer_idx - 1, i_q_p, 0])
-    m_buffer[olm_buffer_idx, i_q_p, 0] = nl.maximum(m_previous, max_, mask=forward_mask) # (128,1)
-    if use_causal_mask:
-      m_buffer[olm_buffer_idx, i_q_p, 0] = nl.copy(m_previous, mask=negation_mask)
+  max_ = nisa.tensor_reduce(np.max, max_local[:, :], axis=(1, ),
+                            dtype=acc_type, negate=False)
 
-    m_current = m_buffer[olm_buffer_idx, i_q_p, 0]
-    # Compute scaling factor
-    alpha = nisa.activation(np.exp, m_previous, bias=-1*m_current, scale=1.0, mask=forward_mask)
-    o_previous = nl.copy(o_buffer[olm_buffer_idx-1, i_q_p, i_d_f], mask=forward_mask)
-    o_previous_scaled = nl.multiply(o_previous, alpha, mask=forward_mask)
-  else:
-    m_buffer[0, i_q_p, 0] = nl.copy(max_)
+  o_previous_scaled = nl.ndarray((par_dim(B_P_SIZE), B_D_SIZE), dtype=o_buffer.dtype)
+
+  if initialize:
+    m_buffer[:, 0] = nl.copy(max_)
     m_current = max_
+  else:
+    m_previous = nl.copy(m_buffer[:, 0])
+    m_buffer[:, 0] = nl.maximum(m_previous, max_) # (128,1)
+
+    m_current = m_buffer[:, 0]
+    # Compute scaling factor
+    alpha = nisa.activation(np.exp, m_current, bias=m_previous, scale=-1.0)
+    o_previous_scaled[...] = nl.multiply(o_buffer[:, :], alpha)
 
   p_local = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
-  i_r_f = nl.arange(REDUCTION_TILE)[None,: ]
+  REDUCTION_TILE = min(2048, LARGE_TILE_SZ // 2)
+
   p_partial_sum = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ // REDUCTION_TILE), dtype=acc_type)
+
   for k_r_i in nl.affine_range(LARGE_TILE_SZ // REDUCTION_TILE):
-    # compute exp(qk-max)
-    p_local[i_q_p, k_r_i * REDUCTION_TILE + i_r_f] = \
-      nisa.activation(np.exp,
-                      qk_res_buf[i_q_p, k_r_i * REDUCTION_TILE + i_r_f],
-                      bias=-1 * m_current,
-                      scale=1.0,
-                      dtype=kernel_dtype,
-                      mask=forward_mask)
+    k_r_i_reduce_slice = nl.ds(k_r_i * REDUCTION_TILE, REDUCTION_TILE)
 
     # dropout
     if dropout_p > 0.0:
-      for k_d_i in nl.sequential_range(REDUCTION_TILE // B_F_SIZE):
-        offset = k_d_i + k_r_i * (REDUCTION_TILE // B_F_SIZE) \
-                  + global_k_large_tile_idx * (LARGE_TILE_SZ // B_F_SIZE) \
-                  + q_tile_idx * seq_k_num_tiles \
-                  + (head_id * q_h_per_k_h + gqa_head_idx) * seq_k_num_tiles * seq_q_num_tiles \
-                  + batch_id * nheads * seq_k_num_tiles * seq_q_num_tiles
-        offset_seed = nl.add(seed_tensor[0, 0], offset, mask=forward_mask)
-        nl.random_seed(seed=offset_seed, mask=forward_mask)
-        softmax_dropout = nl.dropout(p_local[i_q_p, k_r_i * REDUCTION_TILE + k_d_i * B_F_SIZE + i_q_f],
-                                    rate=dropout_p_tensor[i_q_p, 0],
-                                    mask=forward_mask)
-        p_local[i_q_p, k_r_i * REDUCTION_TILE + k_d_i * B_F_SIZE + i_q_f] = \
-          nl.multiply(softmax_dropout, 1 / (1 - dropout_p), mask=forward_mask)
+      # compute exp(qk-max)
+      p_local[:, k_r_i_reduce_slice] = \
+        nisa.activation(np.exp, qk_res_buf[:, k_r_i_reduce_slice],
+                        bias=-1 * m_current, scale=1.0,
+                        dtype=kernel_dtype)
 
-    # Compute partial row-tile sum of exp(qk-max))
-    p_partial_sum[i_q_p, k_r_i] = nl.sum(p_local[i_q_p, k_r_i * REDUCTION_TILE + i_r_f], axis=1, dtype=acc_type, mask=forward_mask)
+      seed_offset_base = k_r_i * (REDUCTION_TILE // B_F_SIZE) \
+                         + local_k_large_tile_idx * (LARGE_TILE_SZ // B_F_SIZE) \
+                         + q_tile_idx * seq_k_num_tiles \
+                         + (head_id * q_h_per_k_h + gqa_head_idx) * seq_k_num_tiles * seq_q_num_tiles \
+                         + batch_id * nheads * seq_k_num_tiles * seq_q_num_tiles
+
+      dropout_p_local(p_local=p_local, dropout_p=dropout_p,
+                      dropout_p_tensor=dropout_p_tensor, seed_tensor=seed_tensor,
+                      seed_offset_base=seed_offset_base, k_r_i=k_r_i,
+                      REDUCTION_TILE=REDUCTION_TILE)
+
+      # Compute partial row-tile sum of exp(qk-max))
+      # FIXME: Use activation accumulate and accumulate over k_r_i loop?
+      p_partial_sum[:, k_r_i] = nl.sum(p_local[:, k_r_i_reduce_slice],
+                                       axis=1, dtype=acc_type)
+    else:
+      # compute exp(qk-max)
+      # Compute partial row-tile sum of exp(qk-max))
+      # FIXME: Use activation accumulate to accumulate over k_r_i loop?
+      p_local[:, k_r_i_reduce_slice] = \
+        nisa.activation_reduce(np.exp, qk_res_buf[:, k_r_i_reduce_slice],
+                               bias=-1 * m_current, scale=1.0,
+                               reduce_op=nl.add, reduce_res=p_partial_sum[:, k_r_i],
+                               dtype=kernel_dtype)
+
+  ps = nl.sum(p_partial_sum, axis=1, dtype=acc_type)
 
   p_local_transposed = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
-  for i_p_t in nl.affine_range(LARGE_TILE_SZ // 512):
-    p_local_t_tmp = nl.ndarray((par_dim(B_P_SIZE), 512), buffer=nl.psum, dtype=np.float32)
-    for i_p_t_local in nl.affine_range(512//128):
-      p_local_t_tmp[i_q_p, i_p_t_local*128 + i_f_128] = nisa.nc_transpose(p_local[i_q_p, i_p_t*512+i_p_t_local * B_P_SIZE + i_f_128], mask=forward_mask)
-    i_f_512 = nl.arange(512)[None, :]
-    p_local_transposed[i_q_p, i_p_t * 512 + i_f_512 ] = nl.copy(p_local_t_tmp[i_q_p, i_f_512], dtype=kernel_dtype, mask=forward_mask)
+  transpose_p_local(p_local_transposed=p_local_transposed, p_local=p_local,
+                    LARGE_TILE_SZ=LARGE_TILE_SZ)
 
-  ps = nl.sum(p_partial_sum, axis=1, dtype=acc_type, mask=forward_mask)
-  pv_psum = nl.zeros((par_dim(B_P_SIZE), B_D_SIZE), dtype=np.float32, buffer=nl.psum)
+  pv_psum = nl.zeros((par_dim(B_P_SIZE), B_D_SIZE), dtype=np.float32,
+                     buffer=nl.psum, lazy_initialization=True)
   for k_i in nl.affine_range(LARGE_TILE_SZ // B_P_SIZE):
-    pv_psum[i_q_p, i_d_f] += nl.matmul(p_local_transposed[i_q_p, k_i * B_P_SIZE + i_f_128],
-                                       v[k_i, i_q_p, i_d_f],
-                                       transpose_x=True,
-                                       mask=forward_mask) # (128, 128) (p(Br), d)
+    pv_psum[:, :] += nl.matmul(p_local_transposed[:, nl.ds(k_i * B_P_SIZE, B_P_SIZE)],
+                               v[k_i, :, :], transpose_x=True) # (128, 128) (p(Br), d)
 
   if initialize:
-    o_buffer[olm_buffer_idx, i_q_p, i_d_f] = nl.copy(pv_psum[i_q_p, i_d_f])
-    l_buffer[olm_buffer_idx, i_q_p, 0] = nl.add(nl.log(ps), max_)
+    o_buffer[:, :] = nl.copy(pv_psum[:, :])
+    l_buffer[:, 0] = nl.add(nl.log(ps), max_)
   else:
-    if use_causal_mask:
-      o_buffer[olm_buffer_idx, i_q_p, i_d_f] = nl.copy(o_buffer[olm_buffer_idx-1, i_q_p, i_d_f], mask=negation_mask)
-    o_buffer[olm_buffer_idx, i_q_p, i_d_f] = nl.add(o_previous_scaled, pv_psum, mask=forward_mask)
+    o_buffer[:, :] = nl.add(o_previous_scaled, pv_psum)
 
-    l_prev = l_buffer[olm_buffer_idx-1, i_q_p, 0]
-    l_exp = nl.add(nl.exp(nl.subtract(l_prev, m_current, mask=forward_mask), mask=forward_mask), ps, mask=forward_mask)
-    l_buffer[olm_buffer_idx, i_q_p, 0] = nl.add(m_current, nl.log(l_exp, mask=forward_mask), mask=forward_mask)
-    if use_causal_mask:
-      l_buffer[olm_buffer_idx, i_q_p, 0] = nl.copy(l_buffer[olm_buffer_idx-1, i_q_p, 0], mask=negation_mask)
+    exp = nisa.activation(nl.exp, m_current, bias=l_buffer[:, 0], scale=-1.0)
+    l_buffer[:, 0] = nl.add(m_current, nisa.activation(nl.log, exp, bias=ps))
+
+
+@nki.jit(mode='trace')
+def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
+  LARGE_TILE_SZ = config.seq_tile_size
+  B_P_SIZE = 128
+
+  if not config.should_transpose_v:
+    cur_v_tile[v_i, :, :] = nl.load(
+      v_hbm_tile[nl.ds(j * LARGE_TILE_SZ + B_P_SIZE * v_i, B_P_SIZE), :],
+      dtype=cur_v_tile.dtype)
+    return
+
+  if nisa.get_nc_version() == nisa.nc_version.gen3:
+    cur_v_tile_transposed = nisa.dma_transpose(
+      v_hbm_tile[:, nl.ds(j * LARGE_TILE_SZ + B_P_SIZE * v_i, B_P_SIZE)])
+    cur_v_tile[v_i, :, :] = nisa.tensor_copy(cur_v_tile_transposed,
+                                             dtype=cur_v_tile.dtype)
+    return
+
+  cur_v_tile[v_i, :, :] = nl.load_transpose2d(
+    v_hbm_tile[:, nl.ds(j * LARGE_TILE_SZ + B_P_SIZE * v_i, B_P_SIZE)],
+    dtype=cur_v_tile.dtype)
+
 
 
 @nki.jit
-def flash_fwd(q, k, v, seed,
+def flash_fwd(q, k, v, seed, logit_bias=None,
               softmax_scale=None,
               use_causal_mask=True,
               mixed_precision=True,
@@ -224,27 +306,35 @@ def flash_fwd(q, k, v, seed,
     - k: shape   (bs, nk_heads, d, seq_k)
     - v: shape   (bs, nv_heads, d, seq_v) if config.should_transpose_v  else (bs, nv_heads, seq_v, d)
     - seed: shape (1,)
+    - logit_bias: shape (bs, n_heads, seq_q, seq_k)
     - o: shape (bs, n_heads, seq_q, d)
     - lse: shape (bs, n_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax) if training else None
     - This kernel requires seq_k == seq_v
 
   IO tensor dtypes:
     - This kernel assumes all IO tensors have the same dtype
-    - If mixed_percision is True, then all Tensor Engine operation will be performed in
+    - If mixed_precision is True, then all Tensor Engine operation will be performed in
       bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
       will be in the same type as the inputs.
 
   Compile-time Constants:
     - softmax_scale: scaling for softmax, is None, default is `1.0/(d**0.5)`
-    - mixed_precision: flag to set non-matmul ops in fp32 precision, defualt is set to `true`, if false, we use same precision as input types
+    - mixed_precision: flag to set non-matmul ops in fp32 precision, default is set to `true`, if false, we use same precision as input types
     - causal_mask: flag to set causal masking
-    - config: Instance of dataclass :class:`nki.kernels.attention.FlashConfig` with Performance config parameters for flash attention with default values
+    - config: Instance of :class:`nki.kernels.attention.FlashConfig` with Performance config parameters for flash attention with default values
         seq_tile_size: `default=2048`, size of the kv tile size for attention computation reduction
         training: bool to indicate training vs inference `default=True`
 
   Performance Notes:
-    For better performance, the kernel is tiled to be of size `LARGE_TILE_SZ`, and Flash attention math techniques are applied in unit
-    of `LARGE_TILE_SZ`. Seqlen that is not divisible by `LARGE_TILE_SZ` is not supported at the moment.
+    For better performance, the kernel is tiled to be of size `config.seq_tile_size`, and Flash attention math techniques are applied in unit
+    of `config.seq_tile_size`. Seqlen that is not divisible by `config.seq_tile_size` is not supported at the moment.
+
+    For large seqlen, `o_buffer` will overflow the statebuf. the kernel is tile `o_buffer` based on the value of `config.attn_core_tile_size`.
+    This is a tradeoff between memory usage and performance. The default value of `config.attn_core_tile_size` is 256, which means the `o_buffer`
+    will roughly take half of the statebuf. The computes are also tiled accordingly. DMA will be rematerialized
+    `seqlen_q // B_P_SIZE // attn_core_tile_size times`.
+
+
 
   GQA support Notes:
     the spmd kernel for launching kernel should be on kv_heads instead of nheads
@@ -273,26 +363,27 @@ def flash_fwd(q, k, v, seed,
 
   o = nl.ndarray((b, h, seqlen_q, d), dtype=q.dtype, buffer=nl.shared_hbm)
   if config.training:
+    if config.lse_dtype:
+      lse_dtype = getattr(nl, config.lse_dtype)
+    else:
+      lse_dtype = acc_type
     lse = nl.ndarray((b, h, nl.tile_size.pmax, seqlen_q // nl.tile_size.pmax),
-                     dtype=acc_type, buffer=nl.shared_hbm)
+                     dtype=lse_dtype, buffer=nl.shared_hbm)
   else:
     lse = None
 
-  i_q_p = nl.arange(B_P_SIZE)[:,None]
-  i_0_f = nl.arange(1)[None, :]
-
+  assert nl.program_ndim() == 2,\
+    f'Expect spmd grid with 2 dimensions, got {nl.program_ndim()} instead!'
   batch_id = nl.program_id(axis=0)
-
-  head_dims = list(range(1, nl.program_ndim()))
-  head_dims_shape = list(nl.num_programs(i) for i in head_dims)
-  head_dims_idx = list(nl.program_id(i) for i in head_dims)
-  head_id = linearize(head_dims_shape, head_dims_idx)
+  head_id = nl.program_id(axis=1)
 
   softmax_scale = softmax_scale or (1.0 / (d ** 0.5))
 
   n_tile_q = seqlen_q // B_P_SIZE # since q will be loaded on tensor engine
 
   LARGE_TILE_SZ = config.seq_tile_size
+  attn_core_tile_size = config.attn_core_tile_size
+
   # FIXME: Add masking for different seqlen values.
   assert config.seq_tile_size >= 512, f" seq tile_size {config.seq_tile_size} cannot be less than 512"
   assert seqlen_k % LARGE_TILE_SZ == 0, f"Need seqlen_k to be divisible by {LARGE_TILE_SZ} but got {seqlen_k}"
@@ -316,124 +407,99 @@ def flash_fwd(q, k, v, seed,
     dropout_p_tensor = None
     seed_local = None
 
-  for i_q_h in nl.affine_range(q_h_per_k_h):
+  if logit_bias is not None:
+    b_logit_bias, h_logit_bias, _, _ = logit_bias.shape
+    assert b_logit_bias == 1 and h_logit_bias == 1, "only support broadcasting logit_bias with batch 1, n_heads 1"
 
+  n_remat = div_ceil(n_tile_q, attn_core_tile_size)
+  attn_core_tile_size = min(n_tile_q, attn_core_tile_size)
+
+  for i_q_h in nl.affine_range(q_h_per_k_h):
     # =============== Global Flash Attention accumulators ====================== #
-    o_buffer = nl.full((n_tile_q, num_large_k_tile, par_dim(B_P_SIZE), d), 0.0, dtype=acc_type, buffer=nl.sbuf)
-    l_buffer = nl.full((n_tile_q, num_large_k_tile, par_dim(B_P_SIZE), 1), 0.0, dtype=acc_type, buffer=nl.sbuf)
-    m_buffer = nl.full((n_tile_q, num_large_k_tile, par_dim(B_P_SIZE), 1), 0.0, dtype=acc_type)
+    l_buffer = nl.zeros((par_dim(B_P_SIZE), n_tile_q), dtype=acc_type,
+                        buffer=nl.sbuf, lazy_initialization=True)
     # =============== Global Flash Attention accumulators END ================== #
 
-    j = 0
-    cur_k_tile = nl.ndarray((par_dim(B_D_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
-    cur_v_tile = nl.ndarray((LARGE_TILE_SZ//B_P_SIZE, par_dim(B_P_SIZE), B_D_SIZE), dtype=kernel_dtype)
-    load_tile_size = B_P_SIZE
-    for k_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-      load_p = nl.arange(B_D_SIZE)[:, None]
-      load_f = nl.arange(load_tile_size)[None, :]
-      cur_k_tile[load_p, load_tile_size*k_i+load_f] = nl.load(
-        k[batch_id, head_id, load_p, load_tile_size*k_i+load_f]
-      )
-    if config.should_transpose_v:
-      for v_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-        load_p = nl.arange(B_D_SIZE)[:, None]
-        load_f = nl.arange(B_P_SIZE)[None, :]
+    for i0 in nl.sequential_range(n_remat):
+      # =============== Global Flash Attention accumulators ====================== #
+      o_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), d), dtype=acc_type,
+                          buffer=nl.sbuf, lazy_initialization=True)
+      m_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), 1), dtype=acc_type,
+                          buffer=nl.sbuf, lazy_initialization=True)
+      # =============== Global Flash Attention accumulators END ================== #
 
-        loaded = nl.load(v[batch_id, head_id, load_p, B_P_SIZE*v_i+load_f], dtype=kernel_dtype)
-        store_p = nl.arange(B_P_SIZE)[:, None]
-        store_f = nl.arange(B_D_SIZE)[None, :]
-        cur_v_tile[v_i, store_p, store_f] = nisa.nc_transpose(loaded)
-    else:
-      for v_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-        load_p = nl.arange(B_P_SIZE)[:, None]
-        load_f = nl.arange(B_D_SIZE)[None, :]
+      for j in nl.sequential_range(0, num_large_k_tile):
+        cur_k_tile = nl.ndarray((par_dim(B_D_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
+        cur_v_tile = nl.ndarray((LARGE_TILE_SZ // B_P_SIZE, par_dim(B_P_SIZE), B_D_SIZE), dtype=kernel_dtype)
 
-        cur_v_tile[v_i, load_p, load_f] = nl.load(v[batch_id, head_id, B_P_SIZE*v_i+load_p, load_f], dtype=kernel_dtype)
+        cur_k_tile[:, :] = nl.load(k[batch_id, head_id, :, nl.ds(j*LARGE_TILE_SZ, LARGE_TILE_SZ)])
 
-    for i in nl.affine_range(n_tile_q):
-      i_f_128 = nl.arange(B_P_SIZE)[None, :]
-      i_f_d = nl.arange(B_D_SIZE)[None, :]
-      i_p_d = nl.arange(B_D_SIZE)[:,None]
-      q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
-      q_tile[i_p_d, i_f_128] = nl.load(q[batch_id,
-                                        head_id * q_h_per_k_h + i_q_h, i_p_d,
-                                        i * B_P_SIZE + i_f_128],
-                                      dtype=kernel_dtype) * softmax_scale # load (d, 128) tile in SBUF
-      # handle first tile and compute max and lse explicitly by passing initialize=True
-      _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
-                            q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
-                            o_buffer=o_buffer[i], l_buffer=l_buffer[i], m_buffer=m_buffer[i],
-                            batch_id=batch_id, head_id=head_id,
-                            gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=0,
-                            kernel_dtype=kernel_dtype, acc_type=acc_type,
-                            flash_config=config, use_causal_mask=use_causal_mask,
-                            initialize=True,
-                            B_P_SIZE=B_P_SIZE, B_F_SIZE=B_F_SIZE, B_D_SIZE=B_D_SIZE,
-                            dropout_p=dropout_p, dropout_p_tensor=dropout_p_tensor, seed_tensor=seed_local)
+        load_tile_size = B_P_SIZE
 
-    for j in nl.sequential_range(1, num_large_k_tile):
-      cur_k_tile = nl.ndarray((par_dim(B_D_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
-      cur_v_tile = nl.ndarray((LARGE_TILE_SZ//B_P_SIZE, par_dim(B_P_SIZE), B_D_SIZE), dtype=kernel_dtype)
-      load_tile_size = B_P_SIZE
-      for k_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-        load_p = nl.arange(B_D_SIZE)[:, None]
-        load_f = nl.arange(load_tile_size)[None, :]
-        cur_k_tile[load_p, load_tile_size*k_i+load_f] = nl.load(
-          k[batch_id, head_id, load_p, j*LARGE_TILE_SZ+load_tile_size*k_i+load_f]
-        )
-      if config.should_transpose_v:
+        v_hbm_tile = v[batch_id, head_id]
         for v_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-          load_p = nl.arange(B_D_SIZE)[:, None]
-          load_f = nl.arange(B_P_SIZE)[None, :]
+          load_v_tile(v_hbm_tile=v_hbm_tile, cur_v_tile=cur_v_tile, j=j, v_i=v_i,
+                      config=config)
 
-          loaded = nl.load(v[batch_id, head_id, load_p, j*LARGE_TILE_SZ+B_P_SIZE*v_i+load_f], dtype=kernel_dtype)
-          store_p = nl.arange(B_P_SIZE)[:, None]
-          store_f = nl.arange(B_D_SIZE)[None, :]
-          cur_v_tile[v_i, store_p, store_f] = nisa.nc_transpose(loaded)
-      else:
-        for v_i in nl.affine_range(LARGE_TILE_SZ // load_tile_size):
-          load_p = nl.arange(B_P_SIZE)[:, None]
-          load_f = nl.arange(B_D_SIZE)[None, :]
+        for i1 in nl.affine_range(attn_core_tile_size):
+          i = i0 * attn_core_tile_size + i1
+          # mask are used to only apply computation to the lower half of the matrix,
+          # which reduce the arthimetic intensity by half.
+          # forward_mask imply initialize, i.e. if forward_mask is false, initialize will
+          # be false as well
+          if use_causal_mask:
+            forward_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+          else:
+            forward_mask = True
 
-          cur_v_tile[v_i, load_p, load_f] = nl.load(v[batch_id, head_id, j*LARGE_TILE_SZ+B_P_SIZE*v_i+load_p, load_f], dtype=kernel_dtype)
+          if (i < n_tile_q) & forward_mask:
+            q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
+            q_hbm_tile = q[batch_id, head_id * q_h_per_k_h + i_q_h]
+            q_sbuf_tile = nl.load(q_hbm_tile[:, nl.ds(i * B_P_SIZE, B_P_SIZE)],
+                                  dtype=kernel_dtype) # load (d, 128) tile in SBUF
+            q_tile[:, :] = q_sbuf_tile * softmax_scale
 
-      for i in nl.affine_range(n_tile_q):
-        i_f_128 = nl.arange(B_P_SIZE)[None, :]
-        i_f_d = nl.arange(B_D_SIZE)[None, :]
-        i_p_d = nl.arange(B_D_SIZE)[:,None]
-        q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
-        q_tile[i_p_d, i_f_128] = nl.load(q[batch_id,
-                head_id * q_h_per_k_h + i_q_h, i_p_d,
-                i * B_P_SIZE + i_f_128],
-              dtype=kernel_dtype) * softmax_scale # load (d, 128) tile in SBUF
-        _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
-                              q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
-                              o_buffer=o_buffer[i], l_buffer=l_buffer[i], m_buffer=m_buffer[i],
-                              batch_id=batch_id, head_id=head_id,
-                              gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=j,
-                              kernel_dtype=kernel_dtype, acc_type=acc_type,
-                              flash_config=config, use_causal_mask=use_causal_mask,
-                              initialize=False,
-                              B_P_SIZE=B_P_SIZE, B_F_SIZE=B_F_SIZE, B_D_SIZE=B_D_SIZE,
-                              dropout_p=dropout_p, dropout_p_tensor=dropout_p_tensor, seed_tensor=seed_local)
+            logit_bias_tile = None
+            if logit_bias is not None:
+              logit_bias_tile = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
+              logit_bias_tile[:, :] = nl.load(
+                logit_bias[0, 0, nl.ds(i * B_P_SIZE, B_P_SIZE),
+                           nl.ds(j * LARGE_TILE_SZ, LARGE_TILE_SZ)])
 
-    # -------- write output to buffer on HBM ------------ #
-    for i in nl.affine_range(n_tile_q):
-      out = nl.ndarray((par_dim(B_P_SIZE), B_D_SIZE), dtype=kernel_dtype)
-      out[i_q_p, i_f_d] = nl.multiply(o_buffer[i, num_large_k_tile - 1, i_q_p, i_f_d],
-                                      nl.exp(m_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f] - l_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f]),
-                                      dtype=kernel_dtype)
+            _flash_attention_core(q_local_tile=q_tile, k=cur_k_tile, v=cur_v_tile,
+                                  q_h_per_k_h=q_h_per_k_h, seqlen_q=seqlen_q, nheads=h,
+                                  o_buffer=o_buffer[i1], l_buffer=l_buffer[:, i], m_buffer=m_buffer[i1],
+                                  batch_id=batch_id, head_id=head_id,
+                                  gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=j,
+                                  kernel_dtype=kernel_dtype, acc_type=acc_type,
+                                  flash_config=config, use_causal_mask=use_causal_mask,
+                                  initialize=j == 0,
+                                  B_P_SIZE=B_P_SIZE, B_F_SIZE=B_F_SIZE, B_D_SIZE=B_D_SIZE,
+                                  dropout_p=dropout_p, dropout_p_tensor=dropout_p_tensor,
+                                  seed_tensor=seed_local, logit_bias_tile=logit_bias_tile)
 
-      nl.store(o[batch_id, head_id * q_h_per_k_h + i_q_h, i*B_P_SIZE + i_q_p, i_f_d], out[i_q_p, i_f_d])
-      if not inference:
-        lse_local = nl.zeros((par_dim(B_P_SIZE), 1), dtype=acc_type)
-        lse_local[i_q_p, i_0_f] = nl.copy(l_buffer[i, num_large_k_tile - 1, i_q_p, i_0_f], dtype=acc_type)
-        nl.store(lse[batch_id, head_id * q_h_per_k_h + i_q_h, i_q_p, i + i_0_f], lse_local[i_q_p, i_0_f])
+      # -------- write output to buffer on HBM ------------ #
+      for i1 in nl.affine_range(attn_core_tile_size):
+        i = i0 * attn_core_tile_size + i1
+
+        if i < n_tile_q:
+          exp = nisa.activation(np.exp, l_buffer[:, i], bias=m_buffer[i1, :, :],
+                                scale=-1.0)
+          out = nl.multiply(o_buffer[i1, :, :], exp,
+                            dtype=kernel_dtype)
+
+          nl.store(o[batch_id, head_id * q_h_per_k_h + i_q_h,
+                     nl.ds(i*B_P_SIZE, B_P_SIZE), :], out)
+
+    if not inference:
+      nl.store(lse[batch_id, head_id * q_h_per_k_h + i_q_h, :, :], l_buffer[:, :])
 
   if config.training:
     return o, lse
 
   return o
+
+
 
 @nki.jit
 def flash_attn_bwd(
@@ -441,6 +507,7 @@ def flash_attn_bwd(
   dy_ref,
   lse_ref,
   seed_ref,
+  logit_bias_ref=None,
   use_causal_mask=False,
   mixed_precision=False,
   dropout_p=0.0,
@@ -457,6 +524,7 @@ def flash_attn_bwd(
    - dy_ref: shape (bs, nheads, head_size, seq)
    - lse_ref: shape (bs, nheads, nl.tile_size.pmax, seq // nl.tile_size.pmax)
    - seed_ref: shape (1,)
+   - logit_bias_ref: shape (bs, n_heads, seq_q, seq_k)
    - out_dq_ref: shape (bs, nheads, head_size, seq)
    - out_dk_ref: shape (bs, nheads, head_size, seq)
    - out_dv_ref: shape (bs, nheads, head_size, seq)
@@ -464,11 +532,11 @@ def flash_attn_bwd(
   Detailed steps:
     1. D = rowsum(dO ◦ O) (pointwise multiply)
 
-    2. Recompute (softmax(Q^T@K))
+    2. Recompute (softmax(Q^T@K + logic_bias))
 
       2.1 Q^T@K
       2.2 Scale the QK score
-      2.3 Apply causal mask
+      2.3 Apply causal mask and add logit_bias
       2.4 softmax
 
     3. Compute the gradients of y = score @ V with respect to the loss
@@ -487,7 +555,6 @@ def flash_attn_bwd(
   mixed_dtype = np.dtype(np.float32) if mixed_precision else kernel_dtype
 
   assert q_ref.dtype == k_ref.dtype == v_ref.dtype == o_ref.dtype == dy_ref.dtype
-  assert lse_ref.dtype == mixed_dtype
 
   # Shape checking
   bs, nheads, d_head, seqlen_q = q_ref.shape
@@ -520,16 +587,18 @@ def flash_attn_bwd(
   # Softmax scaling factor, multiplied onto Q
   softmax_scale = softmax_scale or 1.0 / float(d_head ** 0.5)
 
+  assert nl.program_ndim() == 2,\
+    f'Expect spmd grid with 2 dimensions, got {nl.program_ndim()} instead!'
   # Different batch samples/attention heads have independent attention
   batch_id = nl.program_id(axis=0)
+  head_id = nl.program_id(axis=1)
 
-  head_dims = list(range(1, nl.program_ndim()))
-  head_dims_shape = list(nl.num_programs(i) for i in head_dims)
-  head_dims_idx = list(nl.program_id(i) for i in head_dims)
-  head_id = linearize(head_dims_shape, head_dims_idx)
+  assert nl.num_programs(1) == nheads, \
+    f"The grid shape mismatch, got {nl.num_programs(1)} but should be {nheads}"
 
-  assert n_elts(head_dims_shape) == nheads, \
-    f"The grid shape mismatch, got {n_elts(head_dims_shape)} but should be {nheads}"
+  if logit_bias_ref is not None:
+    b_logit_bias, h_logit_bias, _, _ = logit_bias_ref.shape
+    assert b_logit_bias == 1 and h_logit_bias == 1, "Only support broadcasting logit_bias with batch 1, n_heads 1"
 
   q_seq_n_tiles, q_seq_tile_size = div_ceil(seqlen_q, 128), 128
   d_head_n_tiles, d_head_tile_size = div_ceil(d_head, 128), min(d_head, 128)
@@ -545,45 +614,19 @@ def flash_attn_bwd(
   ##############################################################
   # Step 2.4 Prefetch exp bias for softmax
   ##############################################################
-  softmax_exp_bias = nl.zeros((q_seq_n_tiles, par_dim(q_seq_tile_size), 1), dtype=mixed_dtype)
-  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
-    ip_qk = nl.arange(q_seq_tile_size)[:, None]
-    lse_local = nl.load(
-      lse_ref[batch_id, head_id, ip_qk, i_q_seq_tile],
-      dtype=mixed_dtype)
-    softmax_exp_bias[i_q_seq_tile, ip_qk, 0] = lse_local * -1.0
+  softmax_exp_bias = nl.zeros((par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
+  lse_local = nl.load(lse_ref[batch_id, head_id, :, :], dtype=mixed_dtype)
+  softmax_exp_bias[:, :] = lse_local * -1.0
 
   ##############################################################
   # Step 1 Compute rowsum(dO ◦ O)
   ##############################################################
   dy_o_sum = nl.ndarray((q_seq_n_tiles, par_dim(q_seq_tile_size), 1), dtype=mixed_dtype)
-  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
-    ip_reduce = nl.arange(q_seq_tile_size)[:, None]
-    dy_o_partial = nl.zeros((par_dim(q_seq_tile_size), d_head_n_tiles), dtype=mixed_dtype)
-    for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-      ip_load = nl.arange(d_head_tile_size)[:, None]
-      if_q = nl.arange(q_seq_tile_size)[None, :]
-      dy_local = nl.load_transpose2d(
-        dy_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_load, i_q_seq_tile * q_seq_tile_size + if_q],
-        dtype=mixed_dtype)
-      o_local = nl.load_transpose2d(
-        o_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_load, i_q_seq_tile * q_seq_tile_size + if_q],
-        dtype=mixed_dtype
-      )
-
-      dy_o_partial[ip_reduce, i_d_head_tile] = nisa.tensor_reduce(
-        np.add, data=dy_local*o_local, axis=(1,), dtype=mixed_dtype
-      )
-
-    dy_o_sum[i_q_seq_tile, ip_reduce, 0] = nisa.tensor_reduce(
-      np.add, data=dy_o_partial[ip_reduce, nl.arange(d_head_n_tiles)[None, :]],
-      axis=(1,), dtype=mixed_dtype
-    )
-
-  # Indices for prefetch
-  ip_qk = nl.arange(d_head_tile_size)[:, None]
-  if_q = nl.arange(q_seq_tile_size)[None, :]
-  if_k = nl.arange(k_seq_tile_size)[None, :]
+  compute_rowsum(dy_o_sum=dy_o_sum,
+                 dy_ref_hbm_tile=dy_ref[batch_id, head_id],
+                 o_ref_hbm_tile=o_ref[batch_id, head_id],
+                 d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
+                 q_seq_n_tiles=q_seq_n_tiles, q_seq_tile_size=q_seq_tile_size)
 
   if dropout_p > 0.0:
     seed_local = nl.load(seed_ref[0])
@@ -603,28 +646,25 @@ def flash_attn_bwd(
   _range = nl.sequential_range if dropout_p > 0.0 else nl.affine_range
 
   for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-    # Prefetch V, K
-    v_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size), dtype=kernel_dtype)
-    k_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size), dtype=kernel_dtype)
-    transposed_k_local = nl.zeros((k_seq_fwd_bwd_tile_multipler, d_head_n_tiles, par_dim(k_seq_tile_size_backward), d_head_tile_size), dtype=kernel_dtype)
-    for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-      k_local[i_d_head_tile, ip_qk, if_k] = nl.load(
-        k_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_k],
-        dtype=kernel_dtype)
-      v_local[i_d_head_tile, ip_qk, if_k] = nl.load(
-        v_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_qk, i_k_seq_tile * k_seq_tile_size + if_k],
-        dtype=kernel_dtype)
-      ##############################################################
-      # Prefetch k transpose for the backward too
-      ##############################################################
-      if_k_backward = nl.arange(k_seq_tile_size_backward)[None, :]
-      ip_k_backward = nl.arange(k_seq_tile_size_backward)[:, None]
-      if_d_head = nl.arange(d_head_tile_size)[None, :]
-      for i_k_seq_tile_backward in nl.affine_range(k_seq_fwd_bwd_tile_multipler):
-        transposed_k_local[i_k_seq_tile_backward, i_d_head_tile, ip_k_backward, if_d_head] = \
-          nisa.nc_transpose(k_local[i_d_head_tile, ip_qk,
-                                    i_k_seq_tile_backward * k_seq_tile_size_backward + if_k_backward])
+    i_k_seq_dslice = nl.ds(i_k_seq_tile * k_seq_tile_size, k_seq_tile_size)
 
+    # Prefetch V, K
+    v_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                       dtype=kernel_dtype)
+    k_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
+                       dtype=kernel_dtype)
+    transposed_k_local = nl.zeros((k_seq_fwd_bwd_tile_multipler, d_head_n_tiles,
+                                   par_dim(k_seq_tile_size_backward), d_head_tile_size),
+                                  dtype=kernel_dtype)
+
+    load_kv(k_ref_hbm_tile=k_ref[batch_id, head_id],
+            v_ref_hbm_tile=v_ref[batch_id, head_id],
+            k_local=k_local, transposed_k_local=transposed_k_local, v_local=v_local,
+            d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
+            i_k_seq_tile=i_k_seq_tile, k_seq_tile_size=k_seq_tile_size,
+            k_seq_tile_size_backward=k_seq_tile_size_backward)
+
+    # FIXME: Pass sbuf instead, we will have psum spilling in the current implementation
     dv_psum = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
                         dtype=np.float32, buffer=nl.psum)
     dk_psum = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
@@ -633,17 +673,20 @@ def flash_attn_bwd(
       # Prefetch dy, Q
       dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
       q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
-      for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-        ip_qk = nl.arange(d_head_tile_size)[:, None]
-        if_q = nl.arange(q_seq_tile_size)[None, :]
 
-        dy_local[i_d_head_tile, ip_qk, if_q] = nl.load(
-          dy_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_qk, i_q_seq_tile * q_seq_tile_size + if_q],
-          dtype=kernel_dtype)
+      load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
+                q_ref_hbm_tile = q_ref[batch_id, head_id],
+                dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
+                d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
+                q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
 
-        q_local[i_d_head_tile, ip_qk, if_q] = nl.load(
-          q_ref[batch_id, head_id, i_d_head_tile * d_head_tile_size + ip_qk, i_q_seq_tile * q_seq_tile_size + if_q],
-          dtype=kernel_dtype) * softmax_scale
+      logit_bias_tile = None
+      if logit_bias_ref is not None:
+        i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+        logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
+                                     buffer=nl.sbuf, dtype=kernel_dtype)
+        logit_bias_tile[:, :] = nl.load(
+          logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
 
       _flash_attn_bwd_core(
         q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
@@ -656,43 +699,102 @@ def flash_attn_bwd(
         kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
         softmax_scale=softmax_scale,
         seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
+        logit_bias_tile=logit_bias_tile
       )
 
     # Write dK, dV
-    for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-      ip_dkv = nl.arange(d_head_tile_size)[:, None]
-      if_dkv = nl.arange(k_seq_tile_size)[None, :]
-
-      nl.store(
-        out_dv_ref[batch_id, head_id,
-                   i_d_head_tile * d_head_tile_size + ip_dkv,
-                   i_k_seq_tile * k_seq_tile_size + if_dkv],
-        value=dv_psum[i_d_head_tile, ip_dkv, if_dkv],
-      )
-
-      nl.store(
-        out_dk_ref[batch_id, head_id,
-                    i_d_head_tile * d_head_tile_size + ip_dkv,
-                    i_k_seq_tile * k_seq_tile_size + if_dkv],
-        value=dk_psum[i_d_head_tile, ip_dkv, if_dkv],
-      )
+    store_dk_dv(out_dk_ref_hbm_tile=out_dk_ref[batch_id, head_id],
+                out_dv_ref_hbm_tile=out_dv_ref[batch_id, head_id],
+                local_dk=dk_psum, local_dv=dv_psum, i_k_seq_dslice=i_k_seq_dslice,
+                d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size)
 
   # Write dQ
   for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
     for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-      ip_dq = nl.arange(d_head_tile_size)[:, None]
-      if_dq = nl.arange(q_seq_tile_size)[None, :]
-
+      i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+      i_d_head_dslice = nl.ds(i_d_head_tile * d_head_tile_size, d_head_tile_size)
       nl.store(
-        out_dq_ref[batch_id, head_id,
-                   i_d_head_tile * d_head_tile_size + ip_dq,
-                   i_q_seq_tile * q_seq_tile_size + if_dq],
-        value=dq_local_reduced[i_q_seq_tile, i_d_head_tile, ip_dq, if_dq],
+        out_dq_ref[batch_id, head_id, i_d_head_dslice, i_q_seq_dslice],
+        value=dq_local_reduced[i_q_seq_tile, i_d_head_tile, :, :],
       )
 
   return out_dq_ref, out_dk_ref, out_dv_ref
 
 
+@nki.jit(mode='trace')
+def load_dy_q(dy_ref_hbm_tile, q_ref_hbm_tile, dy_local, q_local, d_head_n_tiles, d_head_tile_size, i_q_seq_tile,
+              q_seq_tile_size, softmax_scale):
+  for i_d_head_tile in nl.affine_range(d_head_n_tiles):
+    i_d_head_dslice = nl.ds(i_d_head_tile * d_head_tile_size, d_head_tile_size)
+    i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+
+    dy_local[i_d_head_tile, :, :] = nl.load(
+      dy_ref_hbm_tile[i_d_head_dslice, i_q_seq_dslice],
+      dtype=dy_local.dtype)
+
+    q_local[i_d_head_tile, :, :] = nl.load(
+      q_ref_hbm_tile[i_d_head_dslice, i_q_seq_dslice],
+      dtype=q_local.dtype) * softmax_scale
+
+
+@nki.jit(mode='trace')
+def store_dk_dv(out_dk_ref_hbm_tile, out_dv_ref_hbm_tile, local_dk, local_dv,
+                d_head_n_tiles, d_head_tile_size, i_k_seq_dslice):
+  for i in nl.affine_range(d_head_n_tiles):
+    i_d_head_dslice = nl.ds(i * d_head_tile_size, d_head_tile_size)
+
+    nl.store(out_dv_ref_hbm_tile[i_d_head_dslice, i_k_seq_dslice],
+             value=local_dv[i, :, :])
+
+    nl.store(out_dk_ref_hbm_tile[i_d_head_dslice, i_k_seq_dslice],
+             value=local_dk[i, :, :])
+
+
+@nki.jit(mode='trace')
+def load_kv(k_ref_hbm_tile, v_ref_hbm_tile, k_local, transposed_k_local, v_local,
+            d_head_n_tiles, d_head_tile_size, i_k_seq_tile, k_seq_tile_size,
+            k_seq_tile_size_backward):
+  k_seq_fwd_bwd_tile_multipler = k_seq_tile_size // k_seq_tile_size_backward
+
+  for i in nl.affine_range(d_head_n_tiles):
+    i_d_head_dslice = nl.ds(i * d_head_tile_size, d_head_tile_size)
+    i_k_seq_dslice = nl.ds(i_k_seq_tile * k_seq_tile_size, k_seq_tile_size)
+    k_local[i, :, :] = nl.load(k_ref_hbm_tile[i_d_head_dslice, i_k_seq_dslice],
+                                           dtype=k_local.dtype)
+    v_local[i, :, :] = nl.load(v_ref_hbm_tile[i_d_head_dslice, i_k_seq_dslice],
+                                           dtype=v_local.dtype)
+    ##############################################################
+    # Prefetch k transpose for the backward too
+    ##############################################################
+    for j in nl.affine_range(k_seq_fwd_bwd_tile_multipler):
+      i_k_dslice = nl.ds(j * k_seq_tile_size_backward, k_seq_tile_size_backward)
+      transposed_k_local[j, i, :, :] = nisa.nc_transpose(k_local[i, :, i_k_dslice])
+
+
+@nki.jit(mode='trace')
+def compute_rowsum(dy_o_sum, dy_ref_hbm_tile, o_ref_hbm_tile, d_head_n_tiles, d_head_tile_size, q_seq_n_tiles,
+                   q_seq_tile_size):
+  mixed_dtype = dy_o_sum.dtype
+  for i in nl.affine_range(q_seq_n_tiles):
+    dy_o_partial = nl.zeros((par_dim(q_seq_tile_size), d_head_n_tiles), dtype=mixed_dtype)
+    for j in nl.affine_range(d_head_n_tiles):
+      d_head_dslice = nl.ds(j * d_head_tile_size, d_head_tile_size)
+      q_seq_dslice = nl.ds(i * q_seq_tile_size, q_seq_tile_size)
+
+      dy_local = nl.load_transpose2d(dy_ref_hbm_tile[d_head_dslice, q_seq_dslice],
+                                     dtype=mixed_dtype)
+      o_local = nl.load_transpose2d(o_ref_hbm_tile[d_head_dslice, q_seq_dslice],
+                                    dtype=mixed_dtype)
+
+      dy_o = nl.multiply(dy_local, o_local, dtype=mixed_dtype)
+      dy_o_partial[:, j] = nisa.tensor_reduce(np.add, data=dy_o, axis=(1,),
+                                              dtype=mixed_dtype)
+
+    dy_o_sum[i, :, 0] = nisa.tensor_reduce(
+      np.add, data=dy_o_partial[:, :], axis=(1,), dtype=mixed_dtype)
+
+
+@nki.jit(mode='trace')
 def _flash_attn_bwd_core(
   q_local, k_local, transposed_k_local, v_local, dy_local,
   dk_psum, dv_psum, dq_local_reduced,
@@ -703,11 +805,7 @@ def _flash_attn_bwd_core(
   kernel_dtype, mixed_dtype,
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
-  global_i_q_seq_tile = None,
-  global_i_k_seq_tile = None,
-  # Used for nl.loop_reduce on dQ if local_i_k_seq_tile is not an index e.g. if it has an offset
-  local_i_k_seq_tile_for_dq_reduce = None,
-):
+  logit_bias_tile=None):
   """
   The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
@@ -721,14 +819,7 @@ def _flash_attn_bwd_core(
   k_seq_n_tiles_backward, k_seq_tile_size_backward = seqlen_k // 128, 128
   k_seq_fwd_bwd_tile_multipler = k_seq_tile_size // k_seq_tile_size_backward
 
-  if global_i_q_seq_tile is None:
-    global_i_q_seq_tile = local_i_q_seq_tile
-    global_i_k_seq_tile = local_i_k_seq_tile
-  
-  if local_i_k_seq_tile_for_dq_reduce is None:
-    local_i_k_seq_tile_for_dq_reduce = local_i_k_seq_tile
-
-  mask = global_i_q_seq_tile * q_seq_tile_size >= global_i_k_seq_tile * k_seq_tile_size if use_causal_mask else None
+  mask = local_i_q_seq_tile * q_seq_tile_size >= local_i_k_seq_tile * k_seq_tile_size if use_causal_mask else None
   # PSUM buffer shape: [q_seq_tile_size P, k_seq_tile_size F]
   qk_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size),
                       dtype=np.float32, buffer=nl.psum)
@@ -736,66 +827,75 @@ def _flash_attn_bwd_core(
 
   batch_id = nl.program_id(axis=0)
   head_id = nl.program_id(axis=1)
-  # Tensor indices for accessing qk result in k_seq_tile_size
-  if_q = nl.arange(q_seq_tile_size)[None, :]
-  ip_qk = nl.arange(d_head_tile_size)[:, None]
-
-  ip_q = nl.arange(q_seq_tile_size)[:, None]
-  if_k = nl.arange(k_seq_tile_size)[None, :]
 
   # Loop over contraction dim of QK matmul
   for i_d_head_tile in nl.affine_range(d_head_n_tiles):
     ##############################################################
     # Step 2.1 Compute Q^T@K, with matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
     ##############################################################
-    qk_psum[ip_q, if_k] += nisa.nc_matmul(q_local[i_d_head_tile, ip_qk, if_q],
-                                            k_local[i_d_head_tile, ip_qk, if_k],
+    qk_psum[:, :] += nisa.nc_matmul(q_local[i_d_head_tile, :, :],
+                                            k_local[i_d_head_tile, :, :],
                                             mask=mask)
 
   ######################################
   # Step 2.2. Apply optional causal mask
   ######################################
   if use_causal_mask:
-    # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
-    qk_res_buf[ip_q, if_k] = nisa.affine_select(
-      pred=(global_i_q_seq_tile * q_seq_tile_size + ip_q >= global_i_k_seq_tile * k_seq_tile_size + if_k),
-      on_true_tile=qk_psum[ip_q, if_k], on_false_value=-9984.0, dtype=mixed_dtype,
-      mask=mask)
+    iq, ik = nl.mgrid[0:q_seq_tile_size, 0:k_seq_tile_size]
+    causal_pred = (local_i_q_seq_tile * q_seq_tile_size + iq >= local_i_k_seq_tile * k_seq_tile_size + ik)
+    if logit_bias_tile is not None:
+      # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
+      intermediate = \
+        nl.add(qk_psum[:, :], logit_bias_tile[:, :], dtype=mixed_dtype, mask=mask)
+      qk_res_buf[:, :] = nisa.affine_select(
+        pred=causal_pred, 
+        on_true_tile=intermediate, on_false_value=-9984.0, dtype=mixed_dtype,
+        mask=mask
+      )
+
+    else:
+      # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
+      qk_res_buf[:, :] = nisa.affine_select(
+        pred=causal_pred,
+        on_true_tile=qk_psum[:, :], on_false_value=-9984.0, dtype=mixed_dtype,
+        mask=mask)
   else:
-    # Simply send psum result back to sbuf
-    qk_res_buf[ip_q, if_k] = \
-      nl.copy(qk_psum[ip_q, if_k], dtype=mixed_dtype)
+    if logit_bias_tile is not None:
+      # Simply add logit bias which copies back to sbuf at the same time
+      qk_res_buf[:, :] = \
+        nl.add(qk_psum[:, :], logit_bias_tile[:, :], dtype=mixed_dtype)
+    else:
+      # Simply send psum result back to sbuf
+      qk_res_buf[:, :] = \
+        nl.copy(qk_psum[:, :], dtype=mixed_dtype)
 
   softmax_y = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
-  softmax_y[ip_q, if_k] = nisa.activation(np.exp,
-                                            data=qk_res_buf[ip_q, if_k],
-                                            bias=softmax_exp_bias[local_i_q_seq_tile, ip_q, 0],
-                                            scale=1.0,
-                                            mask=mask)
+  softmax_y[:, :] = nisa.activation(np.exp,
+                                    data=qk_res_buf[:, :],
+                                    bias=softmax_exp_bias[:, local_i_q_seq_tile],
+                                    scale=1.0,
+                                    mask=mask)
   #####################################################################
   # Dropout
   #####################################################################
   if dropout_p > 0.0:
-    offset = global_i_k_seq_tile + global_i_q_seq_tile * k_seq_n_tiles \
+    offset = local_i_k_seq_tile + local_i_q_seq_tile * k_seq_n_tiles \
               + head_id * k_seq_n_tiles * q_seq_n_tiles \
               + batch_id * nheads * k_seq_n_tiles * q_seq_n_tiles
     offset_seed = nl.add(seed_local[0, 0], offset, mask=mask)
     nl.random_seed(seed=offset_seed, mask=mask)
-    softmax_y[ip_q, if_k] = nl.dropout(softmax_y[ip_q, if_k], rate=dropout_p_local[ip_q, 0], mask=mask)
-    softmax_y[ip_q, if_k] = nl.multiply(softmax_y[ip_q, if_k], 1 / (1 - dropout_p), mask=mask)
+    softmax_y[:, :] = nl.dropout(softmax_y[:, :], rate=dropout_p_local[:, 0], mask=mask)
+    softmax_y[:, :] = nl.multiply(softmax_y[:, :], 1 / (1 - dropout_p), mask=mask)
 
   #####################################################################
   # Step 3.1 Calculate the backward gradients dL/dV, where y=softmax@V
   # in value projection with matmul(stationary=dy, moving=softmax)
   #####################################################################
   for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-    ip_dv = nl.arange(d_head_tile_size)[:, None]
-    if_dv = nl.arange(k_seq_tile_size)[None, :]
-    if_trans_dy = nl.arange(q_seq_tile_size)[None, :]
-    trans_dy = nisa.nc_transpose(dy_local[i_d_head_tile, ip_dv, if_trans_dy],
+    trans_dy = nisa.nc_transpose(dy_local[i_d_head_tile, :, :],
                                   mask=mask)
-    dv_psum[i_d_head_tile, ip_dv, if_dv] += \
-      nisa.nc_matmul(trans_dy, softmax_y[ip_q, if_k], mask=mask)
+    dv_psum[i_d_head_tile, :, :] += \
+      nisa.nc_matmul(trans_dy, softmax_y[:, :], mask=mask)
 
   #####################################################################
   # Step 3.2 Calculate the backward gradients dL/dsoftmax, where y=softmax@V
@@ -804,15 +904,13 @@ def _flash_attn_bwd_core(
   softmax_dy_psum = nl.zeros((par_dim(q_seq_tile_size), k_seq_tile_size),
                               dtype=np.float32, buffer=nl.psum)
   for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-    ip_softmax_dy = nl.arange(d_head_tile_size)[:, None]
-    if_dy = nl.arange(q_seq_tile_size)[None, :]
-    softmax_dy_psum[ip_q, if_k] += \
-      nisa.nc_matmul(dy_local[i_d_head_tile, ip_softmax_dy, if_dy],
-                      v_local[i_d_head_tile, ip_softmax_dy, if_k],
+    softmax_dy_psum[:, :] += \
+      nisa.nc_matmul(dy_local[i_d_head_tile, :, :],
+                      v_local[i_d_head_tile, :, :],
                       mask=mask)
 
   softmax_dy = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
-  softmax_dy[ip_q, if_k] = nl.copy(softmax_dy_psum[ip_q, if_k], dtype=kernel_dtype,
+  softmax_dy[:, :] = nl.copy(softmax_dy_psum[:, :], dtype=kernel_dtype,
                                       mask=mask)
 
   #####################################################################
@@ -820,61 +918,55 @@ def _flash_attn_bwd_core(
   # dL/dx = y * (dL/dy - rowsum(dO_O)), where y = softmax(x)
   #####################################################################
   softmax_dx_local = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
-  softmax_dx_local[ip_q, if_k] = \
-    nisa.scalar_tensor_tensor(data=softmax_dy[ip_q, if_k],
+  softmax_dx_local[:, :] = \
+    nisa.scalar_tensor_tensor(data=softmax_dy[:, :],
                               op0=np.subtract,
-                              operand0=dy_o_sum[local_i_q_seq_tile, ip_q, 0],
+                              operand0=dy_o_sum[local_i_q_seq_tile, :, 0],
                               op1=np.multiply,
-                              operand1=softmax_y[ip_q, if_k],
+                              operand1=softmax_y[:, :],
                               mask=mask)
 
   #####################################################################
   # Step 5.1 Calculate dK, with matmul(stationary=Q, moving=softmax_dx)
   #####################################################################
   for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-    ip_trans_q = nl.arange(d_head_tile_size)[:, None]
-    if_trans_q = nl.arange(q_seq_tile_size)[None, :]
-    ip_dk = nl.arange(d_head_tile_size)[:, None]
-    trans_q_local = nisa.nc_transpose(q_local[i_d_head_tile, ip_trans_q, if_trans_q],
+    trans_q_local = nisa.nc_transpose(q_local[i_d_head_tile, :, :],
                                       mask=mask)
-    dk_psum[i_d_head_tile, ip_dk, if_k] += \
+    dk_psum[i_d_head_tile, :, :] += \
       nisa.nc_matmul(trans_q_local,
-                      softmax_dx_local[ip_q, if_k],
+                      softmax_dx_local[:, :],
                       mask=mask)
 
   #####################################################################
   # Step 5.2 Calculate dQ
   #####################################################################
-  if_k = nl.arange(k_seq_tile_size_backward)[None, :]
-  ip_dq = nl.arange(d_head_tile_size)[:, None]
-  if_dq = nl.arange(q_seq_tile_size)[None, :]
-  if_d = nl.arange(d_head_tile_size)[None, :]
-  ip_transposed_k = nl.arange(k_seq_tile_size_backward)[:, None]
   for i_d_head_tile in nl.affine_range(d_head_n_tiles):
     dq_psum = nl.zeros((par_dim(d_head_tile_size), q_seq_tile_size),
                         dtype=np.float32, buffer=nl.psum)
     for i_k_seq_tile_backward in nl.affine_range(k_seq_fwd_bwd_tile_multipler):
+      i_k_seq_dslice = nl.ds(i_k_seq_tile_backward * k_seq_tile_size_backward,
+                             k_seq_tile_size_backward)
       transposed_softmax_dx_local = \
-        nisa.nc_transpose(softmax_dx_local[ip_q, i_k_seq_tile_backward * k_seq_tile_size_backward + if_k],
+        nisa.nc_transpose(softmax_dx_local[:, i_k_seq_dslice],
                           mask=mask)
-      dq_psum[ip_dq, if_dq] += nisa.nc_matmul(
-          transposed_k_local[i_k_seq_tile_backward, i_d_head_tile, ip_transposed_k, if_d],
+      dq_psum[:, :] += nisa.nc_matmul(
+          transposed_k_local[i_k_seq_tile_backward, i_d_head_tile, :, :],
           transposed_softmax_dx_local,
           mask=mask)
-    dq_local = nl.multiply(dq_psum[ip_dq, if_dq], softmax_scale, dtype=kernel_dtype, mask=mask)
-    dq_local_reduced[local_i_q_seq_tile, i_d_head_tile, ip_dq, if_dq] = nl.loop_reduce(
-      dq_local, op=np.add, loop_indices=(local_i_k_seq_tile_for_dq_reduce,),
+    dq_local = nl.multiply(dq_psum[:, :], softmax_scale, dtype=kernel_dtype, mask=mask)
+    dq_local_reduced[local_i_q_seq_tile, i_d_head_tile, :, :] = nl.loop_reduce(
+      dq_local, op=np.add, loop_indices=(local_i_k_seq_tile,),
       dtype=mixed_dtype, mask=mask)
 
 
 @nki.jit
 def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=False,
-                                           mixed_percision=True):
+                                           mixed_precision=True):
   """
   Fused self attention kernel for small head size Stable Diffusion workload.
 
   Computes softmax(QK^T)V. Decoder model can optionally include a causal mask
-  application. Does not include QKV rojection, output projection, dropout,
+  application. Does not include QKV projection, output projection, dropout,
   residual connection, etc.
 
   This kernel is designed to be used for Stable Diffusion models where the
@@ -890,14 +982,14 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
 
   IO tensor dtypes:
    - This kernel assumes all IO tensors have the same dtype
-   - If mixed_percision is True, then all Tensor Engine operation will be performed in
+   - If mixed_precision is True, then all Tensor Engine operation will be performed in
      bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
      will be in the same type as the inputs.
   """
   # Use q_ref dtype as the intermediate tensor dtype
   # Assume all IO tensors have the same dtype
   kernel_dtype = q_ref.dtype
-  pe_in_dt = nl.bfloat16 if mixed_percision else np.float32
+  pe_in_dt = nl.bfloat16 if mixed_precision else np.float32
   assert q_ref.dtype == k_ref.dtype == v_ref.dtype
 
   # Shape checking

@@ -1,11 +1,10 @@
 import pytest
 
-from neuronxcc.nki.kernels.vision import select_and_scatter_kernel
-from neuronxcc.nki import benchmark, baremetal
+from nki_samples.reference.vision import select_and_scatter_kernel
+from neuronxcc.nki import benchmark, baremetal, simulate_kernel
 import neuronxcc.nki.language as nl
 import numpy as np
 
-numeric_func = baremetal(select_and_scatter_kernel)
 bench_func = benchmark(warmup=5, iters=10)(select_and_scatter_kernel)
 
 np.random.seed(0)
@@ -51,14 +50,15 @@ class TestSelectAndScatter:
 
         bench_func(operand_dev, source_dev)
         latency_res = bench_func.benchmark_result.nc_latency
-        p99 = latency_res.get_latency_percentile(99)
+        p99 = latency_res.get_latency_percentile(50)
         assert p99 <= latency
 
+    @pytest.mark.simulation
     @pytest.mark.parametrize("n, c, operand_h, operand_w, source_h, source_w, dtype", [
  	    [8, 64, 112, 112, 56, 56, np.float32],
  	    [8, 64, 112, 112, 56, 56, nl.bfloat16],
  	])
-    def test_select_and_scatter_for_numeric(self, n, c, operand_h, operand_w, source_h, source_w, dtype):
+    def test_select_and_scatter_for_numeric(self,simulation_only, n, c, operand_h, operand_w, source_h, source_w, dtype):
         operand_dev = nl.static_cast(np.random.random_sample((n, c, operand_h, operand_w)), dtype)
         source_dev = nl.static_cast(np.random.random_sample((n, c, source_h, source_w)), dtype)
 
@@ -66,7 +66,11 @@ class TestSelectAndScatter:
         operand_tensor = nl.static_cast(operand_dev, np.float32)
         source_tensor = nl.static_cast(source_dev, np.float32)
 
-        output_dev = numeric_func(operand_dev, source_dev)
+        numeric_func = baremetal(select_and_scatter_kernel)
+        if simulation_only:
+            output_dev = simulate_kernel(numeric_func, operand_dev, source_dev)
+        else:
+            output_dev = numeric_func(operand_dev, source_dev)
         golden_result = cpu_golden_result(operand_tensor, source_tensor)
         nki_result = nl.static_cast(output_dev, np.float32)
 

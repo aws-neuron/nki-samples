@@ -9,13 +9,13 @@ import numpy as np
 @nki.jit
 def allocated_fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref,
                                            use_causal_mask=False,
-                                           mixed_percision=True):
+                                           mixed_precision=True):
   """
   Allocated fused self attention kernel for small head size Stable Diffusion workload.
   
-  Computes (softmax(Q.T@K)V).T. The wired layout is choosen to avoid transpose as
+  Computes (softmax(Q.T@K)V).T. The wired layout is chosen to avoid transpose as
   much as possible to simplify the debug. The kernel uses the direct allocation API,
-  and implements double buffering to achive better performance than automatic allocation.
+  and implements double buffering to achieve better performance than automatic allocation.
   As of NeuronSDK 2.21, it achieves 18% better performance than auto allocated equivalent.
   To see the performance gap, you can use ``force_auto_alloc`` decorator to override
   manual allocation and benchmark the performance difference.
@@ -34,14 +34,14 @@ def allocated_fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref,
 
   IO tensor dtypes:
    - This kernel assumes all IO tensors have the same dtype
-   - If mixed_percision is True, then all Tensor Engine operation will be performed in
+   - If mixed_precision is True, then all Tensor Engine operation will be performed in
      bfloat16 and accumulation will be performed in float32. Otherwise the intermediates
      will be in the same type as the inputs.
   """
   # Use q_ref dtype as the intermediate tensor dtype
   # Assume all IO tensors have the same dtype
   kernel_dtype = np.float32
-  pe_in_dt = nl.bfloat16 if mixed_percision else kernel_dtype
+  pe_in_dt = nl.bfloat16 if mixed_precision else kernel_dtype
 
   kernel_dtype_itemsize = np.dtype(kernel_dtype).itemsize
   pe_in_dt_itemsize = np.dtype(pe_in_dt).itemsize
@@ -211,7 +211,7 @@ def allocated_fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref,
             on_true_tile=qk_psum[i_interleave_grp, i_k_seq_tile,ip_qk, if_qk], on_false_value=-9984.0, dtype=kernel_dtype)
         else:
           # Copy result to SBUF and find partial maximum for softmax
-          qk_res_buf[i_interleave_grp, ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.tensor_scalar_reduce(qk_psum[i_interleave_grp, i_k_seq_tile,ip_qk, if_qk], np.add, 1.0,
+          qk_res_buf[i_interleave_grp, ip_qk, i_k_seq_tile * k_seq_tile_size + if_qk] = nisa.tensor_scalar_reduce(data=qk_psum[i_interleave_grp, i_k_seq_tile,ip_qk, if_qk], op0=np.add, operand0=1.0,
               reduce_op=np.max, reduce_res=neg_max_res[i_interleave_grp, ip_max, i_k_seq_tile], dtype=kernel_dtype)
 
       # Find global max from tiles

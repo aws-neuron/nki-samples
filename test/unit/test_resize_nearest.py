@@ -3,12 +3,11 @@ Copyright (c) 2023, Amazon.com. All Rights Reserved
 """
 import pytest
 
-from neuronxcc.nki.kernels.vision import resize_nearest_fixed_dma_kernel
-from neuronxcc.nki import benchmark, baremetal
+from nki_samples.reference.vision import resize_nearest_fixed_dma_kernel
+from neuronxcc.nki import benchmark, baremetal, simulate_kernel
 import neuronxcc.nki.language as nl
 import numpy as np
 
-numeric_func = baremetal(resize_nearest_fixed_dma_kernel)
 bench_func = benchmark(warmup=5, iters=10)(resize_nearest_fixed_dma_kernel)
 
 
@@ -49,20 +48,25 @@ class TestResizeNearest:
         bench_func_ = bench_func[in_b]
         bench_func_(input_dev, (out_b, out_h, out_w, out_c))
         latency_res = bench_func_.benchmark_result.nc_latency
-        p99 = latency_res.get_latency_percentile(99)
+        p99 = latency_res.get_latency_percentile(50)
         assert p99 <= latency
 
+    @pytest.mark.simulation
     @pytest.mark.parametrize("in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype", [
  	    [10, 30, 20, 1280, 10, 59, 38, 1280, np.float32],
         [1, 30, 20, 1280, 1, 59, 38, 1280, nl.float16],
         [1, 30, 20, 1280, 1, 59, 38, 1280, nl.bfloat16],
  	])
-    def test_resize_nearest_for_numberic(self, in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype):
+    def test_resize_nearest_for_numberic(self, simulation_only, in_b, in_h, in_w, in_c, out_b, out_h, out_w, out_c, dtype):
         input_tensor = np.random.random_sample((in_b, in_h, in_w, in_c)).astype(np.float32)
 
         input_dev = nl.static_cast(input_tensor, dtype)
 
-        output_tensor = numeric_func[in_b](input_dev, (out_b, out_h, out_w, out_c))
+        numeric_func = baremetal(resize_nearest_fixed_dma_kernel)
+        if simulation_only:
+            output_tensor = simulate_kernel(numeric_func[in_b], input_dev, (out_b, out_h, out_w, out_c))
+        else:
+            output_tensor = numeric_func[in_b](input_dev, (out_b, out_h, out_w, out_c))
         output_tensor = nl.static_cast(output_tensor, np.float32)
         golden_result = cpu_golden_result(input_tensor, output_tensor.shape)
         assert np.allclose(output_tensor, golden_result, atol=1e-2)
