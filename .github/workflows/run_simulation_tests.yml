@@ -1,0 +1,32 @@
+name: Run Python Simulation Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com
+        python -m pip install wget awscli
+        python -m pip install pytest
+        python -m pip install neuronx-cc==2.*
+    - name: Test with pytest
+      run: |
+        PYTHONPATH=$PYTHONPATH:src/ pytest test/unit/ --simulation-only

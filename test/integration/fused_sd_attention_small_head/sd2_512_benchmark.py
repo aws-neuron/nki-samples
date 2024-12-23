@@ -8,6 +8,8 @@ import torch_neuronx
 from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from diffusers.models.unet_2d_condition import UNet2DConditionOutput
 
+parent_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.append(parent_dir)
 from perf_utils.LatencyCollector import benchmark
 
 import sys

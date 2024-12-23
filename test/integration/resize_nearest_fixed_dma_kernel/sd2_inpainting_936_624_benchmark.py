@@ -23,6 +23,8 @@ if use_new_diffusers:
 else:
     from diffusers.models.cross_attention import CrossAttention
 
+parent_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.append(parent_dir)
 from perf_utils.LatencyCollector import benchmark
 
 import sys

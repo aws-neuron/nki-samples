@@ -1,1 +1,7 @@
-Tests under this folder are unit tests for the kernels in `neuronxcc.nki.kernels`, and they are part of the nki-samples Github Repo. Only public APIs can be used for tests in this folder.
+Tests under this folder are unit tests for the kernels in `src/nki_samples`. 
+
+To execute the tests, we need to include `src/nki_samples` in the `PYTHONPATH`.
+
+For example, 
+
+PYTHONPATH=$PYTHONPATH:/home/ubuntu/nki-samples/src/ pytest test_flash_attn_fwd.py
