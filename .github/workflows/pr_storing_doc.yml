@@ -1,0 +1,44 @@
+# Simple workflow for deploying static content to GitHub Pages
+name: Store generated docs to artifact
+
+on:
+  # Runs on main branch PRs
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Single deploy job since we're just deploying
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com
+          python -m pip install wget awscli
+          python -m pip install pytest
+          python -m pip install neuronx-cc==2.*
+          python -m pip install Sphinx 
+      - name: Generate Docs
+        run: |
+          sphinx-build doc _apidoc
+      - name: Upload Page Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-pr-doc
+          path: _apidoc
+          retention-days: 7
