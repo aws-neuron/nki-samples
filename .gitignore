@@ -1,1 +1,5 @@
 build
+_apidoc
+doc/_apidoc
+doc/generated
+__pycache__
