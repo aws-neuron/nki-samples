@@ -1,6 +1,6 @@
 ## View Documentation
 
-The documentation of this repo is built with Github Action, and is available at `<insert_link_when_deployed>`
+The documentation of this repo is built with Github Action, and is available at https://aws-neuron.github.io/nki-samples/
 
 ## Build Documentation Locally
 

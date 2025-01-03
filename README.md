@@ -19,7 +19,7 @@ enabling bare-metal access to the chip for full control.
 ## Documentation
 The latest NKI documentation can be found on the AWS Documentation site, [here](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/). 
 Documentation for NKI kernels are both inline (docstring) and available on the documentation site's 
-[kernel API reference page](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/nki.kernels.html).
+[kernel API reference page](https://aws-neuron.github.io/nki-samples/).
 
 ## Repository Structure
 
