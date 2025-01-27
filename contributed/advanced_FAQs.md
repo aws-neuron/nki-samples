@@ -98,7 +98,7 @@ for out_ in nl.sequential_range(n_tiles_a_o):
 
 ```
 
-Both options can work. But option 2 will be more efficient, as it will turn the nl.sequential_range() back to nl.affine_range() and get better throughput since the loop iterations don't need to wait for a shared chunk of memory to be updated. Tensor `w_temp` is not used outside of the loop so allocating it outside of the loop just adds an unnecessary loop-carried dependency to figure out. 
+Both options can work. But option 2 will be more efficient, as it will turn the `nl.sequential_range()` back to `nl.affine_range()` and get better throughput since the loop iterations don't need to wait for a shared chunk of memory to be updated. Tensor `w_temp` is not used outside of the loop so allocating it outside of the loop just adds an unnecessary loop-carried dependency to figure out. 
 
 2. Use appropriate buffer types (SBUF/PSUM). SBUF is on-chip storage on the NeuronCore. In comparison, SBUF is significantly smaller than HBM (24 MiB) but offers much higher bandwidth (~20x than HBM). PSUM is a small, specialized memory (2 MiB) dedicated to holding matrix multiplication results produced by the tensor engine.
 
