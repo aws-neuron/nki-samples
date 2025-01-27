@@ -14,7 +14,7 @@
 When you want to create a completely new variable, such as loading data directly using `nl.load()` without a predefined buffer, or computing some mathematical function as the result of multiple tiles to create a new tile, then you can use `foo = nl.load()` or `bar = tile_a + tile_b`.
 
 However, sometimes you simply want to work with the data or physical address stored by reference through that variable. This is the case at least twice in examples you've seen.
-1.  When you create a buffer on chip, such as with `a_tile = nl.ndarray( etc, buffer = nl.sbuf)`. You can then use `a_tile[...] = nl.load()` to load directly onto that tile. 
+1.  When you create a buffer on chip, such as with `a_tile = nl.ndarray( etc, buffer = nl.sbuf)`. You can then use `a_tile[...] = nl.load()` to load directly onto that buffer. 
 2. When you are performing computation on tiles through indexing, and you want that same indexing logic to carry into the position where your resultant data is stored. This is the case for `a_tile[...] = nl.load(a_vec[m * ROW_CHUNK : (m + 1) * ROW_CHUNK])`.
     
 Generally we use the `var[...]` syntax to let you alter the data represented by your variable without you needing to define a new one.
