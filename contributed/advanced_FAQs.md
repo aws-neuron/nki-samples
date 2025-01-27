@@ -19,7 +19,7 @@ However, sometimes you simply want to work with the data or physical address sto
     
 Generally we use the `var[...]` syntax to let you alter the data represented by your variable without you needing to define a new one.
 
-When you have a variable declared with `var = nl.ndarray(...)`, you should use:
+When you have a variable declared with `var = nl.ndarray(etc)`, you should use:
 - `var[...] = <nki api>` to assign values to the existing variable
 - `var = <nki api>` creates a new variable that replaces the reference to the previous variable of that name
 
