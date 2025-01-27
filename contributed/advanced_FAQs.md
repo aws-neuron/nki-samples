@@ -54,7 +54,7 @@ Any other use of `+=` may trigger compiler bugs. Please do not use `+=` outside 
 ## Memory and Variables
 
 ### How do tensor allocations work?
-In Neuron, [XLA tensor](https://pytorch.org/xla/master/learn/pytorch-on-xla-devices.html#id3) allocations follow a lazy execution model that differs fundamentally from PyTorch's eager execution. When a tensor is declared, it doesn't immediately allocate memory - instead, it creates a descriptor and records operations in a computation graph. This deferred execution strategy allows XLA to optimize operations, potentially fusing multiple separate operations into a single optimized operation. The actual memory allocation only occurs at execution time when the results are needed, which can lead to more efficient memory usage and better performance through operation optimization.
+[XLA tensors](https://pytorch.org/xla/master/learn/pytorch-on-xla-devices.html#id3) follow a lazy execution model that differs fundamentally from PyTorch's eager execution. When a tensor is declared, it doesn't immediately allocate memory - instead, it creates a descriptor and records operations in a computation graph. This deferred execution strategy allows XLA to optimize operations, potentially fusing multiple separate operations into a single optimized operation. The actual memory allocation only occurs at execution time when the results are needed, which can lead to more efficient memory usage and better performance through operation optimization.
 
 Memory management and allocation patterns significantly impact performance and resource utilization. When working with tensors in loops, resuing tensors in the loop may create unnecessary dependencies, while declaring them inside the loop may improve memory reuse.  
 
