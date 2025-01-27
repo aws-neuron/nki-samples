@@ -17,7 +17,7 @@ However, sometimes you simply want to work with the data or physical address sto
 1.  When you create a buffer on chip, such as with `a_tile = nl.ndarray()`. You can then use `a_tile[...] = nl.load()` to load directly onto that tile. 
 2. When you are performing computation on tiles through indexing, and you want that same indexing logic to carry into the position where your resultant data is stored. This is the case for `a_tile[...] = nl.load(a_vec[m * ROW_CHUNK : (m + 1) * ROW_CHUNK])`.
     
-Generally we use the `[...]` syntax to let you alter the data represented by your variable without you needing to define a new one.
+Generally we use the `var[...]` syntax to let you alter the data represented by your variable without you needing to define a new one.
 
 When you have a variable declared with `var = nl.ndarray(...)`, you should use:
 - `var[...] = <nki api>` to assign values to the existing variable
