@@ -3,7 +3,7 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as ni
 import numpy as np
 
-def matmul(A_DRAM, B_DRAM, Z_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4):
+def matmul(A_DRAM, B_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4):
   """
   Optimized matrix multiplication kernel
 
@@ -22,6 +22,8 @@ def matmul(A_DRAM, B_DRAM, Z_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES
   """
   K, M = A_DRAM.shape
   _, N = B_DRAM.shape
+
+  Z_DRAM = nl.ndarray([M, N], dtype=A_DRAM.dtype, buffer=nl.shared_hbm)
 
   TILE_K = nl.tile_size.pmax
   TILE_M = nl.tile_size.gemm_stationary_fmax
@@ -97,14 +99,15 @@ def matmul(A_DRAM, B_DRAM, Z_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES
         # split across the partition dimension
         nl.store(Z_DRAM[m_start:m_end, n_start:n_end], value=Z_SBUF[m1])
 
+  return Z_DRAM
+
 def check_correct():
   K, M, N = 1024, 4096, 2048
   A = np.random.random_sample([K, M]).astype(np.float16)
   B = np.random.random_sample([K, N]).astype(np.float16)
-  Z = np.ndarray(shape=[M, N], dtype=np.float16)
 
   baremetal_func = nki.baremetal()(matmul)
-  baremetal_func(A, B, Z)
+  Z = baremetal_func(A, B)
 
   Z_corr = A.T @ B
 
@@ -114,10 +117,9 @@ def benchmark_kernel():
   K, M, N = 8192, 4096, 8192
   A = np.random.random_sample([K, M]).astype(np.float16)
   B = np.random.random_sample([K, N]).astype(np.float16)
-  Z = np.ndarray(shape=[M, N], dtype=np.float16)
 
-  benchmark_func = nki.benchmark(warmup=5, iters=10)(matmul)
-  benchmark_func(A, B, Z)
+  benchmark_func = nki.benchmark(warmup=5, iters=10, save_neff_name="file.neff")(matmul)
+  benchmark_func(A, B)
 
 def main():
   check_correct()
