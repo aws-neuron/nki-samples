@@ -312,12 +312,12 @@ def nki_apply_rotary_embedding(q, k, cos, sin):
 
         nl.store(
             output_q_hbm_tile[seq_batch_id * nl.tile_size.pmax + i_p, i_f],
-            output_tile[0],
+            output_tile[0, :, :],
             mask=(seq_batch_id * nl.tile_size.pmax + i_p < seq_len),
         )
         nl.store(
             output_k_hbm_tile[seq_batch_id * nl.tile_size.pmax + i_p, i_f],
-            output_tile[1],
+            output_tile[1, :, :],
             mask=(seq_batch_id * nl.tile_size.pmax + i_p < seq_len),
         )
 
