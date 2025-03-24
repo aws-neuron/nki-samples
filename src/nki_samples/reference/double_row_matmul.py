@@ -8,8 +8,6 @@ kernels - Builtin high performance NKI kernels.
 from neuronxcc import nki
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
-import math
-import numpy as np
 
 @nki.jit
 def quantized_double_row_matmul(
@@ -94,7 +92,7 @@ def quantized_double_row_matmul(
       i_lhs = nl.mgrid[0:TILE_M, 0:BLOCK_K]
       for bm_l in nl.affine_range(TILES_IN_BLOCK_M):
         # Load and quantize tiles from rhs,
-        # setting the load tile to `TILE_M x BLOCK_K` to optimize DMA performance.
+        # setting the load tile to [TILE_M, BLOCK_K] to optimize DMA performance.
         lhs_i_m = m * BLOCK_M + bm_l * TILE_M + i_lhs.p
         lhs_i_k = k * BLOCK_K + i_lhs.x
 
@@ -125,7 +123,7 @@ def quantized_double_row_matmul(
 
       for n in nl.affine_range(NUM_BLOCK_N):
         # Loading tiles from rhs,
-        # setting the load tile to `TILE_K x 2 * BLOCK_N` to optimize DMA performance
+        # setting the load tile to [TILE_K, 2 * BLOCK_N] to optimize DMA performance
         # (i.e. loading 2 rows of a rhs block at a time).
         i_rhs = nl.mgrid[0:TILE_K, 0:2 * BLOCK_N]
 
@@ -141,17 +139,19 @@ def quantized_double_row_matmul(
           for bn in nl.affine_range(TILES_IN_BLOCK_N):
             res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.bfloat16, buffer=nl.psum)
             for bk in nl.affine_range(TILES_IN_BLOCK_K // 2):
+              i_k, i_tile_m, i_m = nl.mgrid[0:TILE_K, 0:2, 0:TILE_M]
               lhsT_double_tile = lhsT_quantized_tiles[
                 bm,
-                nl.arange(TILE_K)[:, None, None],
-                bk * (2 * TILE_M) + nl.arange(2)[None, :, None] * TILE_M + nl.arange(TILE_M)[None, None, :]
+                i_k,
+                bk * (2 * TILE_M) + i_tile_m * TILE_M + i_m
               ]
               assert lhsT_double_tile.shape == (TILE_K, 2, TILE_M)
 
+              i_k, i_tile_n, i_n = nl.mgrid[0:TILE_K, 0:2, 0:TILE_N]
               rhs_double_tile = rhs_quantized_tiles[
                 bk,
-                nl.arange(TILE_K)[:, None, None],
-                2 * bn * TILE_N + nl.arange(2)[None, :, None] * TILE_N + nl.arange(TILE_N)[None, None, :]
+                i_k,
+                2 * bn * TILE_N + i_tile_n * TILE_N + i_n
               ]
               assert rhs_double_tile.shape == (TILE_K, 2, TILE_N)
 
