@@ -42,9 +42,10 @@ class FlashConfig:
 
 
 @nki.jit(mode='trace')
-def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ):
+def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ, use_dma_transpose=False):
   for i in nl.affine_range(LARGE_TILE_SZ // 512):
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
+    # Temporarily disable use_dma_tranpose by default until we stablized it
+    if use_dma_transpose and nisa.get_nc_version() == nisa.nc_version.gen3:
       p_local_t_tmp = nl.ndarray((par_dim(128), 512), buffer=nl.sbuf, dtype=p_local.dtype)
     else:
       p_local_t_tmp = nl.ndarray((par_dim(128), 512), buffer=nl.psum, dtype=np.float32)
@@ -53,7 +54,7 @@ def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ):
       j_128_slice = nl.ds(j * 128, 128)
       i_j_128_slice = nl.ds(i * 512 + j * 128, 128)
 
-      if nisa.get_nc_version() == nisa.nc_version.gen3:
+      if use_dma_transpose and nisa.get_nc_version() == nisa.nc_version.gen3:
         p_local_t_tmp[:, j_128_slice] = nisa.dma_transpose(
           p_local[:, i_j_128_slice])
       else:
