@@ -26,8 +26,8 @@ def nki_softmax_kernel(a_tensor):
                     mask=(i * 128 + ix < num_rows))
 
     # Find max and subtract from each value to ensure numerical stability
-    max_vals = nl.max(a_tile, axis=[1], keepdims=True)
-    shifted = nl.subtract(a_tile, max_vals)
+    max_vals = nl.max(a_tile, axis=[1], keepdims=True, mask=(i * 128 + ix < num_rows))
+    shifted = nl.subtract(a_tile, max_vals, mask=(i * 128 + ix < num_rows))
 
     # Compute element-wise exp of a_tensor
     numerator = nl.exp(shifted)
