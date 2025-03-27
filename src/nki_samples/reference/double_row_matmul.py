@@ -9,7 +9,7 @@ from neuronxcc import nki
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 
-@nki.jit
+@nki.jit(platform_target='trn2')
 def quantized_double_row_matmul(
     lhs,
     rhs_quantized, rhs_scale,
