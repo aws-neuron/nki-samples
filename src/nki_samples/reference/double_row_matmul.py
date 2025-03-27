@@ -137,7 +137,7 @@ def quantized_double_row_matmul(
         i_res_mm = nl.mgrid[0:TILE_M, 0:TILE_N]
         for bm in nl.affine_range(TILES_IN_BLOCK_M):
           for bn in nl.affine_range(TILES_IN_BLOCK_N):
-            res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.bfloat16, buffer=nl.psum)
+            res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             for bk in nl.affine_range(TILES_IN_BLOCK_K // 2):
               i_k, i_tile_m, i_m = nl.mgrid[0:TILE_K, 0:2, 0:TILE_M]
               lhsT_double_tile = lhsT_quantized_tiles[
