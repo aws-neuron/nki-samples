@@ -17,11 +17,7 @@ import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 from neuronxcc import nki
 
-from neuronxcc.nki.language import par_dim
-from dataclasses import dataclass
-
-from neuronxcc.starfish.support.dtype import bfloat16
-
+from neuronxcc.nki.language import par_dim, bfloat16
 
 sb_mod = nki.compiler.sbuf.mod_alloc
 psum_mod = nki.compiler.psum.mod_alloc
