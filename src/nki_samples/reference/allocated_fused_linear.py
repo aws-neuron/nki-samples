@@ -86,7 +86,7 @@ def allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
         square_sum[...] = nisa.activation(op=nl.rsqrt, data=square_sum[...], bias=bias_placeholder[...], mask=((2*i + i_interleave_grp) * pmax < seqlen))
 
         # all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
-        if nisa.get_nc_version() == nisa.nc_version.gen3:
+        if nisa.get_nc_version() >= nisa.nc_version.gen3:
           transpose_res_psum = nl.ndarray((NUM_TRANSP_TILES, par_dim(pmax), 4*pmax), dtype=weights.dtype,
                                           buffer=ncc.psum.mod_alloc(base_bank=0, num_bank_tiles=(1,))) # FIXME: perf is better when all tiles are on bank 0?
         else:
