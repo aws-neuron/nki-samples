@@ -31,8 +31,9 @@ def nki_tensor_add_kernel_(a_input, b_input):
   offset_i_y = nl.program_id(1) * 512
 
   # Generate tensor indices to index tensors a and b
-  ix = offset_i_x + nl.arange(128)[:, None]
-  iy = offset_i_y + nl.arange(512)[None, :]
+  ix_, iy_ = nl.mgrid[0:128, 0:512]
+  ix = offset_i_x + ix_
+  iy = offset_i_y + iy_
 
   # Load input data from device memory (HBM) to on-chip memory (SBUF)
   # We refer to an indexed portion of a tensor as an intermediate tensor

@@ -25,9 +25,7 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor):
   assert a_tensor.shape[1] == g_tensor.shape[0]
 
   # Generate tensor indices to index input tensor
-  ix = nl.arange(128)[:, None]
-  iw = nl.arange(1)[:, None]
-  iy = nl.arange(a_tensor.shape[1])[None, :]
+  ix, iw, iy = nl.mgrid[0:128, 0:1, 0:a_tensor.shape[1]]
 
   num_rows = a_tensor.shape[0]
 

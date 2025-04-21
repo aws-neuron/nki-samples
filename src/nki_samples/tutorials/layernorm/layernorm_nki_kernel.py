@@ -28,9 +28,7 @@ def nki_layernorm_kernel_v1(input_tensor, epsilon, gamma_vector, beta_vector):
   assert input_tensor.shape[1] == gamma_vector.shape[0] == beta_vector.shape[0]
 
   # Generate tile indices for loading/storing data
-  i_p_io = nl.arange(nl.tile_size.pmax)[:, None]
-  i_f_io = nl.arange(input_tensor.shape[1])[None, :]
-  i_p_param = nl.arange(1)[:, None]
+  i_p_io, i_f_io, i_p_param = nl.mgrid[0:nl.tile_size.pmax, 0:input_tensor.shape[1], 0:1]
 
   # Number of rows in the input tensor
   num_rows = input_tensor.shape[0]
@@ -81,9 +79,7 @@ def nki_layernorm_kernel_v2(input_tensor, epsilon, gamma_vector, beta_vector):
   assert input_tensor.shape[1] == gamma_vector.shape[0] == beta_vector.shape[0]
 
   # Generate tile indices for loading/storing data
-  i_p_io = nl.arange(nl.tile_size.pmax)[:, None]
-  i_f_io = nl.arange(input_tensor.shape[1])[None, :]
-  i_p_param = nl.arange(1)[:, None]
+  i_p_io, i_f_io, i_p_param = nl.mgrid[0:nl.tile_size.pmax, 0:input_tensor.shape[1], 0:1]
 
   # Number of rows in the input tensor
   num_rows = input_tensor.shape[0]
@@ -104,8 +100,7 @@ def nki_layernorm_kernel_v2(input_tensor, epsilon, gamma_vector, beta_vector):
 
     # Tile free dimension of the input tensor by nl.tile_size.bn_stats_fmax, 
     # as bn_stats has a free dimension size limit
-    i_f_bn = nl.arange(nl.tile_size.bn_stats_fmax)[None, :]
-    i_f_stats = nl.arange(6)[None, :]
+    i_f_bn, i_f_stats = nl.mgrid[0:nl.tile_size.bn_stats_fmax, 0:6]
     num_bn_stats = math.ceil(input_tensor.shape[1]/nl.tile_size.bn_stats_fmax)
     stats_results = nl.ndarray((nl.tile_size.pmax, 6*num_bn_stats), dtype=np.float32)
     for j in nl.affine_range(num_bn_stats):

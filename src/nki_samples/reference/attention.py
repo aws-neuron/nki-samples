@@ -1029,37 +1029,42 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
   trans_v = nl.ndarray((par_dim(v_seq_tile_size), v_seq_n_tiles, d_head), dtype=pe_in_dt)
 
   for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
-    ip_v = nl.arange(v_seq_tile_size)[:, None]
-    if_v = nl.arange(d_head_tile_size)[None, :]
+    ip_v, if_v = nl.mgrid[0:v_seq_tile_size, 0:d_head_tile_size]
     trans_v[ip_v, i_k_seq_tile, if_v] = nl.load(
       v_ref[batch_id, i_k_seq_tile * k_seq_tile_size + ip_v, if_v],
       dtype=pe_in_dt)
 
   q_local = nl.ndarray((q_seq_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=pe_in_dt)
-  ip_q = nl.arange(d_head_tile_size)[:, None]
-  if_q = nl.arange(q_seq_tile_size)[None, :]
+  ip_q, if_q = nl.mgrid[0:d_head_tile_size, 0:q_seq_tile_size]
   for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
     q_local[i_q_seq_tile, ip_q, if_q] = nl.load(
       q_ref[batch_id, ip_q, i_q_seq_tile * q_seq_tile_size + if_q],
       dtype=pe_in_dt) * softmax_scale
 
   k_local = nl.ndarray((k_seq_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size), dtype=pe_in_dt)
-  ip_k = nl.arange(d_head_tile_size)[:, None]
-  if_k = nl.arange(k_seq_tile_size)[None, :]
+  ip_k, if_k = nl.mgrid[0:d_head_tile_size, 0:k_seq_tile_size]
   for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+      idx_1, idx_2 = nl.mgrid[0:k_seq_tile_size, 0:d_head_tile_size]
+      k_local[i_k_seq_tile, ip_k, if_k] = nl.load_transpose2d(
+          k_ref[batch_id,
+                i_k_seq_tile * k_seq_tile_size + idx_1,
+                idx_2],
+          dtype=pe_in_dt)
+  for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
+    idx_1, idx_2 = nl.mgrid[0:k_seq_tile_size, 0:d_head_tile_size]
     k_local[i_k_seq_tile, ip_k, if_k] = nl.load_transpose2d(
-      k_ref[batch_id,
-            i_k_seq_tile * k_seq_tile_size + nl.arange(k_seq_tile_size)[:, None],
-            nl.arange(d_head_tile_size)[None, :]],
-      dtype=pe_in_dt)
+        k_ref[batch_id,
+              i_k_seq_tile * k_seq_tile_size + idx_1,
+              idx_2],
+        dtype=pe_in_dt)
+
 
   for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):  # indent = 2
     # A SBUF buffer for an independent softmax tile
     qk_res_buf = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=kernel_dtype)
 
     neg_max_res = nl.ndarray((par_dim(q_seq_tile_size), k_seq_n_tiles), dtype=kernel_dtype)
-    ip_max = nl.arange(q_seq_tile_size)[:, None]
-    if_max = nl.arange(k_seq_n_tiles)[None, :]
+    ip_max, if_max = nl.mgrid[0:q_seq_tile_size, 0:k_seq_n_tiles]
 
     # Loop over RHS free of matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):  # indent = 4
@@ -1070,8 +1075,7 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
                          dtype=np.float32, buffer=nl.psum)
 
       # Tensor indices for accessing qk result in k_seq_tile_size
-      ip_qk = nl.arange(q_seq_tile_size)[:, None]
-      if_qk = nl.arange(k_seq_tile_size)[None, :]
+      ip_qk, if_qk = nl.mgrid[0:q_seq_tile_size, 0:k_seq_tile_size]
 
       ##############################################################
       # Step 2. matmul(stationary=tensor_q, moving=tensor_k, contract=d_head)
@@ -1105,10 +1109,8 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
       np.min, data=neg_max_res[ip_max, if_max],
       axis=(1,), dtype=kernel_dtype, negate=False)
 
-    ip_softmax = nl.arange(q_seq_tile_size)[:, None]
-    if_softmax = nl.arange(seqlen)[None, :]
-    ip_sum_res = nl.arange(q_seq_tile_size)[:, None]
-    if_sum_res = nl.arange(d_head_tile_size)[None, :]
+    ip_softmax, if_softmax = nl.mgrid[0:q_seq_tile_size, 0:seqlen]
+    ip_sum_res, if_sum_res = nl.mgrid[0:q_seq_tile_size, 0:d_head_tile_size]
 
     softmax_res = nl.ndarray((par_dim(q_seq_tile_size), seqlen), dtype=pe_in_dt)
     sum_divisor = nl.ndarray((par_dim(q_seq_tile_size), d_head_tile_size), dtype=kernel_dtype)
@@ -1135,27 +1137,23 @@ def fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref, use_causal_mask=
     attn_res_psum = nl.zeros((par_dim(d_head_tile_size), q_seq_tile_size),
                              dtype=np.float32, buffer=nl.psum)
 
-    ip_scores_t = nl.arange(k_seq_tile_size)[:, None]
-    if_scores_t = nl.arange(q_seq_tile_size)[None, :]
+    ip_scores_t, if_scores_t = nl.mgrid[0:k_seq_tile_size, 0:q_seq_tile_size]
     # Loop over matmul_1 contraction
     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
       ###################################
       # Step 5. transpose(softmax_res)
       ###################################
-      ip_scores = nl.arange(q_seq_tile_size)[:, None]
-      if_scores = nl.arange(k_seq_tile_size)[None, :]
+      ip_scores, if_scores = nl.mgrid[0:q_seq_tile_size, 0:k_seq_tile_size]
 
       trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t] = nisa.nc_transpose(
         softmax_res[ip_scores, i_k_seq_tile * k_seq_tile_size + if_scores])
 
-    ip_out = nl.arange(d_head_tile_size)[:, None]
-    if_out = nl.arange(q_seq_tile_size)[None, :]
+    ip_out, if_out = nl.mgrid[0:d_head_tile_size, 0:q_seq_tile_size]
     for i_k_seq_tile in nl.affine_range(k_seq_n_tiles):
       ######################################################################
       # Step 6. matmul_1(stationary=trans_v, moving=trans_softmax_res, contract=seqlen_v=seqlen_k)
       ######################################################################
-      ip_v_t = nl.arange(k_seq_tile_size)[:, None]
-      if_v_t = nl.arange(d_head_tile_size)[None, :]
+      ip_v_t, if_v_t = nl.mgrid[0:k_seq_tile_size, 0:d_head_tile_size]
       attn_res_psum[ip_out, if_out] += \
         nisa.nc_matmul(moving=trans_softmax_res[ip_scores_t, i_k_seq_tile, if_scores_t],
                        stationary=trans_v[ip_v_t, i_k_seq_tile, if_v_t])
