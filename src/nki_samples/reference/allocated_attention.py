@@ -216,7 +216,7 @@ def allocated_fused_self_attn_for_SD_small_head_size(q_ref, k_ref, v_ref,
       ip_softmax, if_softmax = nl.mgrid[0:q_seq_tile_size, 0:seqlen]
       ip_sum_res, if_sum_res = nl.mgrid[0:q_seq_tile_size, 0:d_head_tile_size]
 
-    _, if_reduction = nl.mgrid[0:1, 0:reduction_size]
+      _, if_reduction = nl.mgrid[0:1, 0:reduction_size]
       for i_exp in nl.affine_range(reduction_tiles):
         exp_res[i_interleave_grp, ip_softmax, i_exp*reduction_size + if_reduction] = nisa.activation_reduce(np.exp,
           data=qk_res_buf[i_interleave_grp, ip_softmax, i_exp * reduction_size + if_reduction],
