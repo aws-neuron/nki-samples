@@ -169,23 +169,32 @@ def _nki_apply_rotary_embedding_core(q_tile, k_tile, cos_tile, sin_tile, output_
     The function applies rotary position embedding to query and key tensors
     using the provided cosine and sine embeddings.
     """
+
+    assert q_tile.shape[-1] % 2 == 0, "Sequence length for q_tile must be even!"
+    assert k_tile.shape[-1] % 2 == 0, "Sequence length for k_tile must be even!"
+    assert (
+        q_tile.shape[-1] == k_tile.shape[-1]
+    ), "q_tile and k_tile must have the same sequence length"
+
+    seq_len = q_tile.shape[-1]
+
     # Rotate Q
     output_tile[0, :, :] = q_tile * cos_tile
-    output_tile[0, :, : q_tile.shape[-1] // 2] = output_tile[
-        0, :, : q_tile.shape[-1] // 2
-    ] + (-1 * q_tile[:, q_tile.shape[-1] // 2 :] * sin_tile[:, : q_tile.shape[-1] // 2])
-    output_tile[0, :, q_tile.shape[-1] // 2 :] = output_tile[
-        0, :, q_tile.shape[-1] // 2 :
-    ] + (q_tile[:, : q_tile.shape[-1] // 2] * sin_tile[:, q_tile.shape[-1] // 2 :])
+    output_tile[0, :, : seq_len // 2] = output_tile[0, :, : seq_len // 2] + (
+        -1 * q_tile[:, seq_len // 2 :] * sin_tile[:, : seq_len // 2]
+    )
+    output_tile[0, :, seq_len // 2 :] = output_tile[0, :, seq_len // 2 :] + (
+        q_tile[:, : seq_len // 2] * sin_tile[:, seq_len // 2 :]
+    )
 
     # Rotate K
     output_tile[1, :, :] = k_tile * cos_tile
-    output_tile[1, :, : k_tile.shape[-1] // 2] = output_tile[
-        1, :, : k_tile.shape[-1] // 2
-    ] + (-1 * k_tile[:, k_tile.shape[-1] // 2 :] * sin_tile[:, : k_tile.shape[-1] // 2])
-    output_tile[1, :, k_tile.shape[-1] // 2 :] = output_tile[
-        1, :, k_tile.shape[-1] // 2 :
-    ] + (k_tile[:, : k_tile.shape[-1] // 2] * sin_tile[:, k_tile.shape[-1] // 2 :])
+    output_tile[1, :, : seq_len // 2] = output_tile[1, :, : seq_len // 2] + (
+        -1 * k_tile[:, seq_len // 2 :] * sin_tile[:, : seq_len // 2]
+    )
+    output_tile[1, :, seq_len // 2 :] = output_tile[1, :, seq_len // 2 :] + (
+        k_tile[:, : seq_len // 2] * sin_tile[:, seq_len // 2 :]
+    )
 
 
 def div_ceil(n: int, d: int) -> int:
@@ -258,15 +267,15 @@ def nki_apply_rotary_embedding(q, k, cos, sin):
     AssertionError
         If input tensor shapes don't match or head dimension > 128
     """
-    assert q.shape == k.shape, (
-        f"Shape of Q Tensor: {q.shape} doesn't match shape of K Tensor: {k.shape}"
-    )
-    assert cos.shape == sin.shape, (
-        f"Shape of cos Tensor: {cos.shape} doesn't match shape of sin Tensor: {sin.shape}"
-    )
-    assert q.shape[-1] <= 128, (
-        f"Shape of head dim (last dim) is more than 128: {q.shape}"
-    )
+    assert (
+        q.shape == k.shape
+    ), f"Shape of Q Tensor: {q.shape} doesn't match shape of K Tensor: {k.shape}"
+    assert (
+        cos.shape == sin.shape
+    ), f"Shape of cos Tensor: {cos.shape} doesn't match shape of sin Tensor: {sin.shape}"
+    assert (
+        q.shape[-1] <= 128
+    ), f"Shape of head dim (last dim) is more than 128: {q.shape}"
 
     batch_id = nl.program_id(axis=0)
     head_id = nl.program_id(axis=1)
