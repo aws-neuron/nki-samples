@@ -13,7 +13,7 @@ import numpy as np
 
 
 # NKI_EXAMPLE_16_BEGIN
-git @nki.jit
+@nki.jit
 def nki_matmul_basic_(lhsT, rhs):
   """NKI kernel to compute a 64x128x512 matrix multiplication operation
 
