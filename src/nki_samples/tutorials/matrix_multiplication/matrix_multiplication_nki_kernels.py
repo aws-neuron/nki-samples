@@ -13,7 +13,7 @@ import numpy as np
 
 
 # NKI_EXAMPLE_16_BEGIN
-@nki.jit
+git @nki.jit
 def nki_matmul_basic_(lhsT, rhs):
   """NKI kernel to compute a 64x128x512 matrix multiplication operation
 
@@ -151,7 +151,7 @@ def nki_matmul_hoist_load_(lhsT, rhs):
   for m in nl.affine_range(M // TILE_M):
     # Load a whole column tiles from lhsT (with K * TILE_N numbers)
     # This corresponds to the whole row in the original lhs
-    lhsT_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_N),
+    lhsT_tiles = nl.ndarray((K // TILE_K, nl.par_dim(TILE_K), TILE_M),
                             dtype=lhsT.dtype,
                             buffer=nl.sbuf)
 
