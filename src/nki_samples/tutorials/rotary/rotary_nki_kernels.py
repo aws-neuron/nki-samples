@@ -282,8 +282,7 @@ def nki_apply_rotary_embedding(q, k, cos, sin):
     seq_len = q.shape[2]
     num_seq_batches = div_ceil(seq_len, nl.tile_size.pmax)
     output = nl.ndarray([2] + list(q.shape), dtype=q.dtype, buffer=nl.shared_hbm)
-    i_p = nl.arange(128)[:, None]
-    i_f = nl.arange(q.shape[-1])[None, :]
+    i_p, i_f = nl.mgrid[0:128, 0:q.shape[-1]]
     for seq_batch_id in nl.affine_range(0, num_seq_batches):
         q_hbm_tile = q[batch_id, head_id]
         k_hbm_tile = k[batch_id, head_id]
