@@ -842,7 +842,6 @@ def prefill_active_tokens_and_epilogue(
     acc_type,
     B_F_SIZE,
     B_D_SIZE,
-    skip_active,
 ):
     # -------- Load l, m, o back to SBUF from HBM ------------ #
     num_active_tiles = seqlen_q // ACTIVE_Q_TILE_SIZE
@@ -873,7 +872,7 @@ def prefill_active_tokens_and_epilogue(
         )
 
     # compute attention between input query, key and value
-    if not skip_active and key is not None and value is not None:
+    if key is not None and value is not None:
         B_F_SIZE = min(seqlen_q, B_F_SIZE)
         LARGE_KV_TILE_SIZE = seqlen_q
         cur_k_tile = nl.ndarray(
@@ -1202,7 +1201,6 @@ def decode_active_tokens_and_epilogue(
     kernel_dtype,
     acc_type,
     B_D_SIZE,
-    skip_active,
 ):
     ACTIVE_Q_TILE_SIZE = min(seqlen_q, B_P_SIZE)
     num_active_tiles = seqlen_q // ACTIVE_Q_TILE_SIZE
@@ -1237,7 +1235,7 @@ def decode_active_tokens_and_epilogue(
         m_buffer_sbuf[:, i, :, :] = nl.copy(lmo_tmp[:, :, nl.ds(B_D_SIZE + 1, 1)])
 
     # compute attention between input query, key and value
-    if not skip_active and key is not None and value is not None:
+    if key is not None and value is not None:
         cur_q_tile = nl.ndarray(
             (par_dim(B_D_SIZE), num_active_tiles, q_h_per_k_h, ACTIVE_Q_TILE_SIZE),
             dtype=kernel_dtype,

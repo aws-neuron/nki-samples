@@ -119,7 +119,6 @@ def flash_paged_attn_blockspase_prefill_static(
     active_mask,
     softmax_scale=None,
     mixed_precision=True,
-    skip_active=False,
 ):
     b, h, k_h, seqlen_q, d, LARGE_KV_TILE_SIZE, INNER_Q_TILE_SIZE = check_input_shapes(
         query, key, value, key_cache, value_cache, tile_masks, active_mask, False
@@ -245,7 +244,6 @@ def flash_paged_attn_blockspase_prefill_static(
         acc_type=acc_type,
         B_F_SIZE=B_F_SIZE,
         B_D_SIZE=B_D_SIZE,
-        skip_active=skip_active,
     )
     return o
 
@@ -266,7 +264,6 @@ def flash_paged_attn_blockspase_prefill_dynamic(
     dynamic_loop_unroll_factor=1,
     softmax_scale=None,
     mixed_precision=True,
-    skip_active=False,
 ):
     b, h, k_h, seqlen_q, d, LARGE_KV_TILE_SIZE, INNER_Q_TILE_SIZE = check_input_shapes(
         query, key, value, key_cache, value_cache, tile_masks, active_mask, False
@@ -426,7 +423,6 @@ def flash_paged_attn_blockspase_prefill_dynamic(
         acc_type=acc_type,
         B_F_SIZE=B_F_SIZE,
         B_D_SIZE=B_D_SIZE,
-        skip_active=skip_active,
     )
     return o
 
@@ -447,7 +443,6 @@ def flash_paged_attn_blockspase_decode_static(
     q_update_pred=None,
     softmax_scale=None,
     mixed_precision=True,
-    skip_active=False,
 ):
     b, h, k_h, seqlen_q, d, LARGE_KV_TILE_SIZE, _ = check_input_shapes(
         query, key, value, key_cache, value_cache, tile_masks, active_mask, True
@@ -578,7 +573,6 @@ def flash_paged_attn_blockspase_decode_static(
         kernel_dtype=kernel_dtype,
         acc_type=acc_type,
         B_D_SIZE=B_D_SIZE,
-        skip_active=skip_active,
     )
     return o
 
@@ -601,7 +595,6 @@ def flash_paged_attn_blockspase_decode_dynamic(
     dynamic_loop_unroll_factor=1,
     softmax_scale=None,
     mixed_precision=True,
-    skip_active=False,
 ):
     b, h, k_h, seqlen_q, d, LARGE_KV_TILE_SIZE, _ = check_input_shapes(
         query, key, value, key_cache, value_cache, tile_masks, active_mask, True
@@ -790,7 +783,6 @@ def flash_paged_attn_blockspase_decode_dynamic(
         kernel_dtype=kernel_dtype,
         acc_type=acc_type,
         B_D_SIZE=B_D_SIZE,
-        skip_active=skip_active,
     )
     return o
 
@@ -812,7 +804,6 @@ def flash_attn_varlen_blocksparse_nkifunc(
     n_kv_head=None,
     head_size=None,
     mixed_precision=True,
-    skip_active=False,
     decode_mode=False,
 ):
     """
@@ -881,7 +872,6 @@ def flash_attn_varlen_blocksparse_nkifunc(
                 dynamic_loop_unroll_factor=dynamic_loop_unroll_factor,
                 softmax_scale=1.0 / (head_size**0.5),
                 mixed_precision=mixed_precision,
-                skip_active=skip_active,
             )
             return flash_paged_attn_blockspase_decode_dynamic[1, n_kv_head](**kwargs)
         else:
@@ -899,7 +889,6 @@ def flash_attn_varlen_blocksparse_nkifunc(
                 dynamic_loop_unroll_factor=dynamic_loop_unroll_factor,
                 softmax_scale=1.0 / (head_size**0.5),
                 mixed_precision=mixed_precision,
-                skip_active=skip_active,
             )
             return flash_paged_attn_blockspase_prefill_dynamic[1, n_kv_head](**kwargs)
     else:
@@ -919,7 +908,6 @@ def flash_attn_varlen_blocksparse_nkifunc(
                 last_tile_indices=last_tile_indices,
                 softmax_scale=1.0 / (head_size**0.5),
                 mixed_precision=mixed_precision,
-                skip_active=skip_active,
             )
             return flash_paged_attn_blockspase_decode_static[1, n_kv_head](**kwargs)
         else:
@@ -935,6 +923,5 @@ def flash_attn_varlen_blocksparse_nkifunc(
                 active_mask=active_mask,
                 softmax_scale=1.0 / (head_size**0.5),
                 mixed_precision=mixed_precision,
-                skip_active=skip_active,
             )
             return flash_paged_attn_blockspase_prefill_static[1, n_kv_head](**kwargs)

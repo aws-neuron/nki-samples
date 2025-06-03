@@ -94,13 +94,11 @@ class BlockDiagonalCausalFromBottomRightMask:
         return prior_mask
 
     @staticmethod
-    def from_seqlens(query_lens, seq_lens, block_size=None, skip_active=False):
+    def from_seqlens(query_lens, seq_lens, block_size=None):
         contexted = block_size is None
         if contexted:
             prior_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
-                query_lens,
-                seq_lens,
-                skip_active=skip_active,
+                query_lens, seq_lens
             )
             active_mask = None
         else:
@@ -113,7 +111,12 @@ class BlockDiagonalCausalFromBottomRightMask:
         return prior_mask, active_mask
 
 
-def ref_softmax(x: torch.Tensor, dim: int, mixed_precision=False, return_max_reduce=False):
+def ref_softmax(
+    x: torch.Tensor,
+    dim: int,
+    mixed_precision=False,
+    return_max_reduce=False,
+):
     print(f"{x.shape=}")
     if mixed_precision:
         x = x.float()
@@ -140,7 +143,11 @@ def ref_masked_attention(
         # masked_score = scaled_qk + attn_mask.float()
         masked_score = torch.where(attn_mask, scaled_qk, -9984)
     if return_buffer:
-        score, sum_exp, max_buffer = ref_softmax(masked_score, dim=-1, return_max_reduce=True)
+        score, sum_exp, max_buffer = ref_softmax(
+            masked_score,
+            dim=-1,
+            return_max_reduce=True,
+        )
     else:
         score, sum_exp = ref_softmax(masked_score, dim=-1)
     o_buffer = torch.einsum("hqk,khd->qhd", score.to(kernel_dtype), value).contiguous()
@@ -166,7 +173,6 @@ def ref_context_attention(
     head_size,
     num_queries_per_kv,
     return_buffer=False,
-    skip_active=False,
 ):
     scale = float(1.0 / (head_size**0.5))
     if num_queries_per_kv > 1:
@@ -175,7 +181,7 @@ def ref_context_attention(
         value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
 
     attn_mask, _ = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-        query_lens, seq_lens, skip_active=skip_active
+        query_lens, seq_lens
     )
 
     # convert binary mask to -inf values
@@ -221,7 +227,11 @@ def sample_input_sizes(
     if prefill_batch_size == 0:
         query_lens = torch.ones(decode_batch_size, dtype=torch.long)
     else:
-        prefill_query_lens = _sample_lengths(prefill_batch_size, min_query_len, max_query_len)
+        prefill_query_lens = _sample_lengths(
+            prefill_batch_size,
+            min_query_len,
+            max_query_len,
+        )
         decode_query_lens = torch.ones(decode_batch_size, dtype=torch.long)
         query_lens = torch.cat([prefill_query_lens, decode_query_lens])
     if max_ctx_len == 0:
@@ -264,9 +274,15 @@ def sample_inputs(
         batch_size, max_block_per_request
     )
     b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
-    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens[:-1], dtype=torch.long), dim=0)
+    b_start_loc = torch.cumsum(
+        torch.tensor([0] + query_lens[:-1], dtype=torch.long),
+        dim=0,
+    )
     # copy kv to cache
-    b_seq_start_loc = torch.cumsum(torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0)
+    b_seq_start_loc = torch.cumsum(
+        torch.tensor([0] + seq_lens[:-1], dtype=torch.long),
+        dim=0,
+    )
     for i in range(batch_size):
         for j in range(query_lens[i]):
             k[b_start_loc[i] + j].copy_(key[b_seq_start_loc[i] + b_ctx_len[i] + j])
@@ -299,7 +315,7 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size, num_
     num_seqs = len(seq_lens)
     active_blocks: list[int] = []
     for seq_id in range(num_seqs):
-        active_blocks = active_blocks + block_tables[seq_id, : blocks_per_seq[seq_id]].tolist()
+        active_blocks += block_tables[seq_id, : blocks_per_seq[seq_id]].tolist()
     return F.pad(
         torch.tensor(active_blocks, dtype=torch.int32),
         (0, num_blocks - len(active_blocks)),

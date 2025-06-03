@@ -30,7 +30,6 @@ def _run_ref_version(
     head_size,
     num_queries_per_kv,
     return_buffer,
-    skip_active,
 ):
     num_actual_tokens = sum(query_lens)
     max_num_queries = pad_to_next_power_of_2(num_actual_tokens)
@@ -43,7 +42,6 @@ def _run_ref_version(
         head_size,
         num_queries_per_kv,
         return_buffer=return_buffer,
-        skip_active=skip_active,
     )
     output_ref_padded = F.pad(
         output_ref,
@@ -106,7 +104,6 @@ class NKIBlockSparseRunner:
         num_queries_per_kv,
         dynamic_loop_unroll_factor,
         mixed_precision,
-        skip_active,
     ):
         input_args, input_kwargs = self.build_torch_inputs(
             query,
@@ -123,7 +120,6 @@ class NKIBlockSparseRunner:
             num_queries_per_kv,
             dynamic_loop_unroll_factor,
             mixed_precision,
-            skip_active,
         )
         if self.exec_mode == "xla":
             return self.run_nki_xla(*input_args, **input_kwargs)
@@ -165,7 +161,6 @@ class NKIBlockSparseRunner:
         num_queries_per_kv,
         dynamic_loop_unroll_factor,
         mixed_precision,
-        skip_active,
     ):
         # calculate input shapes
         self.num_actual_tokens = sum(query_lens)
@@ -329,7 +324,6 @@ class NKIBlockSparseRunner:
             head_size=head_size,
             dynamic_loop_unroll_factor=dynamic_loop_unroll_factor,
             mixed_precision=mixed_precision,
-            skip_active=skip_active,
             decode_mode=self.decode_mode,
         )
         return input_args, input_kwargs
@@ -384,7 +378,6 @@ def _run_test(
     mixed_precision,
     column_order,
     dynamic_unroll_factor,
-    skip_active,
     decode_mode,
     nki_block_sparse_runner_cls=NKIBlockSparseRunner,
     save_dir=None,
@@ -437,7 +430,6 @@ def _run_test(
         num_queries_per_kv=num_queries_per_kv,
         dynamic_loop_unroll_factor=dynamic_unroll_factor,
         mixed_precision=mixed_precision,
-        skip_active=skip_active,
     )
 
     output_ref = _run_ref_version(
@@ -449,7 +441,6 @@ def _run_test(
         head_size,
         num_queries_per_kv,
         return_buffer=True,
-        skip_active=skip_active,
     )
 
     print(output_nki.shape, output_ref.shape)
@@ -518,8 +509,6 @@ def test_blocksparse_flash_paged_attention(
     column_order: bool,
     pad_power2_num_tiles: bool,
 ) -> None:
-    skip_active = False
-
     assert large_kv_tile_size % block_size == 0
 
     torch.manual_seed(0)
@@ -558,7 +547,6 @@ def test_blocksparse_flash_paged_attention(
             dynamic_unroll_factor=dynamic_unroll_factor,
             mixed_precision=mixed_precision,
             column_order=column_order,
-            skip_active=skip_active,
             decode_mode=False,
         )
 
@@ -616,8 +604,6 @@ def test_decode_only(
     pad_power2_num_tiles: bool,
     dynamic_unroll_factor: int,
 ) -> None:
-    skip_active = False
-
     assert large_kv_tile_size % block_size == 0
 
     torch.manual_seed(0)
@@ -653,6 +639,5 @@ def test_decode_only(
             dynamic_unroll_factor=dynamic_unroll_factor,
             mixed_precision=mixed_precision,
             column_order=False,
-            skip_active=skip_active,
             decode_mode=True,
         )

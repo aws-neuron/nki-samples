@@ -45,7 +45,9 @@ class BlockSparsePlan:
             assert arg.shape[0] == self.num_tiles, (arg.shape, self.num_tiles)
 
         if self.tile_kv_skip_indices.size > 0:
-            assert self.tile_kv_skip_indices[0] > 0, f"We will never expect to skip first tile"
+            assert (
+                self.tile_kv_skip_indices[0] > 0
+            ), f"We will never expect to skip first tile"
             assert np.all(self.tile_kv_skip_indices < self.num_tiles)
 
     @property
@@ -73,8 +75,12 @@ class FlashPagedAttentionSchedulerBase:
     Generate schedule for flash attention
     """
 
-    def __init__(self, prompt_lens, context_lens, tile_size_q, tile_size_kv, block_size):
-        assert tile_size_kv % block_size == 0, "tile_size_kv must be multiple of block_size"
+    def __init__(
+        self, prompt_lens, context_lens, tile_size_q, tile_size_kv, block_size
+    ):
+        assert (
+            tile_size_kv % block_size == 0
+        ), "tile_size_kv must be multiple of block_size"
 
         def _check_np_int_array(*arrays):
             for a in arrays:
@@ -123,13 +129,18 @@ class SequenceAlignedPlan(BlockSparsePlan):
             pad_width = [(0, pad_to - shape[0])] + [(0, 0)] * (len(shape) - 1)
             return np.pad(x, pad_width, mode="constant", constant_values=pad_value)
 
-        tile_q_indices = pad(self.tile_q_indices, pad_num_tile_to, pad_value=q_pad_value)
+        tile_q_indices = pad(
+            self.tile_q_indices,
+            pad_num_tile_to,
+            pad_value=q_pad_value,
+        )
         tile_block_tables_offsets = pad(self.tile_block_table_offsets, pad_num_tile_to)
         # pad different value for q and kv seq ids so that sequence affiliation mask is False
         tile_q_seq_ids = pad(self.tile_q_seq_ids, pad_num_tile_to, pad_value=0)
         tile_kv_seq_ids = pad(self.tile_kv_seq_ids, pad_num_tile_to, pad_value=1)
         tile_kv_skip_indices = np.array(
-            self.tile_kv_skip_indices.tolist() + list(range(num_tiles, pad_num_tile_to)),
+            self.tile_kv_skip_indices.tolist()
+            + list(range(num_tiles, pad_num_tile_to)),
             dtype=np.int32,
         )
         return self.__class__(
@@ -150,7 +161,12 @@ class SequenceAlignedPlan(BlockSparsePlan):
             tile_q_indices[tile_q_indices == -1] = skip_value
         return tile_q_indices
 
-    def build_tile_block_tables(self, block_tables, skip_value, dynamic_loop_unrolling=None):
+    def build_tile_block_tables(
+        self,
+        block_tables,
+        skip_value,
+        dynamic_loop_unrolling=None,
+    ):
         block_tables = np.concatenate(
             [block_tables.squeeze(), np.array([skip_value], dtype=np.int32)]
         )
@@ -158,7 +174,9 @@ class SequenceAlignedPlan(BlockSparsePlan):
         if self.tile_kv_skip_indices.size > 0:
             tile_kv_skip_indices = self.tile_kv_skip_indices
             if dynamic_loop_unrolling:
-                indices_not_at_loop_start = tile_kv_skip_indices % dynamic_loop_unrolling != 0
+                indices_not_at_loop_start = (
+                    tile_kv_skip_indices % dynamic_loop_unrolling != 0
+                )
                 tile_kv_skip_indices = tile_kv_skip_indices[indices_not_at_loop_start]
             tile_block_tables[tile_kv_skip_indices, :] = skip_value
         return tile_block_tables
@@ -186,7 +204,9 @@ class SequenceAlignedPlan(BlockSparsePlan):
             tile_masks = np.expand_dims(self.tile_q_seq_ids, 1) == np.expand_dims(
                 tile_kv_seq_ids, 2
             )
-            tile_masks = tile_masks.reshape((num_tiles, tile_size_kv // B_P_SIZE, B_P_SIZE))
+            tile_masks = tile_masks.reshape(
+                (num_tiles, tile_size_kv // B_P_SIZE, B_P_SIZE)
+            )
             # Transpose for efficient load
             # New layout: (B_P_SIZE, num_tiles, tile_size_kv // B_P_SIZE)
             tile_masks = tile_masks.transpose(2, 0, 1)
@@ -196,7 +216,11 @@ class SequenceAlignedPlan(BlockSparsePlan):
             )
         return tile_masks
 
-    def build_decode_tile_update_indices(self, padded_seqlen_q, build_update_pred=False):
+    def build_decode_tile_update_indices(
+        self,
+        padded_seqlen_q,
+        build_update_pred=False,
+    ):
         tile_q_indices = self.tile_q_indices[: self.num_real_tiles].flatten().copy()
         _, num_tiles_per_seq = np.unique(tile_q_indices, return_counts=True)
         last_tile_indices = np.cumsum(num_tiles_per_seq) - 1
@@ -215,6 +239,7 @@ class SequenceAlignedPlan(BlockSparsePlan):
         padded_last_tile_indices[: len(last_tile_indices)] = last_tile_indices
         padded_last_tile_indices[len(last_tile_indices) :] = last_tile_indices[-1]
         return update_indices, padded_last_tile_indices
+
 
 class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
     def __init__(
@@ -285,7 +310,11 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
             kv_indices = kv_indices.flatten()
 
             q_offsets = _build_load_offsets(
-                prompt_starts[seq_id], self.prompt_lens[seq_id], self.tile_size_q, q_indices, -1
+                prompt_starts[seq_id],
+                self.prompt_lens[seq_id],
+                self.tile_size_q,
+                q_indices,
+                -1,
             )
             bt_offsets = _build_load_offsets(
                 context_block_starts[seq_id],
@@ -296,10 +325,18 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
             )
 
             q_seq_ids = _build_seq_ids(
-                seq_id, self.prompt_lens[seq_id], self.tile_size_q, q_indices, self.num_seq
+                seq_id,
+                self.prompt_lens[seq_id],
+                self.tile_size_q,
+                q_indices,
+                self.num_seq,
             )
             kv_seq_ids = _build_seq_ids(
-                seq_id, self.context_lens[seq_id], self.tile_size_kv, kv_indices, self.num_seq + 1
+                seq_id,
+                self.context_lens[seq_id],
+                self.tile_size_kv,
+                kv_indices,
+                self.num_seq + 1,
             )
 
             tile_q_offsets.append(q_offsets)
@@ -329,7 +366,10 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
                 tile_kv_skip_indices = np.array([], dtype=np.int32)
         else:
             tile_q_offsets = np.empty((0, self.tile_size_q), dtype=np.int32)
-            tile_bt_offsets = np.empty((0, self.tile_size_kv // self.block_size), dtype=np.int32)
+            tile_bt_offsets = np.empty(
+                (0, self.tile_size_kv // self.block_size),
+                dtype=np.int32,
+            )
             tile_q_seq_ids = np.empty((0, self.tile_size_q), dtype=np.int32)
             tile_kv_seq_ids = np.empty((0, self.tile_size_kv), dtype=np.int32)
             tile_kv_skip_indices = np.array([], dtype=np.int32)
