@@ -5,7 +5,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from neuronxcc import nki
 from flash_attn_blocksparse import flash_attn_varlen_blocksparse_nkifunc
 
 from blocksparse_planner import SequenceAlignedScheduler as BlockSparseScheduler

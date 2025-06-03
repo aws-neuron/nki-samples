@@ -35,17 +35,6 @@ def is_power_of_2(x):
     return x > 0 and (x & (x - 1)) == 0
 
 
-def load_v_tile(v_hbm_tile, cur_v_tile, large_tile_idx, v_i, LARGE_TILE_SZ):
-    B_D_SIZE = v_hbm_tile.shape[-1]
-    cur_v_tile[:, nl.ds(v_i * B_D_SIZE, B_D_SIZE)] = nl.load(
-        v_hbm_tile[
-            nl.ds(large_tile_idx * LARGE_TILE_SZ + B_P_SIZE * v_i, B_P_SIZE),
-            :,
-        ],
-        dtype=cur_v_tile.dtype,
-    )
-
-
 def load_indices(indices_hbm, partition_size=None):
     """
     Load a 2D indices array of shape [num_tiles, num_indices] from HBM to SBUF

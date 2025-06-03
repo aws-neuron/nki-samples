@@ -19,26 +19,23 @@ import neuronxcc.nki as nki
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.language import par_dim
-from neuronxcc.nki.isa.constants import oob_mode
 from neuronxcc.nki.typing import scalar
 
 from paged_cache import (
     prepare_kv_block_dim_tiling,
     transform_block_tables_for_indirect_load,
-    load_kv_tile_from_cache,
 )
 from flash_attn_helper import (
-    _flash_attention_core,
-    _flash_attention_core_kq_matmul,
-    _active_attention_core_batched,
+    prefill_prior_tokens,
+    prefill_active_tokens_and_epilogue,
+    decode_prior_tokens,
+    decode_active_tokens_and_epilogue,
 )
 from utils import (
     B_P_SIZE,
     B_FMAX_SIZE,
     ceil_div,
     is_power_of_2,
-    pad_to_multiple,
-    load_v_tile,
     load_indices,
     load_indices_for_loop_step,
     prepare_q_indices_range,
@@ -46,8 +43,6 @@ from utils import (
     prepare_q_update_pred,
     load_decode_query,
     load_and_broadcast_q_update_preds,
-    PF_transpose_with_PE,
-    create_identity_for_transpose,
 )
 
 
@@ -202,7 +197,7 @@ def flash_paged_attn_blockspase_prefill_static(
         num_head=k_h,
         head_id=head_id,
     )
-    prefill_prior(
+    prefill_prior_tokens(
         num_tiles_unrolled=MAX_NUM_TILE,
         query=query,
         key_cache=key_cache,
@@ -231,7 +226,7 @@ def flash_paged_attn_blockspase_prefill_static(
         B_D_SIZE=B_D_SIZE,
     )
 
-    epilogue_prefill(
+    prefill_active_tokens_and_epilogue(
         o=o,
         query=query,
         key=key,
@@ -372,7 +367,7 @@ def flash_paged_attn_blockspase_prefill_dynamic(
             LARGE_Q_TILE_SIZE * dynamic_loop_unroll_factor,
             partition_size=INNER_Q_TILE_SIZE,
         )
-        prefill_prior(
+        prefill_prior_tokens(
             num_tiles_unrolled=dynamic_loop_unroll_factor,
             query=query,
             key_cache=key_cache,
@@ -412,7 +407,7 @@ def flash_paged_attn_blockspase_prefill_dynamic(
         nl.store(dst=cond, value=cond_next)
         cond_var = cond
 
-    epilogue_prefill(
+    prefill_active_tokens_and_epilogue(
         o=o,
         query=query,
         key=key,
@@ -434,369 +429,6 @@ def flash_paged_attn_blockspase_prefill_dynamic(
         skip_active=skip_active,
     )
     return o
-
-
-def prefill_prior(
-    num_tiles_unrolled,
-    query,
-    key_cache,
-    value_cache,
-    m_buffer,
-    l_buffer,
-    o_buffer,
-    tile_q_indices_sbuf,
-    cur_masks,
-    tile_masks,
-    block_tables_sbuf,
-    num_blocks_per_large_tile,
-    block_size,
-    kernel_dtype,
-    acc_type,
-    identity_for_transpose_k_hbm,
-    identity_for_transpose_p_hbm,
-    batch_id,
-    head_id,
-    q_h_per_k_h,
-    softmax_scale,
-    n_small_in_large_q_tile,
-    INNER_Q_TILE_SIZE,
-    LARGE_KV_TILE_SIZE,
-    B_F_SIZE,
-    B_D_SIZE,
-):
-    load_mask_locally = cur_masks is None
-    identity_for_transpose_k = nl.load(identity_for_transpose_k_hbm)
-    identity_for_transpose_p = nl.load(identity_for_transpose_p_hbm)
-    # Max, LSE, Output, and Q buffers on sbuf, define them outside static loop for DMA skipping
-    m_sbuf_tile = nl.zeros(
-        (par_dim(INNER_Q_TILE_SIZE), n_small_in_large_q_tile, q_h_per_k_h, 1),
-        dtype=acc_type,
-        buffer=nl.sbuf,
-    )
-    l_sbuf_tile = nl.zeros(
-        (par_dim(INNER_Q_TILE_SIZE), n_small_in_large_q_tile, q_h_per_k_h, 1),
-        dtype=acc_type,
-        buffer=nl.sbuf,
-    )
-    o_sbuf_tile = nl.zeros(
-        (par_dim(INNER_Q_TILE_SIZE), n_small_in_large_q_tile, q_h_per_k_h, B_D_SIZE),
-        dtype=acc_type,
-        buffer=nl.sbuf,
-    )
-    num_loads = num_blocks_per_large_tile // B_P_SIZE
-    k_load_buffer = nl.zeros(
-        (par_dim(B_P_SIZE), num_loads, block_size * B_D_SIZE),
-        dtype=key_cache.dtype,
-    )
-    v_load_buffer = nl.zeros(
-        (par_dim(B_P_SIZE), num_loads * block_size * B_D_SIZE),
-        dtype=value_cache.dtype,
-    )
-
-    for local_tile_idx in nl.sequential_range(num_tiles_unrolled):
-        if load_mask_locally:
-            cur_masks = load_indices(
-                tile_masks[local_tile_idx],
-                partition_size=INNER_Q_TILE_SIZE,
-            )
-        cur_k_tile, cur_v_tile = load_kv_tile_from_cache(
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_tables=block_tables_sbuf,
-            large_k_tile_idx=local_tile_idx,
-            num_blocks_per_large_tile=num_blocks_per_large_tile,
-            block_size=block_size,
-            B_D_SIZE=B_D_SIZE,
-            kernel_dtype=kernel_dtype,
-            k_load_buffer=k_load_buffer,
-            v_load_buffer=v_load_buffer,
-            identity_for_transpose=identity_for_transpose_k,
-        )
-        # load aggregation buffer and q from HBM
-        q_sbuf_tile_transposed = nl.ndarray(
-            (
-                par_dim(B_D_SIZE),
-                q_h_per_k_h,
-                n_small_in_large_q_tile,
-                INNER_Q_TILE_SIZE,
-            ),
-            dtype=query.dtype,
-            buffer=nl.sbuf,
-        )
-        # XXX: nl.zeros due to DMA skipping, otherwise, will get NaNs
-        q_sbuf_tmp = nl.zeros(
-            (
-                par_dim(INNER_Q_TILE_SIZE),
-                n_small_in_large_q_tile,
-                q_h_per_k_h,
-                B_D_SIZE,
-            ),
-            dtype=kernel_dtype,
-            buffer=nl.sbuf,
-        )
-        for small_q_idx in nl.affine_range(n_small_in_large_q_tile):
-            for i_q_h in nl.affine_range(q_h_per_k_h):
-                i_p = nl.arange(INNER_Q_TILE_SIZE)[:, None]
-                i_f = nl.arange(B_D_SIZE)[None, :]
-                q_sbuf_tmp[i_p, small_q_idx, i_q_h, i_f] = nl.load(
-                    query[
-                        batch_id,
-                        head_id * q_h_per_k_h + i_q_h,
-                        tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx],
-                        i_f,
-                    ],
-                    mode=oob_mode.skip,
-                )
-                q_tile_scaled = nl.multiply(
-                    q_sbuf_tmp[:, small_q_idx, i_q_h, :],
-                    softmax_scale,
-                    dtype=kernel_dtype,
-                )
-                PF_transpose_with_PE(
-                    q_tile_scaled,
-                    q_sbuf_tile_transposed[:, i_q_h, small_q_idx, :],
-                    identity_for_transpose=identity_for_transpose_p,
-                    out_in_psum=False,
-                )
-        for small_q_idx in nl.affine_range(n_small_in_large_q_tile):
-            i_p = nl.arange(INNER_Q_TILE_SIZE)[:, None, None]
-            i_f_h = nl.arange(q_h_per_k_h)[None, :, None]
-            i_f_d = nl.arange(1)[None, None, :]
-            m_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d] = nl.load(
-                m_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                mode=oob_mode.skip,
-            )
-            l_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d] = nl.load(
-                l_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                mode=oob_mode.skip,
-            )
-            i_p = nl.arange(INNER_Q_TILE_SIZE)[:, None, None]
-            i_f_h = nl.arange(q_h_per_k_h)[None, :, None]
-            i_f_d = nl.arange(B_D_SIZE)[None, None, :]
-            o_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d] = nl.load(
-                o_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                mode=oob_mode.skip,
-            )
-
-        for small_q_idx in nl.affine_range(n_small_in_large_q_tile):
-            for i_q_h in nl.affine_range(q_h_per_k_h):
-                q_tile = q_sbuf_tile_transposed[:, i_q_h, small_q_idx]
-                if load_mask_locally:
-                    # for static loop
-                    cur_mask_tile = cur_masks[:, small_q_idx, :]
-                else:
-                    # for dynamic while loop (with static unrolling)
-                    cur_mask_tile = cur_masks[
-                        :, local_tile_idx * n_small_in_large_q_tile + small_q_idx
-                    ]
-                _flash_attention_core(
-                    q_local_tile=q_tile,
-                    k=cur_k_tile,
-                    v=cur_v_tile,
-                    o_buffer=o_sbuf_tile[:, small_q_idx, i_q_h],
-                    l_buffer=l_sbuf_tile[:, small_q_idx, i_q_h],
-                    m_buffer=m_sbuf_tile[:, small_q_idx, i_q_h],
-                    kernel_dtype=kernel_dtype,
-                    acc_type=acc_type,
-                    tile_mask=cur_mask_tile,
-                    identity_for_transpose=identity_for_transpose_p,
-                    use_causal_mask=False,
-                    q_tile_idx=None,
-                    Q_TILE_SIZE=INNER_Q_TILE_SIZE,
-                    LARGE_KV_TILE_SIZE=LARGE_KV_TILE_SIZE,
-                    B_F_SIZE=B_F_SIZE,
-                    B_D_SIZE=B_D_SIZE,
-                )
-
-        for small_q_idx in nl.affine_range(n_small_in_large_q_tile):
-            i_p = nl.arange(INNER_Q_TILE_SIZE)[:, None, None]
-            i_f_h = nl.arange(q_h_per_k_h)[None, :, None]
-            i_f_d = nl.arange(B_D_SIZE)[None, None, :]
-            nl.store(
-                o_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                o_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d],
-                mode=oob_mode.skip,
-            )
-            i_p = nl.arange(INNER_Q_TILE_SIZE)[:, None, None]
-            i_f_h = nl.arange(q_h_per_k_h)[None, :, None]
-            i_f_d = nl.arange(1)[None, None, :]
-            nl.store(
-                m_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                m_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d],
-                mode=oob_mode.skip,
-            )
-            nl.store(
-                l_buffer[
-                    tile_q_indices_sbuf[i_p, small_q_idx, local_tile_idx], i_f_h, i_f_d
-                ],
-                l_sbuf_tile[i_p, small_q_idx, i_f_h, i_f_d],
-                mode=oob_mode.skip,
-            )
-
-
-def epilogue_prefill(
-    o,
-    query,
-    key,
-    value,
-    active_mask,
-    softmax_scale,
-    m_buffer,
-    l_buffer,
-    o_buffer,
-    ACTIVE_Q_TILE_SIZE,
-    seqlen_q,
-    batch_id,
-    head_id,
-    q_h_per_k_h,
-    kernel_dtype,
-    acc_type,
-    B_F_SIZE,
-    B_D_SIZE,
-    skip_active,
-):
-    # -------- Load l, m, o back to SBUF from HBM ------------ #
-    num_active_tiles = seqlen_q // ACTIVE_Q_TILE_SIZE
-    assert seqlen_q % ACTIVE_Q_TILE_SIZE == 0
-
-    o_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, B_D_SIZE),
-        dtype=acc_type,
-    )
-    m_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, 1),
-        dtype=acc_type,
-    )
-    l_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, 1),
-        dtype=acc_type,
-    )
-
-    for i in nl.affine_range(num_active_tiles):
-        o_buffer_sbuf[:, i] = nl.load(
-            o_buffer[nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE)]
-        )
-        l_buffer_sbuf[:, i] = nl.load(
-            l_buffer[nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE)]
-        )
-        m_buffer_sbuf[:, i] = nl.load(
-            m_buffer[nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE)]
-        )
-
-    # compute attention between input query, key and value
-    if not skip_active and key is not None and value is not None:
-        B_F_SIZE = min(seqlen_q, B_F_SIZE)
-        LARGE_KV_TILE_SIZE = seqlen_q
-        cur_k_tile = nl.ndarray(
-            (par_dim(B_D_SIZE), LARGE_KV_TILE_SIZE),
-            dtype=kernel_dtype,
-        )
-        cur_k_tile[:, :] = nl.load(
-            key[batch_id, head_id, :, :],
-            dtype=cur_k_tile.dtype,
-        )
-        cur_v_tile = nl.ndarray(
-            (par_dim(B_P_SIZE), LARGE_KV_TILE_SIZE // B_P_SIZE * B_D_SIZE),
-            dtype=kernel_dtype,
-        )
-        v_hbm_tile = value[batch_id, head_id]
-        # load at granularity of B_P_SIZE
-        for v_i in nl.affine_range(LARGE_KV_TILE_SIZE // B_P_SIZE):
-            load_v_tile(
-                v_hbm_tile=v_hbm_tile,
-                cur_v_tile=cur_v_tile,
-                large_tile_idx=0,
-                v_i=v_i,
-                LARGE_TILE_SZ=LARGE_KV_TILE_SIZE,
-            )
-
-        identity_for_transpose_p = create_identity_for_transpose(
-            cur_v_tile, ACTIVE_Q_TILE_SIZE
-        )
-        for i in nl.affine_range(num_active_tiles):
-            cur_mask = nl.load(
-                active_mask[
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                    nl.ds(0, LARGE_KV_TILE_SIZE),
-                ],
-                dtype=active_mask.dtype,
-            )
-            for i_q_h in nl.affine_range(q_h_per_k_h):
-                q_hbm_tile = query[
-                    batch_id,
-                    head_id * q_h_per_k_h + i_q_h,
-                ]
-                q_sbuf_tile = nl.ndarray(
-                    (ACTIVE_Q_TILE_SIZE, B_D_SIZE), dtype=query.dtype
-                )
-                q_sbuf_tile[:, :] = nl.load(
-                    q_hbm_tile[nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE), :],
-                )  # load (d, 128) tile in SBUF
-                q_tile_scaled = nl.ndarray(
-                    (ACTIVE_Q_TILE_SIZE, B_D_SIZE), dtype=kernel_dtype
-                )
-                q_tile_scaled[:, :] = nl.multiply(
-                    q_sbuf_tile, softmax_scale, dtype=kernel_dtype
-                )
-                q_tile = nl.ndarray((B_D_SIZE, ACTIVE_Q_TILE_SIZE), dtype=kernel_dtype)
-                PF_transpose_with_PE(
-                    q_tile_scaled,
-                    q_tile,
-                    identity_for_transpose=identity_for_transpose_p,
-                    out_in_psum=False,
-                )
-                _flash_attention_core(
-                    q_local_tile=q_tile,
-                    k=cur_k_tile,
-                    v=cur_v_tile,
-                    o_buffer=o_buffer_sbuf[:, i, i_q_h],
-                    l_buffer=l_buffer_sbuf[:, i, i_q_h],
-                    m_buffer=m_buffer_sbuf[:, i, i_q_h],
-                    kernel_dtype=kernel_dtype,
-                    acc_type=acc_type,
-                    tile_mask=cur_mask,
-                    identity_for_transpose=identity_for_transpose_p,
-                    use_causal_mask=True,
-                    q_tile_idx=i,
-                    Q_TILE_SIZE=ACTIVE_Q_TILE_SIZE,
-                    LARGE_KV_TILE_SIZE=LARGE_KV_TILE_SIZE,
-                    B_F_SIZE=B_F_SIZE,
-                    B_D_SIZE=B_D_SIZE,
-                )
-
-    # -------- write output to buffer on HBM ------------ #
-    for i in nl.affine_range(num_active_tiles):
-        out = nl.ndarray(
-            (par_dim(ACTIVE_Q_TILE_SIZE), q_h_per_k_h, B_D_SIZE), dtype=kernel_dtype
-        )
-        out[...] = nl.multiply(
-            o_buffer_sbuf[:, i],
-            1.0
-            / l_buffer_sbuf[
-                :, i
-            ],  # XXX: l is 0 in padded tokens, warning in simulation
-            dtype=kernel_dtype,
-        )
-        for i_q_h in nl.affine_range(q_h_per_k_h):
-            nl.store(
-                o[
-                    batch_id,
-                    head_id * q_h_per_k_h + i_q_h,
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                    :,
-                ],
-                out[:, i_q_h, :],
-            )
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -905,7 +537,7 @@ def flash_paged_attn_blockspase_decode_static(
         B_D_SIZE,
         loop_index=None,
     )
-    decode_prior(
+    decode_prior_tokens(
         num_tiles_unrolled=MAX_NUM_TILE,
         query_sbuf=query_sbuf,
         key_cache=key_cache,
@@ -931,7 +563,7 @@ def flash_paged_attn_blockspase_decode_static(
         identity_for_transpose_k_hbm=identity_for_transpose_k_hbm,
     )
 
-    epilogue_decode(
+    decode_active_tokens_and_epilogue(
         o=o,
         query=query,
         key=key,
@@ -1106,7 +738,7 @@ def flash_paged_attn_blockspase_decode_dynamic(
             B_D_SIZE,
             loop_index=loop_index,
         )
-        decode_prior(
+        decode_prior_tokens(
             num_tiles_unrolled=dynamic_loop_unroll_factor,
             query_sbuf=query_sbuf,
             key_cache=key_cache,
@@ -1143,7 +775,7 @@ def flash_paged_attn_blockspase_decode_dynamic(
         nl.store(dst=cond, value=cond_next)
         cond_var = cond
 
-    epilogue_decode(
+    decode_active_tokens_and_epilogue(
         o=o,
         query=query,
         key=key,
@@ -1161,359 +793,6 @@ def flash_paged_attn_blockspase_decode_dynamic(
         skip_active=skip_active,
     )
     return o
-
-
-def decode_prior(
-    num_tiles_unrolled,
-    query_sbuf,
-    key_cache,
-    value_cache,
-    lmo_buffer,
-    m_next_tile,
-    l_next_tile,
-    o_next_tile,
-    q_offsets,
-    block_tables_sbuf,
-    tile_mask_sbuf,
-    q_update_pred_sbuf,
-    q_update_pred_broadcast,
-    num_blocks_per_large_tile,
-    block_size,
-    kernel_dtype,
-    acc_type,
-    q_h_per_k_h,
-    B_D_SIZE,
-    MULTI_BUFFER_SIZE,
-    identity_for_transpose_m_step1_hbm,
-    identity_for_transpose_m_step2_hbm,
-    identity_for_transpose_k_hbm,
-):
-
-    identity_for_transpose_k = nl.load(identity_for_transpose_k_hbm)
-    identity_for_transpose_m_step1 = nl.load(identity_for_transpose_m_step1_hbm)
-    identity_for_transpose_m_step2 = nl.load(identity_for_transpose_m_step2_hbm)
-
-    # XXX: no dma skipping for decode kernel, no need to zero
-    num_loads = num_blocks_per_large_tile // B_P_SIZE
-    k_load_buffer = nl.ndarray(
-        (par_dim(B_D_SIZE), MULTI_BUFFER_SIZE, num_loads * block_size * B_P_SIZE),
-        dtype=kernel_dtype,
-    )
-    v_load_buffer = nl.ndarray(
-        (par_dim(B_P_SIZE), MULTI_BUFFER_SIZE, num_loads * block_size * B_D_SIZE),
-        dtype=kernel_dtype,
-    )
-    # load first iteration of key cache
-    k_load_buffer_reshaped = k_load_buffer.reshape(
-        (B_D_SIZE, MULTI_BUFFER_SIZE, num_loads, block_size, B_P_SIZE),
-    )
-    for load_idx in nl.affine_range(num_loads):
-        i_p = nl.arange(B_P_SIZE)[:, None]
-        i_f = nl.arange(block_size * B_D_SIZE)[None, :]
-        loaded = nl.ndarray((B_P_SIZE, block_size * B_D_SIZE), dtype=key_cache.dtype)
-        loaded[i_p, i_f] = nl.load(key_cache[block_tables_sbuf[i_p, load_idx, 0], i_f])
-        for tb_i in nl.affine_range(block_size):
-            if loaded.dtype != kernel_dtype:
-                k_src = nl.copy(
-                    loaded[:, nl.ds(tb_i * B_D_SIZE, B_D_SIZE)],
-                    dtype=kernel_dtype,
-                )
-            else:
-                k_src = loaded[:, nl.ds(tb_i * B_D_SIZE, B_D_SIZE)]
-            PF_transpose_with_PE(
-                src=k_src,
-                out=k_load_buffer_reshaped[:, 0, load_idx, tb_i],
-                identity_for_transpose=identity_for_transpose_k,
-            )
-
-    # load value cache
-    for load_idx in nl.affine_range(num_loads):
-        i_p = nl.arange(B_P_SIZE)[:, None]
-        i_f = nl.arange(block_size * B_D_SIZE)[None, :]
-        if kernel_dtype == value_cache.dtype:
-            v_load_buffer[i_p, 0, i_f + load_idx * block_size * B_D_SIZE] = nl.load(
-                value_cache[block_tables_sbuf[i_p, load_idx, 0], i_f],
-            )
-        else:
-            loaded = nl.ndarray(
-                (B_P_SIZE, block_size * B_D_SIZE), dtype=value_cache.dtype
-            )
-            loaded[...] = nl.load(
-                value_cache[block_tables_sbuf[i_p, load_idx, 0], i_f],
-            )
-            v_load_buffer[i_p, 0, i_f + load_idx * block_size * B_D_SIZE] = nl.copy(
-                loaded,
-                dtype=kernel_dtype,
-            )
-
-    NEG_INF = -9984.0  # Magic number to replace -inf similar to what Tensorizer uses
-    num_tiles_padded = num_tiles_unrolled + 1
-    if num_tiles_unrolled > B_P_SIZE:
-        # pad to multiple of 128 for PE transpose during write out
-        num_tiles_padded = pad_to_multiple(num_tiles_padded, B_P_SIZE)
-    o_buffer_sbuf = nl.zeros(
-        (par_dim(B_D_SIZE), num_tiles_padded, q_h_per_k_h),
-        dtype=acc_type,
-    )
-    m_buffer_sbuf = nl.full(
-        (par_dim(1), num_tiles_padded, q_h_per_k_h),
-        NEG_INF,
-        dtype=acc_type,
-    )
-    l_buffer_sbuf = nl.zeros(
-        (par_dim(1), num_tiles_padded, q_h_per_k_h),
-        dtype=acc_type,
-    )
-    if q_offsets is not None:
-        # dynamic loop has previous states from last dynamic loop step
-        o_buffer_sbuf[:, 0, :] = nl.load(o_next_tile)
-        l_buffer_sbuf[:, 0, :] = nl.load(l_next_tile)
-        m_buffer_sbuf[:, 0, :] = nl.load(m_next_tile)
-
-    kq_res_ones = nl.ones(
-        (par_dim(B_P_SIZE), tile_mask_sbuf.shape[-1], q_h_per_k_h),
-        dtype=acc_type,
-    )
-    sumexp_ones = nl.ones((par_dim(B_P_SIZE), 1), dtype=kernel_dtype)
-
-    for local_tile_idx in nl.sequential_range(num_tiles_unrolled):
-        _flash_attention_core_kq_matmul(
-            q_local_tile=query_sbuf,
-            o_buffer_sbuf=o_buffer_sbuf,
-            l_buffer_sbuf=l_buffer_sbuf,
-            m_buffer_sbuf=m_buffer_sbuf,
-            kernel_dtype=kernel_dtype,
-            acc_type=acc_type,
-            q_update_pred_sbuf=q_update_pred_sbuf,
-            q_update_pred_broadcast=q_update_pred_broadcast,
-            tile_mask=tile_mask_sbuf,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_tables_sbuf=block_tables_sbuf,
-            large_tile_idx=local_tile_idx,
-            MULTI_BUFFER_SIZE=MULTI_BUFFER_SIZE,
-            num_blocks_per_large_tile=num_blocks_per_large_tile,
-            block_size=block_size,
-            k_load_buffer=k_load_buffer,
-            v_load_buffer=v_load_buffer,
-            kq_res_ones=kq_res_ones,
-            sumexp_ones=sumexp_ones,
-            identity_for_transpose_k=identity_for_transpose_k,
-            identity_for_transpose_m_step1=identity_for_transpose_m_step1,
-            identity_for_transpose_m_step2=identity_for_transpose_m_step2,
-        )
-
-    if q_offsets is not None:
-        nl.store(o_next_tile, o_buffer_sbuf[:, num_tiles_unrolled, :])
-        nl.store(l_next_tile, l_buffer_sbuf[:, num_tiles_unrolled, :])
-        nl.store(m_next_tile, m_buffer_sbuf[:, num_tiles_unrolled, :])
-    # store L, M, O in (seqlen, h, d) format
-    write_tile_size = min(num_tiles_unrolled, B_P_SIZE)
-    identity_for_transpose_o = create_identity_for_transpose(o_buffer_sbuf, B_D_SIZE)
-    identity_for_transpose_lm = nl.ones((1, 1), dtype=acc_type)
-    for i in nl.affine_range(ceil_div(num_tiles_unrolled, write_tile_size)):
-        lmo_sbuf = nl.ndarray(
-            (write_tile_size, q_h_per_k_h, B_D_SIZE + 2),
-            dtype=o_buffer_sbuf.dtype,
-        )
-        for i_q_h in nl.affine_range(q_h_per_k_h):
-            o_tmp = nl.ndarray(
-                (write_tile_size, B_D_SIZE), dtype=acc_type, buffer=nl.psum
-            )
-            PF_transpose_with_PE(
-                src=o_buffer_sbuf[
-                    :,
-                    nl.ds(i * write_tile_size, write_tile_size),
-                    i_q_h,
-                ],
-                out=o_tmp,
-                identity_for_transpose=identity_for_transpose_o,
-                out_in_psum=True,
-            )
-            lmo_sbuf[:, i_q_h, nl.ds(0, B_D_SIZE)] = nl.copy(o_tmp)
-            l_tmp = nl.ndarray((write_tile_size, 1), dtype=acc_type, buffer=nl.psum)
-            PF_transpose_with_PE(
-                src=l_buffer_sbuf[
-                    :,
-                    nl.ds(i * write_tile_size, write_tile_size),
-                    i_q_h,
-                ],
-                out=l_tmp,
-                identity_for_transpose=identity_for_transpose_lm,
-                out_in_psum=True,
-            )
-            lmo_sbuf[:, i_q_h, nl.ds(B_D_SIZE, 1)] = nl.copy(l_tmp)
-            m_tmp = nl.ndarray((write_tile_size, 1), dtype=acc_type, buffer=nl.psum)
-            PF_transpose_with_PE(
-                src=m_buffer_sbuf[
-                    :,
-                    nl.ds(i * write_tile_size, write_tile_size),
-                    i_q_h,
-                ],
-                out=m_tmp,
-                identity_for_transpose=identity_for_transpose_lm,
-                out_in_psum=True,
-            )
-            lmo_sbuf[:, i_q_h, nl.ds(B_D_SIZE + 1, 1)] = nl.copy(m_tmp)
-        i_q = nl.arange(write_tile_size)[:, None, None]
-        i_h = nl.arange(q_h_per_k_h)[None, :, None]
-        i_d = nl.arange(B_D_SIZE + 2)[None, None, :]
-        if q_offsets is not None:
-            nl.store(
-                lmo_buffer[q_offsets[i_q + i * write_tile_size, 0], i_h, i_d],
-                lmo_sbuf[i_q, i_h, i_d],
-                mask=(i_q + i * write_tile_size < q_offsets.shape[0]),
-            )
-        else:
-            nl.store(
-                lmo_buffer[i_q + i * write_tile_size, i_h, i_d],
-                lmo_sbuf[i_q, i_h, i_d],
-                mask=(i_q + i * write_tile_size < num_tiles_unrolled),
-            )
-
-
-def epilogue_decode(
-    o,
-    query,
-    key,
-    value,
-    lmo_buffer,
-    softmax_scale,
-    last_tile_indices_sbuf,
-    seqlen_q,
-    batch_id,
-    head_id,
-    q_h_per_k_h,
-    kernel_dtype,
-    acc_type,
-    B_D_SIZE,
-    skip_active,
-):
-    ACTIVE_Q_TILE_SIZE = min(seqlen_q, B_P_SIZE)
-    num_active_tiles = seqlen_q // ACTIVE_Q_TILE_SIZE
-    assert seqlen_q % ACTIVE_Q_TILE_SIZE == 0
-    assert last_tile_indices_sbuf.shape == (ACTIVE_Q_TILE_SIZE, num_active_tiles)
-
-    o_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, B_D_SIZE),
-        dtype=acc_type,
-    )
-    m_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, 1),
-        dtype=acc_type,
-    )
-    l_buffer_sbuf = nl.ndarray(
-        (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, q_h_per_k_h, 1),
-        dtype=acc_type,
-    )
-    for i in nl.affine_range(num_active_tiles):
-        lmo_tmp = nl.ndarray(
-            (par_dim(ACTIVE_Q_TILE_SIZE), q_h_per_k_h, B_D_SIZE + 2),
-            dtype=acc_type,
-        )
-        i_q = nl.arange(ACTIVE_Q_TILE_SIZE)[:, None, None]
-        i_h = nl.arange(q_h_per_k_h)[None, :, None]
-        i_d = nl.arange(B_D_SIZE + 2)[None, None, :]
-        lmo_tmp[i_q, i_h, i_d] = nl.load(
-            lmo_buffer[last_tile_indices_sbuf[i_q, i], i_h, i_d]
-        )
-        o_buffer_sbuf[:, i, :, :] = nl.copy(lmo_tmp[:, :, nl.ds(0, B_D_SIZE)])
-        l_buffer_sbuf[:, i, :, :] = nl.copy(lmo_tmp[:, :, nl.ds(B_D_SIZE, 1)])
-        m_buffer_sbuf[:, i, :, :] = nl.copy(lmo_tmp[:, :, nl.ds(B_D_SIZE + 1, 1)])
-
-    # compute attention between input query, key and value
-    if not skip_active and key is not None and value is not None:
-        cur_q_tile = nl.ndarray(
-            (par_dim(B_D_SIZE), num_active_tiles, q_h_per_k_h, ACTIVE_Q_TILE_SIZE),
-            dtype=kernel_dtype,
-        )
-        identity_for_transpose_q = create_identity_for_transpose(
-            cur_q_tile, ACTIVE_Q_TILE_SIZE
-        )
-        for i in nl.affine_range(num_active_tiles):
-            for i_q_h in nl.affine_range(q_h_per_k_h):
-                q_hbm_tile = query[
-                    batch_id,
-                    head_id * q_h_per_k_h + i_q_h,
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                    :,
-                ]
-                q_sbuf_tile = nl.load(q_hbm_tile)
-                q_tile_scaled = nl.multiply(
-                    q_sbuf_tile, softmax_scale, dtype=kernel_dtype
-                )
-                PF_transpose_with_PE(
-                    q_tile_scaled,
-                    cur_q_tile[:, i, i_q_h],
-                    identity_for_transpose=identity_for_transpose_q,
-                    out_in_psum=False,
-                )
-        cur_k_tile = nl.ndarray(
-            (par_dim(B_D_SIZE), num_active_tiles, ACTIVE_Q_TILE_SIZE),
-            dtype=kernel_dtype,
-        )
-        cur_v_tile = nl.ndarray(
-            (par_dim(ACTIVE_Q_TILE_SIZE), num_active_tiles, 1, B_D_SIZE),
-            dtype=kernel_dtype,
-        )
-        for i in nl.affine_range(num_active_tiles):
-            cur_k_tile[:, i, :] = nl.load(
-                key[
-                    batch_id,
-                    head_id,
-                    :,
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                ],
-                dtype=kernel_dtype,
-            )
-            cur_v_tile[:, i, 0, :] = nl.load(
-                value[
-                    batch_id,
-                    head_id,
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                    :,
-                ],
-                dtype=kernel_dtype,
-            )
-
-        for i in nl.affine_range(num_active_tiles):
-            _active_attention_core_batched(
-                q=cur_q_tile[:, i],
-                k=cur_k_tile[:, i],
-                v=cur_v_tile[:, i],
-                o_buffer=o_buffer_sbuf[:, i],
-                l_buffer=l_buffer_sbuf[:, i],
-                m_buffer=m_buffer_sbuf[:, i],
-                q_h_per_k_h=q_h_per_k_h,
-                kernel_dtype=kernel_dtype,
-                acc_type=acc_type,
-                TILE_SIZE=ACTIVE_Q_TILE_SIZE,
-                B_D_SIZE=B_D_SIZE,
-            )
-
-    # -------- write output to buffer on HBM ------------ #
-    for i in nl.affine_range(num_active_tiles):
-        out = nl.ndarray(
-            (par_dim(ACTIVE_Q_TILE_SIZE), q_h_per_k_h, B_D_SIZE), dtype=kernel_dtype
-        )
-        out[...] = nl.multiply(
-            o_buffer_sbuf[:, i],
-            1.0
-            / l_buffer_sbuf[
-                :, i
-            ],  # XXX: l is 0 in padded tokens, warning in simulation
-            dtype=kernel_dtype,
-        )
-        for i_q_h in nl.affine_range(q_h_per_k_h):
-            nl.store(
-                o[
-                    batch_id,
-                    head_id * q_h_per_k_h + i_q_h,
-                    nl.ds(i * ACTIVE_Q_TILE_SIZE, ACTIVE_Q_TILE_SIZE),
-                    :,
-                ],
-                out[:, i_q_h, :],
-            )
 
 
 def flash_attn_varlen_blocksparse_nkifunc(
