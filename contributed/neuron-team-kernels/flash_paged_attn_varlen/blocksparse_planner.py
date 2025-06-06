@@ -20,6 +20,11 @@ import numpy as np
 import numpy.typing as npt
 
 
+def _ceil_div(a, b):
+    assert b != 0
+    return (a + b - 1) // b
+
+
 @dataclass(frozen=True)
 class BlockSparsePlan:
     tile_q_indices: npt.NDArray[np.int32]
@@ -54,71 +59,6 @@ class BlockSparsePlan:
     def num_tiles(self):
         return len(self.tile_q_indices)
 
-    def pad_plan(self, pad_num_tile_to):
-        raise NotImplementedError
-
-    def build_tile_q_indices(self, skip_value=None):
-        raise NotImplementedError
-
-    def build_tile_block_tables(self, block_tables):
-        raise NotImplementedError
-
-    def build_tile_masks(self):
-        raise NotImplementedError
-
-    def build_decode_tile_update_indices(self):
-        raise NotImplementedError
-
-
-class FlashPagedAttentionSchedulerBase:
-    """
-    Generate schedule for flash attention
-    """
-
-    def __init__(
-        self, prompt_lens, context_lens, tile_size_q, tile_size_kv, block_size
-    ):
-        assert (
-            tile_size_kv % block_size == 0
-        ), "tile_size_kv must be multiple of block_size"
-
-        def _check_np_int_array(*arrays):
-            for a in arrays:
-                if not isinstance(a, np.ndarray) or a.dtype not in (np.int32, np.int64):
-                    return False
-            return True
-
-        assert _check_np_int_array(prompt_lens, context_lens)
-        assert len(prompt_lens) == len(
-            context_lens
-        ), "prompt_lens and context_lens must have the same length"
-        self.num_seq = len(prompt_lens)
-        assert self.num_seq > 0, "prompt_lens and context_lens must be non-empty"
-        self.prompt_lens = prompt_lens.astype(np.int32)
-        self.context_lens = context_lens.astype(np.int32)
-        self.tile_size_q = tile_size_q
-        self.tile_size_kv = tile_size_kv
-        self.block_size = block_size
-
-    def generate_plan(self):
-        raise NotImplementedError
-
-
-def _ceil_div(a, b):
-    assert b != 0
-    return (a + b - 1) // b
-
-
-def _get_seq_start_end(seqlens, padded_seqlens=None):
-    if padded_seqlens is None:
-        padded_seqlens = seqlens
-    cu_seqlen = np.cumsum(padded_seqlens)
-    seqlens_starts = np.concatenate(([0], cu_seqlen[:-1]))
-    seqlens_ends = seqlens_starts + seqlens
-    return seqlens_starts, seqlens_ends, cu_seqlen[-1]
-
-
-class SequenceAlignedPlan(BlockSparsePlan):
     def pad_plan(self, pad_num_tile_to, q_pad_value=0):
         num_tiles = self.num_tiles
         if pad_num_tile_to <= num_tiles:
@@ -241,7 +181,27 @@ class SequenceAlignedPlan(BlockSparsePlan):
         return update_indices, padded_last_tile_indices
 
 
-class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
+def _get_seq_start_end(seqlens, padded_seqlens=None):
+    if padded_seqlens is None:
+        padded_seqlens = seqlens
+    cu_seqlen = np.cumsum(padded_seqlens)
+    seqlens_starts = np.concatenate(([0], cu_seqlen[:-1]))
+    seqlens_ends = seqlens_starts + seqlens
+    return seqlens_starts, seqlens_ends, cu_seqlen[-1]
+
+
+def _check_np_int_array(*arrays):
+    for a in arrays:
+        if not isinstance(a, np.ndarray) or a.dtype not in (np.int32, np.int64):
+            return False
+    return True
+
+
+class FlashAttentionPlanner:
+    """
+    Generate execution plan for flash attention
+    """
+
     def __init__(
         self,
         prompt_lens,
@@ -249,17 +209,24 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
         tile_size_q,
         tile_size_kv,
         block_size,
-        column_order,
+        traverse_in_column_order,
         kv_dma_skipping,
     ):
-        super(__class__, self).__init__(
-            prompt_lens,
-            context_lens,
-            tile_size_q,
-            tile_size_kv,
-            block_size,
-        )
-        self.column_order = column_order
+        assert (
+            tile_size_kv % block_size == 0
+        ), "tile_size_kv must be multiple of block_size"
+        assert _check_np_int_array(prompt_lens, context_lens)
+        assert len(prompt_lens) == len(
+            context_lens
+        ), "prompt_lens and context_lens must have the same length"
+        self.num_seq = len(prompt_lens)
+        assert self.num_seq > 0, "prompt_lens and context_lens must be non-empty"
+        self.prompt_lens = prompt_lens.astype(np.int32)
+        self.context_lens = context_lens.astype(np.int32)
+        self.tile_size_q = tile_size_q
+        self.tile_size_kv = tile_size_kv
+        self.block_size = block_size
+        self.traverse_in_column_order = traverse_in_column_order
         self.kv_dma_skipping = kv_dma_skipping
 
     def generate_plan(self):
@@ -303,7 +270,7 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
             kv_indices = np.broadcast_to(
                 np.arange(num_kv_tiles, dtype=np.int32).reshape(1, -1), num_tiles
             )
-            if self.column_order:
+            if self.traverse_in_column_order:
                 q_indices = q_indices.transpose()
                 kv_indices = kv_indices.transpose()
             q_indices = q_indices.flatten()
@@ -374,7 +341,7 @@ class SequenceAlignedScheduler(FlashPagedAttentionSchedulerBase):
             tile_kv_seq_ids = np.empty((0, self.tile_size_kv), dtype=np.int32)
             tile_kv_skip_indices = np.array([], dtype=np.int32)
 
-        return SequenceAlignedPlan(
+        return BlockSparsePlan(
             tile_q_offsets,
             tile_bt_offsets,
             tile_q_seq_ids,

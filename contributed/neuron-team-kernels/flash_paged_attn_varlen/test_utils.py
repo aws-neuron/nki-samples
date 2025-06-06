@@ -4,6 +4,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import logical_and, logical_or
 
 
 def ceil_div(a, b):
@@ -46,8 +47,6 @@ class BlockDiagonalCausalFromBottomRightMask:
 
     @staticmethod
     def _from_seqlens(query_lens, seq_lens, block_size=None, skip_active=False):
-        from torch import logical_and, logical_or
-
         contexted = block_size is None
         context_lens = torch.tensor(seq_lens) - torch.tensor(query_lens)
         n_queries = sum(query_lens)
@@ -62,8 +61,8 @@ class BlockDiagonalCausalFromBottomRightMask:
 
         a = torch.arange(n_queries).reshape(n_queries, 1).expand(n_queries, n_keys)
         b = torch.arange(n_keys).reshape(1, n_keys).expand(n_queries, n_keys)
-        q_cumsum = torch.tensor([0] + query_lens).cumsum(dim=0)
-        k_cumsum = torch.tensor([0] + key_lens_blockaligned).cumsum(dim=0)
+        q_cumsum = torch.cat((torch.tensor([0]), query_lens)).cumsum(dim=0)
+        k_cumsum = torch.cat((torch.tensor([0]), key_lens_blockaligned)).cumsum(dim=0)
 
         prior_mask = torch.zeros(n_queries, n_keys)
         new_masks: list[torch.Tensor] = []
@@ -235,27 +234,32 @@ def sample_input_sizes(
         decode_query_lens = torch.ones(decode_batch_size, dtype=torch.long)
         query_lens = torch.cat([prefill_query_lens, decode_query_lens])
     if max_ctx_len == 0:
-        ctx_lens = torch.zeros(batch_size, dtype=torch.long)
+        context_lens = torch.zeros(batch_size, dtype=torch.long)
     else:
-        ctx_lens = _sample_lengths(batch_size, min_ctx_len, max_ctx_len)
-    return query_lens.tolist(), ctx_lens.tolist()
+        context_lens = _sample_lengths(batch_size, min_ctx_len, max_ctx_len)
+    return query_lens, context_lens
 
 
-def sample_inputs(
+def sample_input_tensors(
     query_lens,
-    ctx_lens,
+    context_lens,
     max_block_per_request,
     block_size,
     num_heads,
     num_kv_heads,
     head_size,
     dtype,
+    cache_size=None,
 ):
+    assert isinstance(query_lens, torch.Tensor)
+    assert isinstance(context_lens, torch.Tensor)
     batch_size = len(query_lens)
-    cache_size = (batch_size * max_block_per_request) + 2
-    seq_lens = [a + b for a, b in zip(query_lens, ctx_lens)]
+    if not cache_size:
+        # pick a large enough cache size
+        cache_size = (batch_size * max_block_per_request) + 128
+    seq_lens = query_lens + context_lens
 
-    num_tokens = sum(query_lens)
+    num_tokens = query_lens.sum().item()
     query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
     query.uniform_(-1, 1)
     torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
@@ -268,21 +272,14 @@ def sample_inputs(
     v_cache = torch.zeros(cache_size, block_size, num_kv_heads, head_size, dtype=dtype)
     k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    values = torch.arange(0, cache_size, dtype=torch.long)
-    values = values[torch.randperm(cache_size)]
-    block_table = values[: batch_size * max_block_per_request].view(
+    block_tables = torch.randperm(cache_size, dtype=torch.long)
+    block_tables = block_tables[: batch_size * max_block_per_request].view(
         batch_size, max_block_per_request
     )
-    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
-    b_start_loc = torch.cumsum(
-        torch.tensor([0] + query_lens[:-1], dtype=torch.long),
-        dim=0,
-    )
+    b_ctx_len = context_lens
+    b_start_loc = torch.cumsum(torch.cat((torch.tensor([0]), query_lens[:-1])), dim=0)
     # copy kv to cache
-    b_seq_start_loc = torch.cumsum(
-        torch.tensor([0] + seq_lens[:-1], dtype=torch.long),
-        dim=0,
-    )
+    b_seq_start_loc = torch.cumsum(torch.cat((torch.tensor([0]), seq_lens[:-1])), dim=0)
     for i in range(batch_size):
         for j in range(query_lens[i]):
             k[b_start_loc[i] + j].copy_(key[b_seq_start_loc[i] + b_ctx_len[i] + j])
@@ -295,7 +292,7 @@ def sample_inputs(
                 end_loc = b_seq_start_loc[i] + b_ctx_len[i]
             else:
                 end_loc = start_loc + block_size
-            start_slot = block_table[i, block_id] * block_size
+            start_slot = block_tables[i, block_id] * block_size
             end_slot = start_slot + end_loc - start_loc
             k_cache.view(-1, num_kv_heads, head_size)[start_slot:end_slot].copy_(
                 key[start_loc:end_loc]
@@ -306,7 +303,7 @@ def sample_inputs(
             cur_ctx += block_size
             block_id += 1
 
-    return query, k, v, k_cache, v_cache, block_table, key, value, query_lens, seq_lens
+    return query, k, v, k_cache, v_cache, block_tables, key, value
 
 
 def get_active_block_tables(block_tables, query_lens, seq_lens, block_size, num_blocks):
