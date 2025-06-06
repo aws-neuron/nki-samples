@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_attn_blocksparse import flash_attn_varlen_blocksparse_nkifunc
+from kernel_impl import flash_attn_varlen_blocksparse_nkifunc
 
 from blocksparse_planner import FlashAttentionPlanner
 from test_utils import (
