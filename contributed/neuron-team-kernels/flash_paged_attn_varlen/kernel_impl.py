@@ -57,9 +57,18 @@ def check_input_shapes(
     else:
         _, LARGE_Q_TILE_SIZE, LARGE_KV_TILE_SIZE = tile_masks.shape
     b, h, seqlen_q, d = query.shape
-    assert is_power_of_2(seqlen_q), f"{seqlen_q=} is expected to be power of 2"
     assert seqlen_q <= 8192, f"Large {seqlen_q=} consumes too much sbuf space"
-    assert seqlen_q % LARGE_Q_TILE_SIZE == 0
+    if seqlen_q <= B_P_SIZE:
+        assert is_power_of_2(seqlen_q), f"{seqlen_q=} is expected to be power of 2"
+    elif seqlen_q <= B_FMAX_SIZE:
+        assert seqlen_q % B_P_SIZE == 0, f"{seqlen_q=} must be mulitple of {B_P_SIZE=}"
+    else:
+        assert (
+            seqlen_q % B_FMAX_SIZE == 0
+        ), f"{seqlen_q=} must be multiple of {B_FMAX_SIZE=}"
+    assert (
+        seqlen_q % LARGE_Q_TILE_SIZE == 0
+    ), f"{seqlen_q=} must be multiple of {LARGE_Q_TILE_SIZE=}"
     assert b == 1, f"Batch size must be 1 for Ragged Tensor, got {b}"
     assert (
         d >= 16 and d <= 128 and is_power_of_2(d)

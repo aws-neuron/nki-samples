@@ -11,9 +11,13 @@ from test_utils import (
     BlockDiagonalCausalFromBottomRightMask,
     get_active_block_tables,
     ceil_div,
+    is_power_of_2,
     pad_to_multiple,
     pad_to_next_power_of_2,
 )
+
+B_P_SIZE = 128
+B_FMAX_SIZE = 512
 
 
 def _decide_execution_mode(exec_mode):
@@ -48,7 +52,6 @@ class NKIFlashPagedAttentionRunner:
         dynamic_loop_unrolling_size,
         exec_mode=None,
     ):
-        B_P_SIZE = 128
         assert large_kv_tile_size >= B_P_SIZE
         self.query_lens = query_lens
         self.context_lens = context_lens
@@ -63,6 +66,8 @@ class NKIFlashPagedAttentionRunner:
         self.numpy_kernel_use_bf16 = True  # use ml_dtypes.bfloat16 for baremetal mode
         self.save_artifact = False
         self.num_actual_tokens = None
+        assert is_power_of_2(self.large_q_tile_size)
+        assert is_power_of_2(self.large_kv_tile_size)
         assert (
             not self.is_decode_kernel or large_q_tile_size == 1
         ), f"{large_q_tile_size=} must be 1 for decode scenario"
@@ -71,9 +76,23 @@ class NKIFlashPagedAttentionRunner:
     def _preprocess(self):
         self.num_actual_tokens = self.query_lens.sum().item()
         self.seq_lens = self.query_lens + self.context_lens
-        # FIXME: for num_active_tokens > 128, we only need to pad to multiple of 128
-        self.num_active_tokens_after_padding = pad_to_next_power_of_2(
-            self.num_actual_tokens
+        if self.num_actual_tokens < B_P_SIZE:
+            num_active_tokens_after_padding = pad_to_next_power_of_2(
+                self.num_actual_tokens,
+            )
+        elif self.num_actual_tokens < B_FMAX_SIZE:
+            num_active_tokens_after_padding = pad_to_multiple(
+                self.num_actual_tokens,
+                B_P_SIZE,
+            )
+        else:
+            num_active_tokens_after_padding = pad_to_multiple(
+                self.num_actual_tokens,
+                B_FMAX_SIZE,
+            )
+        self.num_active_tokens_after_padding = pad_to_multiple(
+            num_active_tokens_after_padding,
+            self.large_q_tile_size,
         )
         self.active_masks = self._build_active_token_masks()
         self.context_token_plan = self._build_kernel_plan(
@@ -170,7 +189,6 @@ class NKIFlashPagedAttentionRunner:
                 )
             else:
                 q_update_pred = q_update_pred.reshape(1, num_tiles)
-        B_P_SIZE = 128
         tile_size = min(self.num_active_tokens_after_padding, B_P_SIZE)
         # reshape last_tile_indices for fast vector dge loading
         last_tile_indices = last_tile_indices.reshape(
