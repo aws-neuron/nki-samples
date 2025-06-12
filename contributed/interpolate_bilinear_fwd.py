@@ -76,9 +76,8 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             out_tile = nl.ndarray([P_TILE_SIZE, h_tile_size_dst, w_dst], dtype=src_arr.dtype, buffer=nl.sbuf)
 
             ### Load input array from HBM
-            i_p = p * P_TILE_SIZE + nl.arange(P_TILE_SIZE)[:, None, None]
-            i_h = nl.arange(h_start_hbm_src, h_end_hbm_src)[None, :, None]
-            i_w = nl.arange(w_src)[None, None, :]
+            i_p, i_h, i_w = nl.mgrid[0:P_TILE_SIZE, h_start_hbm_src:h_end_hbm_src, 0:w_src]
+            i_p = p * P_TILE_SIZE + i_p
 
             in_tile = nl.load(src_arr[i_p, i_h, i_w], mask=(i_p < n * c))
 
@@ -110,15 +109,15 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             )
         
             ### Edges
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None]
+            i_p, i_wx, i_h, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:(w_src - 1)]
 
             ## Upper & lower edges, i.e. h=0 or h=h_dst-1 (corners excluded)
-            i_h_dst = ((h_tile_size_dst - 1) * nl.arange(2)[None, None, :, None])
-            i_w_dst = (2 * nl.arange(w_src - 1)[None, None, None, :] + 1) + nl.arange(2)[None, :, None, None]
+            i_h_dst = (h_tile_size_dst - 1) * i_h
+            i_w_dst = (2 * i_wy + 1) + i_wx
             
-            i_h_src = ((h_tile_size_src - 1) * nl.arange(2)[None, None, :, None])
-            i_w_src_075 = nl.arange(w_src - 1)[None, None, None, :] + nl.arange(2)[None, :, None, None]
-            i_w_src_025 = nl.arange(w_src - 1)[None, None, None, :] + (-1 * nl.arange(2)[None, :, None, None] + 1)
+            i_h_src = (h_tile_size_src - 1) * i_h
+            i_w_src_075 = i_wy + i_wx
+            i_w_src_025 = i_wy + (-1 * i_wx + 1)
             
             out_tile[i_p, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_h_src, i_w_src_075] + \
@@ -126,6 +125,8 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             )
         
             ## Right & left edges, i.e. w=0 or w=w_dst-1 (corners excluded)
+            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None]
+
             i_h_dst = (2 * nl.arange(h_tile_size_src - 1)[None, None, None, :] + 1) + nl.arange(2)[None, :, None, None]
             i_w_dst = ((w_dst - 1) * nl.arange(2)[None, None, :, None])
             
@@ -139,24 +140,20 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             )
         
             ## Corners
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None]
+            i_p, i_w, i_h = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2]
 
-            i_h_dst = ((h_tile_size_dst - 1) * nl.arange(2)[None, None, :])
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, :, None])
-            
-            i_h_src = ((h_tile_size_src - 1) * nl.arange(2)[None, None, :])
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, :, None])
+            i_h_dst = ((h_tile_size_dst - 1) * i_h)
+            i_w_dst = ((w_dst - 1) * i_w)
+            i_h_src = ((h_tile_size_src - 1) * i_h)
+            i_w_src = ((w_src - 1) * i_w)
         
             out_tile[i_p, i_h_dst, i_w_dst] = in_tile[i_p, i_h_src, i_w_src]
 
             ### Write output array to HBM
-            i_p_tile = nl.arange(P_TILE_SIZE)[:, None, None]
-            i_h_tile = nl.arange(h_start_tile_dst, h_end_tile_dst)[None, :, None]
-            i_p_hbm = p * P_TILE_SIZE + nl.arange(P_TILE_SIZE)[:, None, None]
-            i_h_hbm = nl.arange(h_start_hbm_dst, h_end_hbm_dst)[None, :, None]
-            i_w = nl.arange(w_dst)[None, None, :]
-
-            nl.store(dst_arr[i_p_hbm, i_h_hbm, i_w], value=out_tile[i_p_tile, i_h_tile, i_w], mask=(i_p_hbm < n * c))
+            i_p, i_h_tile, i_w = nl.mgrid[0:P_TILE_SIZE, h_start_tile_dst:h_end_tile_dst, 0:w_dst]
+            _, i_h_hbm, _ = nl.mgrid[0:P_TILE_SIZE, h_start_hbm_dst:h_end_hbm_dst, 0:w_dst]
+            i_p_hbm = p * P_TILE_SIZE + i_p
+            nl.store(dst_arr[i_p_hbm, i_h_hbm, i_w], value=out_tile[i_p, i_h_tile, i_w], mask=(i_p_hbm < n * c))
 
     dst_arr = dst_arr.reshape((n, c, h_dst, w_dst))
     return dst_arr
@@ -188,7 +185,7 @@ def benchmark_kernel():
 
 def main():
   check_correct()
-  benchmark_kernel()
+# benchmark_kernel()
 
 if __name__ == "__main__":
   main()
