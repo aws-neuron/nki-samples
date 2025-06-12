@@ -109,9 +109,9 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             )
         
             ### Edges
+            ## Upper & lower edges, i.e. h=0 or h=h_dst-1 (corners excluded)
             i_p, i_wx, i_h, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:(w_src - 1)]
 
-            ## Upper & lower edges, i.e. h=0 or h=h_dst-1 (corners excluded)
             i_h_dst = (h_tile_size_dst - 1) * i_h
             i_w_dst = (2 * i_wy + 1) + i_wx
             
@@ -125,14 +125,14 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
             )
         
             ## Right & left edges, i.e. w=0 or w=w_dst-1 (corners excluded)
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None]
+            i_p, i_hx, i_w, i_hy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:(h_tile_size_src-1)]
 
-            i_h_dst = (2 * nl.arange(h_tile_size_src - 1)[None, None, None, :] + 1) + nl.arange(2)[None, :, None, None]
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, None, :, None])
+            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_w_dst = (w_dst - 1) * i_w
             
-            i_h_src_075 = nl.arange(h_tile_size_src - 1)[None, None, None, :] + nl.arange(2)[None, :, None, None]
-            i_h_src_025 = nl.arange(h_tile_size_src - 1)[None, None, None, :] + (-1 * nl.arange(2)[None, :, None, None] + 1)
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, None, :, None])
+            i_h_src_075 = i_hy + i_hx
+            i_h_src_025 = i_hy + (-1 * i_hx + 1)
+            i_w_src = (w_src - 1) * i_w
             
             out_tile[i_p, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_h_src_075, i_w_src] + \
