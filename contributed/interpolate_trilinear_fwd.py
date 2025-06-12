@@ -89,52 +89,52 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
 
             ### Core region
             weight_3d = weight_1d ** 3
-            i_p, i_dx, i_hx, i_wx, i_dy, i_hy, i_wy = nl.mgrid[
+            i_p, i_d_x, i_h_x, i_w_x, i_d_y, i_h_y, i_w_y = nl.mgrid[
                 0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(h_src-1), 0:(w_src-1)
             ]
-            i_d_dst = (2 * i_dy + 1) + i_dx
-            i_h_dst = (2 * i_hy + 1) + i_hx
-            i_w_dst = (2 * i_wy + 1) + i_wx
+            i_d_dst = (2 * i_d_y + 1) + i_d_x
+            i_h_dst = (2 * i_h_y + 1) + i_h_x
+            i_w_dst = (2 * i_w_y + 1) + i_w_x
             
             # (9*3)*weight_3d = 0.42
-            i_d_src_042 = i_dy + i_dx
-            i_h_src_042 = i_hy + i_hx
-            i_w_src_042 = i_wy + i_wx
+            i_d_src_042 = i_d_y + i_d_x
+            i_h_src_042 = i_h_y + i_h_x
+            i_w_src_042 = i_w_y + i_w_x
             
             # (3*3)*weight_3d (depth) = 0.14
-            i_d_src_014_d = i_dy + (-1 * i_dx + 1)
-            i_h_src_014_d = i_hy + i_hx
-            i_w_src_014_d = i_wy + i_wx
+            i_d_src_014_d = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_014_d = i_h_y + i_h_x
+            i_w_src_014_d = i_w_y + i_w_x
             
             # (3*3)*weight_3d (height) = 0.14
-            i_d_src_014_h = i_dy + i_dx
-            i_h_src_014_h = i_hy + (-1 * i_hx + 1)
-            i_w_src_014_h = i_wy + i_wx
+            i_d_src_014_h = i_d_y + i_d_x
+            i_h_src_014_h = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_014_h = i_w_y + i_w_x
             
             # (1*3)*weight_3d (width) = 0.05
-            i_d_src_005_w = i_dy + (-1 * i_dx + 1)
-            i_h_src_005_w = i_hy + (-1 * i_hx + 1)
-            i_w_src_005_w = i_wy + i_wx
+            i_d_src_005_w = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_005_w = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_005_w = i_w_y + i_w_x
             
             # (9*1)*weight_3d (width) = 0.14
-            i_d_src_014_w = i_dy + i_dx
-            i_h_src_014_w = i_hy + i_hx
-            i_w_src_014_w = i_wy + (-1 * i_wx + 1)
+            i_d_src_014_w = i_d_y + i_d_x
+            i_h_src_014_w = i_h_y + i_h_x
+            i_w_src_014_w = i_w_y + (-1 * i_w_x + 1)
             
             # (3*1)*weight_3d (depth) = 0.05
-            i_d_src_005_d = i_dy + (-1 * i_dx + 1)
-            i_h_src_005_d = i_hy + i_hx
-            i_w_src_005_d = i_wy + (-1 * i_wx + 1)
+            i_d_src_005_d = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_005_d = i_h_y + i_h_x
+            i_w_src_005_d = i_w_y + (-1 * i_w_x + 1)
             
             # (3*1)*weight_3d (height) = 0.05
-            i_d_src_005_h = i_dy + i_dx
-            i_h_src_005_h = i_hy + (-1 * i_hx + 1)
-            i_w_src_005_h = i_wy + (-1 * i_wx + 1)
+            i_d_src_005_h = i_d_y + i_d_x
+            i_h_src_005_h = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_005_h = i_w_y + (-1 * i_w_x + 1)
             
             # (1*1)*weight_3d = 0.01
-            i_d_src_001 = i_dy + (-1 * i_dx + 1)
-            i_h_src_001 = i_hy + (-1 * i_hx + 1)
-            i_w_src_001 = i_wy + (-1 * i_wx + 1)
+            i_d_src_001 = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_001 = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_001 = i_w_y + (-1 * i_w_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 (9 * 3) * weight_3d * in_tile[i_p, i_d_src_042, i_h_src_042, i_w_src_042] + \
@@ -151,20 +151,20 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             weight_2d = weight_1d ** 2
             
             ## d=0 and d=d_dst - 1 faces (borders excluded)
-            i_p, i_d, i_hx, i_wx, i_hy, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1), 0:(w_src-1)]
+            i_p, i_d, i_h_x, i_w_x, i_h_y, i_w_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1), 0:(w_src-1)]
             i_d_dst = ((d_tile_size_dst - 1) * i_d)
-            i_h_dst = (2 * i_hy + 1) + i_hx
-            i_w_dst = (2 * i_wy + 1) + i_wx
+            i_h_dst = (2 * i_h_y + 1) + i_h_x
+            i_w_dst = (2 * i_w_y + 1) + i_w_x
             
             i_d_src = ((d_tile_size_src - 1) * i_d)
-            i_h_src_056 = i_hy + i_hx
-            i_w_src_056 = i_wy + i_wx
-            i_h_src_018_h = i_hy + (-1 * i_hx + 1)
-            i_w_src_018_h = i_wy + i_wx
-            i_h_src_018_w = i_hy + i_hx
-            i_w_src_018_w = i_wy + (-1 * i_wx + 1)
-            i_h_src_006 = i_hy + (-1 * i_hx + 1)
-            i_w_src_006 = i_wy + (-1 * i_wx + 1)
+            i_h_src_056 = i_h_y + i_h_x
+            i_w_src_056 = i_w_y + i_w_x
+            i_h_src_018_h = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_018_h = i_w_y + i_w_x
+            i_h_src_018_w = i_h_y + i_h_x
+            i_w_src_018_w = i_w_y + (-1 * i_w_x + 1)
+            i_h_src_006 = i_h_y + (-1 * i_h_x + 1)
+            i_w_src_006 = i_w_y + (-1 * i_w_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src, i_h_src_056, i_w_src_056] + \
@@ -174,20 +174,20 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## h=0 and h=h_dst - 1 faces (borders excluded)
-            i_p, i_dx, i_h, i_wx, i_dy, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(w_src-1)]
-            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_p, i_d_x, i_h, i_w_x, i_d_y, i_w_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(w_src-1)]
+            i_d_dst = (2 * i_d_y + 1) + i_d_x
             i_h_dst = ((h_dst - 1) * i_h)
-            i_w_dst = (2 * i_wy + 1) + i_wx
+            i_w_dst = (2 * i_w_y + 1) + i_w_x
             
             i_h_src = ((h_src - 1) * i_h)
-            i_d_src_056 = i_dy + i_dx
-            i_w_src_056 = i_wy + i_wx
-            i_d_src_018_d = i_dy + (-1 * i_dx + 1)
-            i_w_src_018_d = i_wy + i_wx
-            i_d_src_018_w = i_dy + i_dx
-            i_w_src_018_w = i_wy + (-1 * i_wx + 1)
-            i_d_src_006 = i_dy + (-1 * i_dx + 1)
-            i_w_src_006 = i_wy + (-1 * i_wx + 1)
+            i_d_src_056 = i_d_y + i_d_x
+            i_w_src_056 = i_w_y + i_w_x
+            i_d_src_018_d = i_d_y + (-1 * i_d_x + 1)
+            i_w_src_018_d = i_w_y + i_w_x
+            i_d_src_018_w = i_d_y + i_d_x
+            i_w_src_018_w = i_w_y + (-1 * i_w_x + 1)
+            i_d_src_006 = i_d_y + (-1 * i_d_x + 1)
+            i_w_src_006 = i_w_y + (-1 * i_w_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src_056, i_h_src, i_w_src_056] + \
@@ -197,20 +197,20 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## w=0 and w=w_dst - 1 faces (borders excluded)
-            i_p, i_dx, i_hx, i_w, i_dy, i_hy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(h_src-1)]
-            i_d_dst = (2 * i_dy + 1) + i_dx
-            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_p, i_d_x, i_h_x, i_w, i_d_y, i_h_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(h_src-1)]
+            i_d_dst = (2 * i_d_y + 1) + i_d_x
+            i_h_dst = (2 * i_h_y + 1) + i_h_x
             i_w_dst = ((w_dst - 1) * i_w)
             
             i_w_src = ((w_src - 1) * i_w)
-            i_d_src_056 = i_dy + i_dx
-            i_h_src_056 = i_hy + i_hx
-            i_d_src_018_d = i_dy + (-1 * i_dx + 1)
-            i_h_src_018_d = i_hy + i_hx
-            i_d_src_018_h = i_dy + i_dx
-            i_h_src_018_h = i_hy + (-1 * i_hx + 1)
-            i_d_src_006 = i_dy + (-1 * i_dx + 1)
-            i_h_src_006 = i_hy + (-1 * i_hx + 1)
+            i_d_src_056 = i_d_y + i_d_x
+            i_h_src_056 = i_h_y + i_h_x
+            i_d_src_018_d = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_018_d = i_h_y + i_h_x
+            i_d_src_018_h = i_d_y + i_d_x
+            i_h_src_018_h = i_h_y + (-1 * i_h_x + 1)
+            i_d_src_006 = i_d_y + (-1 * i_d_x + 1)
+            i_h_src_006 = i_h_y + (-1 * i_h_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src_056, i_h_src_056, i_w_src] + \
@@ -221,15 +221,15 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             
             ### Edges
             ## (d=0 and d=d_dst - 1) x (h=0 and h=h_dst - 1) edges (corners excluded)
-            i_p, i_d, i_h, i_wx, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(w_src-1)]
+            i_p, i_d, i_h, i_w_x, i_w_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(w_src-1)]
             i_d_dst = ((d_tile_size_dst - 1) * i_d)
             i_h_dst = ((h_dst - 1) * i_h)
-            i_w_dst = (2 * i_wy + 1) + i_wx
+            i_w_dst = (2 * i_w_y + 1) + i_w_x
             
             i_d_src = ((d_tile_size_src - 1) * i_d)
             i_h_src = ((h_src - 1) * i_h)
-            i_w_src_075 = i_wy + i_wx
-            i_w_src_025 = i_wy + (-1 * i_wx + 1)
+            i_w_src_075 = i_w_y + i_w_x
+            i_w_src_025 = i_w_y + (-1 * i_w_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src, i_h_src, i_w_src_075] + \
@@ -237,15 +237,15 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## (d=0 and d=d_dst - 1) x (w=0 and w=w_dst - 1) edges (corners excluded)
-            i_p, i_d, i_hx, i_w, i_hy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1)]
+            i_p, i_d, i_h_x, i_w, i_h_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1)]
             i_d_dst = ((d_tile_size_dst - 1) * i_d)
-            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_h_dst = (2 * i_h_y + 1) + i_h_x
             i_w_dst = ((w_dst - 1) * i_w)
             
             i_d_src = ((d_tile_size_src - 1) * i_d)
             i_w_src = ((w_src - 1) * i_w)
-            i_h_src_075 = i_hy + i_hx
-            i_h_src_025 = i_hy + (-1 * i_hx + 1)
+            i_h_src_075 = i_h_y + i_h_x
+            i_h_src_025 = i_h_y + (-1 * i_h_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src, i_h_src_075, i_w_src] + \
@@ -253,15 +253,15 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## (h=0 and h=h_dst - 1) x (w=0 and w=w_dst - 1) edges (corners excluded)
-            i_p, i_dx, i_h, i_w, i_dy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1)]
-            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_p, i_d_x, i_h, i_w, i_d_y = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1)]
+            i_d_dst = (2 * i_d_y + 1) + i_d_x
             i_h_dst = ((h_dst - 1) * i_h)
             i_w_dst = ((w_dst - 1) * i_w)
             
             i_h_src = ((h_src - 1) * i_h)
             i_w_src = ((w_src - 1) * i_w)
-            i_d_src_075 = i_dy + i_dx
-            i_d_src_025 = i_dy + (-1 * i_dx + 1)
+            i_d_src_075 = i_d_y + i_d_x
+            i_d_src_025 = i_d_y + (-1 * i_d_x + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src_075, i_h_src, i_w_src] + \
