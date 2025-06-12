@@ -34,6 +34,7 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
     """
     This function implements a NKI kernel for trilinear 2x upscaling (interpolation) on a 5D 
     input tensor array for the `align_corners=False` case and using advanced indexing only.
+
     Source array N & C dimensions are mapped to the SBUF partition dimension. D, H & W dimensions are mapped to the 
     SBUF free dimension. The kernel chunks the source array along the D dimension in chunks of `chunk_size` faces. 
     From a physical memory perspective, the kernel therefore operates on source array tiles of 
@@ -44,7 +45,6 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
         chunk_size (int): Size of the chunk along the D free dimension.
     """
     P_TILE_SIZE = nl.tile_size.pmax # 128
-
     n_src, c_src, d_src, h_src, w_src = src_arr.shape
     n_dst, c_dst, d_dst, h_dst, w_dst = n_src, c_src, d_src * 2, h_src * 2, w_src * 2
 
@@ -53,10 +53,10 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
     assert d_dst == 2 * d_src, "Output depth must be twice the input depth"
     assert h_dst == 2 * h_src, "Output height must be twice the input height"
     assert w_dst == 2 * w_src, "Output width must be twice the input width"
+
     n, c = n_src, c_src
     
     weight_1d = 1 / 4 # specific to scaling_factor=2.0 & align_corners=False
-
     src_arr = src_arr.reshape((n * c, d_src, h_src, w_src))
     dst_arr = nl.ndarray(
         [n_dst * c_dst, d_dst, h_dst, w_dst], 
@@ -66,7 +66,6 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
 
     wdw_size = chunk_size
     step_size = wdw_size - 1
-
     for d in nl.static_range(math.ceil((d_src - wdw_size)/step_size) + 1):
         d_start_hbm_src = max(0, d * step_size) 
         d_end_hbm_src = min(wdw_size + d * step_size, d_src)
@@ -79,64 +78,63 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
         
         d_start_hbm_dst = 2 * d_start_hbm_src + 1 if d_start_hbm_src else 0
         d_end_hbm_dst = 2 * d_end_hbm_src
+
         for p in nl.affine_range(math.ceil(n * c / P_TILE_SIZE)):
             out_tile = nl.ndarray([P_TILE_SIZE, d_tile_size_dst, h_dst, w_dst], dtype=src_arr.dtype, buffer=nl.sbuf)
 
             ### Load input array from HBM
-            i_p = p * P_TILE_SIZE + nl.arange(P_TILE_SIZE)[:, None, None, None]
-            i_d = nl.arange(d_start_hbm_src, d_end_hbm_src)[None, :, None, None]
-            i_h = nl.arange(h_src)[None, None, :, None]
-            i_w = nl.arange(w_src)[None, None, None, :]
-
+            i_p, i_d, i_h, i_w = nl.mgrid[0:P_TILE_SIZE, d_start_hbm_src:d_end_hbm_src, 0:h_src, 0:w_src]
+            i_p = p * P_TILE_SIZE + i_p
             in_tile = nl.load(src_arr[i_p, i_d, i_h, i_w], mask=(i_p < n * c))
 
             ### Core region
             weight_3d = weight_1d ** 3
-
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None, None, None, None]
-            i_d_dst = (2 * nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + 1) + nl.arange(2)[None, :, None, None, None, None, None]
-            i_h_dst = (2 * nl.arange(h_src - 1)[None, None, None, None, None, :, None] + 1) + nl.arange(2)[None, None, :, None, None, None, None]
-            i_w_dst = (2 * nl.arange(w_src - 1)[None, None, None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None, None, None]
-
+            i_p, i_dx, i_hx, i_wx, i_dy, i_hy, i_wy = nl.mgrid[
+                0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(h_src-1), 0:(w_src-1)
+            ]
+            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_w_dst = (2 * i_wy + 1) + i_wx
+            
             # (9*3)*weight_3d = 0.42
-            i_d_src_042 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + nl.arange(2)[None,:, None, None, None, None, None]
-            i_h_src_042 = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None, None]
-            i_w_src_042 = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None, None]
-
+            i_d_src_042 = i_dy + i_dx
+            i_h_src_042 = i_hy + i_hx
+            i_w_src_042 = i_wy + i_wx
+            
             # (3*3)*weight_3d (depth) = 0.14
-            i_d_src_014_d = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + (-1 * nl.arange(2)[None, :, None, None, None, None, None] + 1)
-            i_h_src_014_d = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None, None]
-            i_w_src_014_d = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None, None]
-
+            i_d_src_014_d = i_dy + (-1 * i_dx + 1)
+            i_h_src_014_d = i_hy + i_hx
+            i_w_src_014_d = i_wy + i_wx
+            
             # (3*3)*weight_3d (height) = 0.14
-            i_d_src_014_h = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + nl.arange(2)[None, :, None, None, None, None, None]
-            i_h_src_014_h = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None, None] + 1)
-            i_w_src_014_h = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None, None]
-
+            i_d_src_014_h = i_dy + i_dx
+            i_h_src_014_h = i_hy + (-1 * i_hx + 1)
+            i_w_src_014_h = i_wy + i_wx
+            
             # (1*3)*weight_3d (width) = 0.05
-            i_d_src_005_w = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + (-1 * nl.arange(2)[None, :, None, None, None, None, None] + 1)
-            i_h_src_005_w = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None, None] + 1)
-            i_w_src_005_w = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None, None]
-
+            i_d_src_005_w = i_dy + (-1 * i_dx + 1)
+            i_h_src_005_w = i_hy + (-1 * i_hx + 1)
+            i_w_src_005_w = i_wy + i_wx
+            
             # (9*1)*weight_3d (width) = 0.14
-            i_d_src_014_w = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + nl.arange(2)[None, :, None, None, None, None, None]
-            i_h_src_014_w = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None, None]
-            i_w_src_014_w = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None, None] + 1)
-
+            i_d_src_014_w = i_dy + i_dx
+            i_h_src_014_w = i_hy + i_hx
+            i_w_src_014_w = i_wy + (-1 * i_wx + 1)
+            
             # (3*1)*weight_3d (depth) = 0.05
-            i_d_src_005_d = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + (-1 * nl.arange(2)[None, :, None, None, None, None, None] + 1)
-            i_h_src_005_d = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None, None]
-            i_w_src_005_d = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None, None] + 1)
-
+            i_d_src_005_d = i_dy + (-1 * i_dx + 1)
+            i_h_src_005_d = i_hy + i_hx
+            i_w_src_005_d = i_wy + (-1 * i_wx + 1)
+            
             # (3*1)*weight_3d (height) = 0.05
-            i_d_src_005_h = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + nl.arange(2)[None, :, None, None, None, None, None]
-            i_h_src_005_h = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None, None] + 1)
-            i_w_src_005_h = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None, None] + 1)
-
+            i_d_src_005_h = i_dy + i_dx
+            i_h_src_005_h = i_hy + (-1 * i_hx + 1)
+            i_w_src_005_h = i_wy + (-1 * i_wx + 1)
+            
             # (1*1)*weight_3d = 0.01
-            i_d_src_001 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None, None] + (-1 * nl.arange(2)[None, :, None, None, None, None, None] + 1)
-            i_h_src_001 = nl.arange(h_src - 1)[None, None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None, None] + 1)
-            i_w_src_001 = nl.arange(w_src - 1)[None, None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None, None] + 1)
+            i_d_src_001 = i_dy + (-1 * i_dx + 1)
+            i_h_src_001 = i_hy + (-1 * i_hx + 1)
+            i_w_src_001 = i_wy + (-1 * i_wx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 (9 * 3) * weight_3d * in_tile[i_p, i_d_src_042, i_h_src_042, i_w_src_042] + \
@@ -148,30 +146,25 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
                 (3 * 1) * weight_3d * in_tile[i_p, i_d_src_005_h, i_h_src_005_h, i_w_src_005_h] + \
                 (1 * 1) * weight_3d * in_tile[i_p, i_d_src_001, i_h_src_001, i_w_src_001]
             )
-        
+            
             ### Faces
             weight_2d = weight_1d ** 2
-
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None, None, None]
             
             ## d=0 and d=d_dst - 1 faces (borders excluded)
-            i_d_dst = ((d_tile_size_dst - 1) * nl.arange(2)[None, :, None, None, None, None])
-            i_h_dst = (2 * nl.arange(h_src - 1)[None, None, None, None, :, None] + 1) + nl.arange(2)[None, None, :, None, None, None]
-            i_w_dst = (2 * nl.arange(w_src - 1)[None, None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None, None]
-
-            i_d_src = ((d_tile_size_src - 1) * nl.arange(2)[None, :, None, None, None, None])
-
-            i_h_src_056 = nl.arange(h_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_w_src_056 = nl.arange(w_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_h_src_018_h = nl.arange(h_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_w_src_018_h = nl.arange(w_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_h_src_018_w = nl.arange(h_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_w_src_018_w = nl.arange(w_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
-
-            i_h_src_006 = nl.arange(h_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_w_src_006 = nl.arange(w_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
+            i_p, i_d, i_hx, i_wx, i_hy, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1), 0:(w_src-1)]
+            i_d_dst = ((d_tile_size_dst - 1) * i_d)
+            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_w_dst = (2 * i_wy + 1) + i_wx
+            
+            i_d_src = ((d_tile_size_src - 1) * i_d)
+            i_h_src_056 = i_hy + i_hx
+            i_w_src_056 = i_wy + i_wx
+            i_h_src_018_h = i_hy + (-1 * i_hx + 1)
+            i_w_src_018_h = i_wy + i_wx
+            i_h_src_018_w = i_hy + i_hx
+            i_w_src_018_w = i_wy + (-1 * i_wx + 1)
+            i_h_src_006 = i_hy + (-1 * i_hx + 1)
+            i_w_src_006 = i_wy + (-1 * i_wx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src, i_h_src_056, i_w_src_056] + \
@@ -181,23 +174,20 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## h=0 and h=h_dst - 1 faces (borders excluded)
-            i_d_dst = (2 * nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + 1) + nl.arange(2)[None, None, :, None, None, None]
-            i_h_dst = ((h_dst - 1) * nl.arange(2)[None, :, None, None, None, None])
-            i_w_dst = (2 * nl.arange(w_src - 1)[None, None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None, None]
-
-            i_h_src = ((h_src - 1) * nl.arange(2)[None, :, None, None, None, None])
-
-            i_d_src_056 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_w_src_056 = nl.arange(w_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_d_src_018_d = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_w_src_018_d = nl.arange(w_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_d_src_018_w = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_w_src_018_w = nl.arange(w_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
-
-            i_d_src_006 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_w_src_006 = nl.arange(w_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
+            i_p, i_dx, i_h, i_wx, i_dy, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(w_src-1)]
+            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_h_dst = ((h_dst - 1) * i_h)
+            i_w_dst = (2 * i_wy + 1) + i_wx
+            
+            i_h_src = ((h_src - 1) * i_h)
+            i_d_src_056 = i_dy + i_dx
+            i_w_src_056 = i_wy + i_wx
+            i_d_src_018_d = i_dy + (-1 * i_dx + 1)
+            i_w_src_018_d = i_wy + i_wx
+            i_d_src_018_w = i_dy + i_dx
+            i_w_src_018_w = i_wy + (-1 * i_wx + 1)
+            i_d_src_006 = i_dy + (-1 * i_dx + 1)
+            i_w_src_006 = i_wy + (-1 * i_wx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src_056, i_h_src, i_w_src_056] + \
@@ -207,23 +197,20 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## w=0 and w=w_dst - 1 faces (borders excluded)
-            i_d_dst = (2 * nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + 1) + nl.arange(2)[None, None, :, None, None, None]
-            i_h_dst = (2 * nl.arange(h_src - 1)[None, None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None, None]
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, :, None, None, None, None])
-
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, :, None, None, None, None])
-
-            i_d_src_056 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_h_src_056 = nl.arange(h_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_d_src_018_d = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_h_src_018_d = nl.arange(h_src - 1)[None, None, None, None, None, :] + nl.arange(2)[None, None, None, :, None, None]
-
-            i_d_src_018_h = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + nl.arange(2)[None, None, :, None, None, None]
-            i_h_src_018_h = nl.arange(h_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
-
-            i_d_src_006 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :, None] + (-1 * nl.arange(2)[None, None, :, None, None, None] + 1)
-            i_h_src_006 = nl.arange(h_src - 1)[None, None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None, None] + 1)
+            i_p, i_dx, i_hx, i_w, i_dy, i_hy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1), 0:(h_src-1)]
+            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_w_dst = ((w_dst - 1) * i_w)
+            
+            i_w_src = ((w_src - 1) * i_w)
+            i_d_src_056 = i_dy + i_dx
+            i_h_src_056 = i_hy + i_hx
+            i_d_src_018_d = i_dy + (-1 * i_dx + 1)
+            i_h_src_018_d = i_hy + i_hx
+            i_d_src_018_h = i_dy + i_dx
+            i_h_src_018_h = i_hy + (-1 * i_hx + 1)
+            i_d_src_006 = i_dy + (-1 * i_dx + 1)
+            i_h_src_006 = i_hy + (-1 * i_hx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 9 * weight_2d * in_tile[i_p, i_d_src_056, i_h_src_056, i_w_src] + \
@@ -231,20 +218,18 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
                 3 * weight_2d * in_tile[i_p, i_d_src_018_h, i_h_src_018_h, i_w_src] + \
                 1 * weight_2d * in_tile[i_p, i_d_src_006, i_h_src_006, i_w_src]
             )
-        
+            
             ### Edges
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None, None]
-
             ## (d=0 and d=d_dst - 1) x (h=0 and h=h_dst - 1) edges (corners excluded)
-            i_d_dst = ((d_tile_size_dst - 1) * nl.arange(2)[None, :, None, None, None])
-            i_h_dst = ((h_dst - 1) * nl.arange(2)[None, None, :, None, None])
-            i_w_dst = (2 * nl.arange(w_src - 1)[None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None]
-
-            i_d_src = ((d_tile_size_src - 1) * nl.arange(2)[None, :, None, None, None])
-            i_h_src = ((h_src - 1) * nl.arange(2)[None, None, :, None, None])
-
-            i_w_src_075 = nl.arange(w_src - 1)[None, None, None, None, :] + nl.arange(2)[None, None, None, :, None]
-            i_w_src_025 = nl.arange(w_src - 1)[None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None] + 1)
+            i_p, i_d, i_h, i_wx, i_wy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(w_src-1)]
+            i_d_dst = ((d_tile_size_dst - 1) * i_d)
+            i_h_dst = ((h_dst - 1) * i_h)
+            i_w_dst = (2 * i_wy + 1) + i_wx
+            
+            i_d_src = ((d_tile_size_src - 1) * i_d)
+            i_h_src = ((h_src - 1) * i_h)
+            i_w_src_075 = i_wy + i_wx
+            i_w_src_025 = i_wy + (-1 * i_wx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src, i_h_src, i_w_src_075] + \
@@ -252,15 +237,15 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## (d=0 and d=d_dst - 1) x (w=0 and w=w_dst - 1) edges (corners excluded)
-            i_d_dst = ((d_tile_size_dst - 1) * nl.arange(2)[None, :, None, None, None])
-            i_h_dst = (2 * nl.arange(h_src - 1)[None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None]
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, None, :, None, None])
-
-            i_d_src = ((d_tile_size_src - 1) * nl.arange(2)[None, :, None, None, None])
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, None, :, None, None])
-
-            i_h_src_075 = nl.arange(h_src - 1)[None, None, None, None, :] + nl.arange(2)[None, None, None, :, None]
-            i_h_src_025 = nl.arange(h_src - 1)[None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None] + 1)
+            i_p, i_d, i_hx, i_w, i_hy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(h_src-1)]
+            i_d_dst = ((d_tile_size_dst - 1) * i_d)
+            i_h_dst = (2 * i_hy + 1) + i_hx
+            i_w_dst = ((w_dst - 1) * i_w)
+            
+            i_d_src = ((d_tile_size_src - 1) * i_d)
+            i_w_src = ((w_src - 1) * i_w)
+            i_h_src_075 = i_hy + i_hx
+            i_h_src_025 = i_hy + (-1 * i_hx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src, i_h_src_075, i_w_src] + \
@@ -268,44 +253,39 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
             )
             
             ## (h=0 and h=h_dst - 1) x (w=0 and w=w_dst - 1) edges (corners excluded)
-            i_d_dst = (2 * nl.arange(d_tile_size_src - 1)[None, None, None, None, :] + 1) + nl.arange(2)[None, None, None, :, None]
-            i_h_dst = ((h_dst - 1) * nl.arange(2)[None, :, None, None, None])
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, None, :, None, None])
-
-            i_h_src = ((h_src - 1) * nl.arange(2)[None, :, None, None, None])
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, None, :, None, None])
-
-            i_d_src_075 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :] + nl.arange(2)[None, None, None, :, None]
-            i_d_src_025 = nl.arange(d_tile_size_src - 1)[None, None, None, None, :] + (-1 * nl.arange(2)[None, None, None, :, None] + 1)
+            i_p, i_dx, i_h, i_w, i_dy = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2, 0:(d_tile_size_src-1)]
+            i_d_dst = (2 * i_dy + 1) + i_dx
+            i_h_dst = ((h_dst - 1) * i_h)
+            i_w_dst = ((w_dst - 1) * i_w)
+            
+            i_h_src = ((h_src - 1) * i_h)
+            i_w_src = ((w_src - 1) * i_w)
+            i_d_src_075 = i_dy + i_dx
+            i_d_src_025 = i_dy + (-1 * i_dx + 1)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = (
                 3 * weight_1d * in_tile[i_p, i_d_src_075, i_h_src, i_w_src] + \
                 1 * weight_1d * in_tile[i_p, i_d_src_025, i_h_src, i_w_src]
             )
-        
-            #### Corners
-            i_p = nl.arange(P_TILE_SIZE)[:, None, None, None]
-
-            i_d_dst = ((d_tile_size_dst - 1) * nl.arange(2)[None, :, None, None])
-            i_h_dst = ((h_dst - 1) * nl.arange(2)[None, None, :, None])
-            i_w_dst = ((w_dst - 1) * nl.arange(2)[None, None, None, :])
-
-            i_d_src = ((d_tile_size_src - 1) * nl.arange(2)[None, :, None, None])
-            i_h_src = ((h_src - 1) * nl.arange(2)[None, None, :, None])
-            i_w_src = ((w_src - 1) * nl.arange(2)[None, None, None, :])
+            
+            ### Corners
+            i_p, i_d, i_h, i_w = nl.mgrid[0:P_TILE_SIZE, 0:2, 0:2, 0:2]
+            i_d_dst = ((d_tile_size_dst - 1) * i_d)
+            i_h_dst = ((h_dst - 1) * i_h)
+            i_w_dst = ((w_dst - 1) * i_w)
+            
+            i_d_src = ((d_tile_size_src - 1) * i_d)
+            i_h_src = ((h_src - 1) * i_h)
+            i_w_src = ((w_src - 1) * i_w)
             
             out_tile[i_p, i_d_dst, i_h_dst, i_w_dst] = in_tile[i_p, i_d_src, i_h_src, i_w_src]
 
             ### Write output array to HBM
-            i_p_tile = nl.arange(P_TILE_SIZE)[:, None, None, None]
-            i_d_tile = nl.arange(d_start_tile_dst, d_end_tile_dst)[None, :, None, None]
-            i_p_hbm = p * P_TILE_SIZE + nl.arange(P_TILE_SIZE)[:, None, None, None]
-            i_d_hbm = nl.arange(d_start_hbm_dst, d_end_hbm_dst)[None, :, None, None]
-            i_h = nl.arange(h_dst)[None, None, :, None]
-            i_w = nl.arange(w_dst)[None, None, None, :]
+            i_p, i_d, i_h, i_w = nl.mgrid[0:P_TILE_SIZE, d_start_tile_dst:d_end_tile_dst, 0:h_dst, 0:w_dst]
+            i_p_hbm = p * P_TILE_SIZE + i_p
+            _, i_d_hbm, _, _ = nl.mgrid[0:P_TILE_SIZE, d_start_hbm_dst:d_end_hbm_dst, 0:h_dst, 0:w_dst]
+            nl.store(dst_arr[i_p_hbm, i_d_hbm, i_h, i_w], value=out_tile[i_p, i_d, i_h, i_w], mask=(i_p_hbm < n * c))
 
-            nl.store(dst_arr[i_p_hbm, i_d_hbm, i_h, i_w], value=out_tile[i_p_tile, i_d_tile, i_h, i_w], mask=(i_p_hbm < n * c))
-    
     dst_arr = dst_arr.reshape((n, c, d_dst, h_dst, w_dst))
     return dst_arr
 
@@ -337,7 +317,7 @@ def benchmark_kernel():
 
 def main():
     check_correct()
-    benchmark_kernel()
+    #benchmark_kernel()
 
 if __name__ == "__main__":
     main()
