@@ -52,6 +52,9 @@ class NKIFlashPagedAttentionRunner:
         dynamic_loop_unrolling_size,
         exec_mode=None,
     ):
+        """
+        Kernel executor to generate and cache tile-plan, and dispatch for execution
+        """
         assert large_kv_tile_size >= B_P_SIZE
         self.query_lens = query_lens
         self.context_lens = context_lens
@@ -223,7 +226,7 @@ class NKIFlashPagedAttentionRunner:
         self.last_tile_indices = last_tile_indices
         self.q_update_pred = q_update_pred
 
-        # dyanmic loop num iteration
+        # dynamic loop num iteration
         if self.dynamic_loop_unrolling_size:
             num_dynamic_loop_steps = torch.empty((1, 1), dtype=torch.int32)
             num_dynamic_loop_steps[0] = ceil_div(

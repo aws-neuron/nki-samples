@@ -117,7 +117,7 @@ def _flash_attention_core(
     of q and a block of K and V.
     q_local_tile: (B_D_SIZE, Q_TILE_SIZE)
     k: (B_D_SIZE, LARGE_KV_TILE_SIZE)
-    v: (B_P_SIZE, LARGE_KV_TILE_SIZE // B_P_SIZE, B_D_SIZE)
+    v: (B_P_SIZE, LARGE_KV_TILE_SIZE // B_P_SIZE * B_D_SIZE)
     The results are stored in the following three buffers
     o_buffer: (Q_TILE_SIZE, B_D_SIZE)
     l_buffer: (Q_TILE_SIZE, 1)
@@ -292,11 +292,16 @@ def _flash_attention_core_kq_matmul(
     """
     The flash attention core function to calculate self attention between a tile
     of q and a block of K and V.
+
+    This is only used to handle decode phase attention between new prompt tokens (Q) and context
+    tokens (KV). Instead of calculate score as S=Q@K^T, we calculate K^T@Q to improve engine
+    utilization
+
+    This func also performs loading KV cache using vector DGE into SBUF
+
     Input:
     q_local_tile: (B_D_SIZE, q_h_per_k_h)
-    k: (B_D_SIZE, kv_tile_size)
-    v: (B_P_SIZE, kv_tile_size // B_P_SIZE, B_D_SIZE)
-    The results are stored in the following three buffers
+    The results are stored in the large_tile_idx-th column in the following three buffers
     o_buffer_sbuf: (B_D_SIZE, NUM_LARGE_TILE, q_h_per_k_h)
     l_buffer_sbuf: (1, NUM_LAEGE_TILE, q_h_per_k_h)
     m_buffer_sbuf: (1, NUM_LAEGE_TILE, q_h_per_k_h)
@@ -329,6 +334,8 @@ def _flash_attention_core_kq_matmul(
             q_local_tile[:, large_tile_idx],
             transpose_x=True,
         )  # (p(128), Q_TILE_SIZE)
+
+    # prefetch key cache for next tile
     if large_tile_idx + 1 < NUM_LARGE_TILE:
         k_load_buffer_reshaped = k_load_buffer.reshape(
             (B_D_SIZE, MULTI_BUFFER_SIZE, num_loads, block_size, B_P_SIZE),
@@ -361,6 +368,7 @@ def _flash_attention_core_kq_matmul(
                     identity_for_transpose=identity_for_transpose_k,
                 )
 
+    # mask out kq score using attention mask
     nisa.tensor_copy_predicated(
         src=kq_res_psum,
         dst=kq_res_buf,
@@ -470,6 +478,8 @@ def _flash_attention_core_kq_matmul(
             p_local[:, k_i],
             transpose_x=True,
         )
+
+    # prefetch value cache for next tile
     if large_tile_idx + 1 < NUM_LARGE_TILE:
         # load value cache
         for load_idx in nl.affine_range(num_loads):
@@ -548,6 +558,9 @@ def _active_attention_core_batched(
     o_buffer: (par_dim(TILE_SIZE), q_h_per_k_h, B_D_SIZE)
     l_buffer: (par_dim(TILE_SIZE), q_h_per_k_h, 1)
     m_buffer: (par_dim(TILE_SIZE), q_h_per_k_h, 1)
+
+    This function is only used for decode phase to handle attention on active
+    tokens of different sequences in a batched fashion.
     """
     qk_psum = nl.ndarray(
         (par_dim(TILE_SIZE), q_h_per_k_h, 1),
@@ -643,6 +656,12 @@ def prefill_prior_tokens(
     B_F_SIZE,
     B_D_SIZE,
 ):
+    """
+    Handles `num_tiles_unrolled` tiles of attention between Q and context tokens by having a static
+    sequential loop over the tiles.
+
+    This function is also used as loop body of dynamic-loop kernel
+    """
     load_mask_locally = cur_masks is None
     identity_for_transpose_k = nl.load(identity_for_transpose_k_hbm)
     identity_for_transpose_p = nl.load(identity_for_transpose_p_hbm)
@@ -1002,6 +1021,12 @@ def decode_prior_tokens(
     identity_for_transpose_m_step2_hbm,
     identity_for_transpose_k_hbm,
 ):
+    """
+    Handles `num_tiles_unrolled` tiles of attention between Q and context tokens by having a static
+    sequential loop over the tiles.
+
+    This function is also used as loop body of dynamic-loop kernel
+    """
 
     identity_for_transpose_k = nl.load(identity_for_transpose_k_hbm)
     identity_for_transpose_m_step1 = nl.load(identity_for_transpose_m_step1_hbm)

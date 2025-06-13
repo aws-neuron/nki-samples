@@ -144,6 +144,9 @@ def transform_to_vector_dge_layout(
 
 
 def PF_transpose_with_PE_int4byte(src, out, identity_for_transpose=None):
+    """
+    Perform int32 P-F Transpose with PE. Lower into 4 uint8 P-F transpose with reinterpret cast
+    """
     # lower as 4 uint8 matmul
     assert src.dtype == out.dtype
     assert src.dtype == nl.int32
@@ -199,6 +202,9 @@ def create_identity_for_transpose(src, size):
 
 
 def PF_transpose_with_PE(src, out, identity_for_transpose=None, out_in_psum=False):
+    """
+    Perform P-F Transpose with PE.
+    """
     p, f = src.shape
     assert p <= B_P_SIZE and f <= B_P_SIZE
     assert out.shape == (f, p), f"{src.shape=} {out.shape=}"
@@ -251,6 +257,9 @@ def PF_transpose_with_PE(src, out, identity_for_transpose=None, out_in_psum=Fals
 
 
 def broadcast_partition_with_PE(src, out, src_one_zero=False, out_in_psum=False):
+    """
+    Perform Partition Dimension Broadcast with PE rather than vector engine.
+    """
     out_shape = out.shape
     assert (
         src.dtype != nl.int32

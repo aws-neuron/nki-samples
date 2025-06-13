@@ -31,6 +31,14 @@ from utils import (
 
 
 def prepare_kv_block_dim_tiling(key_cache, value_cache, LARGE_KV_TILE_SIZE):
+    """
+    If number of blocks to load for a tile (i.e. LARGE_KV_TILE_SIZE // block_size) is smaller than
+    B_P_SIZE(128), tiling on block_size dimension is applied so that there are 128 loads to fully
+    utilize Vector DGE.
+
+    This function decides the new tiled_block_size. It also reshapes KV cache to a 2-D layout to
+    load KV data in block granularity
+    """
     num_blocks, k_h, block_size, d = key_cache.shape
     num_blocks_per_large_tile = LARGE_KV_TILE_SIZE // block_size
     assert is_power_of_2(
@@ -64,6 +72,16 @@ def transform_block_tables_for_indirect_load(
     num_head,
     head_id,
 ):
+    """
+    This function calculates the new block ids after reshaping KV cache layout from [num_blocks,
+    k_h, block_size, d] to [num_blocks * k_h, bloock_size * d].
+
+    And then block_tables is transposed (from [num_tiles, num_blocks_per_tile] to
+    [num_blocks_per_tile, num_tiles]) to map block_ids per tile to SBUF Partition Dimension for
+    vector DGE.
+    """
+    # block_tables on HBM has layout [num_tiles, num_blocks_per_tile]. And after loaded to SBUF,
+    # the layout becomes [par_dim(128), ceil_div(num_tiles, 128), num_blocks_per_tile]
     num_tiles_per_partition, num_partitions, num_blocks_per_tile = block_tables.shape
 
     num_loads = ceil_div(num_blocks_per_tile, B_P_SIZE)

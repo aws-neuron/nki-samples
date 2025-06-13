@@ -31,6 +31,7 @@ class BlockSparsePlan:
     tile_block_table_offsets: npt.NDArray[np.int32]
     tile_q_seq_ids: npt.NDArray[np.int32]
     tile_kv_seq_ids: npt.NDArray[np.int32]
+    # for DMA skipping if tile has the same KV offset as its predecessor
     tile_kv_skip_indices: npt.NDArray[np.int32]
     block_size: int
     tile_size_q: int
@@ -50,37 +51,37 @@ class BlockSparsePlan:
             assert arg.shape[0] == self.num_tiles, (arg.shape, self.num_tiles)
 
         if self.tile_kv_skip_indices.size > 0:
-            assert (
-                self.tile_kv_skip_indices[0] > 0
-            ), f"We will never expect to skip first tile"
+            assert np.all(self.tile_kv_skip_indices > 0), f"We never skip first tile"
             assert np.all(self.tile_kv_skip_indices < self.num_tiles)
 
     @property
     def num_tiles(self):
         return len(self.tile_q_indices)
 
-    def pad_plan(self, pad_num_tile_to, q_pad_value=0):
+    def pad_plan(self, pad_num_tiles_to, q_skip_value=0):
         num_tiles = self.num_tiles
-        if pad_num_tile_to <= num_tiles:
+        if pad_num_tiles_to <= num_tiles:
             return self
 
         def pad(x, pad_to, pad_value=0):
+            # always pad first dim of plan attribute
             shape = x.shape
             pad_width = [(0, pad_to - shape[0])] + [(0, 0)] * (len(shape) - 1)
             return np.pad(x, pad_width, mode="constant", constant_values=pad_value)
 
         tile_q_indices = pad(
             self.tile_q_indices,
-            pad_num_tile_to,
-            pad_value=q_pad_value,
+            pad_num_tiles_to,
+            pad_value=q_skip_value,
         )
-        tile_block_tables_offsets = pad(self.tile_block_table_offsets, pad_num_tile_to)
+        tile_block_tables_offsets = pad(self.tile_block_table_offsets, pad_num_tiles_to)
         # pad different value for q and kv seq ids so that sequence affiliation mask is False
-        tile_q_seq_ids = pad(self.tile_q_seq_ids, pad_num_tile_to, pad_value=0)
-        tile_kv_seq_ids = pad(self.tile_kv_seq_ids, pad_num_tile_to, pad_value=1)
+        tile_q_seq_ids = pad(self.tile_q_seq_ids, pad_num_tiles_to, pad_value=0)
+        tile_kv_seq_ids = pad(self.tile_kv_seq_ids, pad_num_tiles_to, pad_value=1)
+        # add all padded tile ids to kv_skip_indices for DMA skipping
         tile_kv_skip_indices = np.array(
             self.tile_kv_skip_indices.tolist()
-            + list(range(num_tiles, pad_num_tile_to)),
+            + list(range(num_tiles, pad_num_tiles_to)),
             dtype=np.int32,
         )
         return self.__class__(
@@ -107,6 +108,15 @@ class BlockSparsePlan:
         skip_value,
         dynamic_loop_unrolling=None,
     ):
+        """
+        Materialize block_table for each tile using 2-D block_tables [batch_size,
+        num_blocks_per_seq] and self.tile_block_tables_offsets.
+
+        If a tile is marked to skip KV loading, we set block_ids to skip_value.
+
+        But for dynamic loop case, if a tile is at the loop boundary (i.e., tile_id is multiple of
+        loop_unrolling size), then we disable DMA skipping for this tile to load KV cache from HBM
+        """
         block_tables = np.concatenate(
             [block_tables.squeeze(), np.array([skip_value], dtype=np.int32)]
         )
@@ -128,7 +138,14 @@ class BlockSparsePlan:
         assert tile_size_kv % B_P_SIZE == 0 and tile_size_kv % self.block_size == 0
         num_tiled_blocks = max(B_P_SIZE, tile_size_kv // self.block_size)
         tiled_block_size = tile_size_kv // num_tiled_blocks
+        # Mask is only used to mask out paddings within a tile. As a result, the mask is a sequence
+        # affiliation mask: as long as Q token and KV token has the same sequence id, the mask is
+        # True
         if tiled_block_size > 1:
+            # Due to how computation is mapped to 2-D SBUF, our kernel does not aggregate KV token
+            # following token's position id order. Instead, each KV tile are reshaped to have
+            # layout (B_P_SIZE, block_size) on SBUF, and reduction is done column by column. As a
+            # result, we need to reorder tile mask accordingly.
             tile_kv_seq_ids = tile_kv_seq_ids.reshape(
                 (
                     num_tiles,
@@ -141,6 +158,7 @@ class BlockSparsePlan:
                 (num_tiles, tile_size_kv)
             )
         if decode_kq_matmul:
+            # for decode, due to adopting kq matmul to improve , we need to transpose mask again
             tile_masks = np.expand_dims(self.tile_q_seq_ids, 1) == np.expand_dims(
                 tile_kv_seq_ids, 2
             )
@@ -261,6 +279,8 @@ class FlashAttentionPlanner:
         for seq_id, (num_q_tiles, num_kv_tiles) in enumerate(
             zip(num_seq_q_tiles, num_seq_kv_tiles)
         ):
+            # for each request / sequence, we cover the QK score region with tiles of shape [q_len
+            # // tile_size_q, kv_len // tile_size_kv]
             if num_q_tiles == 0 or num_kv_tiles == 0:
                 continue
             num_tiles = (num_q_tiles, num_kv_tiles)
@@ -291,6 +311,9 @@ class FlashAttentionPlanner:
                 -1,
             )
 
+            # record which sequence each query / context token belongs to. Padded token in query has
+            # seq_id self.num_seq. Padded token in cotnext has seq_id self.num_seq + 1. This is to
+            # guarantee generated mask will be False.
             q_seq_ids = _build_seq_ids(
                 seq_id,
                 self.prompt_lens[seq_id],
@@ -311,7 +334,8 @@ class FlashAttentionPlanner:
             tile_q_seq_ids.append(q_seq_ids)
             tile_kv_seq_ids.append(kv_seq_ids)
             if self.kv_dma_skipping:
-                # calculate load mask for kv
+                # DMA skipping is enabled, then if adjacent tiles use the same KV region, then we
+                # can skip KV load
                 prev_kv_indices = np.concatenate(([-1], kv_indices[:-1]))
                 kv_skip_indices = (
                     np.nonzero(kv_indices == prev_kv_indices)[0] + total_num_tiles

@@ -164,7 +164,7 @@ def flash_paged_attn_blockspase_prefill_static(
         dtype=acc_type,
         buffer=nl.hbm,
     )
-    # FIXME: rename l_buffer as sumexp_buffer
+    # FIXME: l_buffer stores SumExp, should rename
     l_buffer = nl.ndarray(
         (seqlen_q, q_h_per_k_h, 1),
         dtype=acc_type,
@@ -310,7 +310,7 @@ def flash_paged_attn_blockspase_prefill_dynamic(
         dtype=acc_type,
         buffer=nl.hbm,
     )
-    # FIXME: rename l_buffer as sumexp_buffer
+    # FIXME: l_buffer stores SumExp, should rename
     l_buffer = nl.ndarray(
         (seqlen_q, q_h_per_k_h, 1),
         dtype=acc_type,
@@ -827,9 +827,11 @@ def flash_attn_varlen_blocksparse_nkifunc(
       - tile_q_indices: (num_large_tiles, large_tile_size_q)
       - tile_block_tables: (num_large_tiles, num_block_per_large_tile)
       - tile_masks: (num_large_tiles, large_tile_size_q, large_tile_size_k) if not decode_mode
-          else (num_large_tiles, large_tile_size_q, large_tile_size_k)
+          else (B_P_SIZE, num_large_tiles, large_tile_size_k // B_P_SIZE)
       - active_mask: (seq_q, seq_q)
+      - num_dynamic_loop_steps: shape (1, 1). Only used in dynamic loop kernel
 
+    Notes:
       - This kernel requires seq_k == seq_v
       - We use continuous batching by default, so the batch dimension is always 1, and different
         requests are concatenated along sequence dimension.
@@ -842,19 +844,16 @@ def flash_attn_varlen_blocksparse_nkifunc(
         will be in the same type as the inputs.
 
     Compile-time Constants:
-      - sequence_parallel_group: sequence parallel group to shard the cache blocks, List[int].
       - softmax_scale: scaling for softmax, is None, default is `1.0/(d**0.5)`
       - mixed_precision: flag to set non-matmul ops in fp32 precision, defualt is set to `true`,
           if false, we use same precision as input types
+      - dynamic_loop_unroll_factor: int, positive value means using dynamic loop version of the
+        kernel and unroll loop steps to mitigate dynamic loop overhead. Setting to zero dispatches
+        to static version of the kernel.
 
     GQA support Notes:
-      the spmd kernel for launching kernel should be on kv_heads instead of nheads
-
-    Example usage:
-      MHA: q: [b, h, d, s], k: [b, h, d, s], v: [b, h, s, d]
-        usage: `flash_fwd[b, h](q, k, v, ...)`
-      GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
-        usage: `flash_fwd[b, kv_h](q, k, v, ...)`
+      The spmd grid for launching kernel should be on kv_heads instead of nheads. For dynamic loop
+      version, spmd is not supported.
     """
     if n_kv_head is None:
         n_kv_head = key_cache.shape[1]
@@ -862,6 +861,11 @@ def flash_attn_varlen_blocksparse_nkifunc(
     if head_size is None:
         head_size = key_cache.shape[-1]
     if dynamic_loop_unroll_factor:
+        # if dynamic_loop_unroll_factor has positive value, dispatch to dynamic-while kernel
+        assert (
+            isinstance(dynamic_loop_unroll_factor, int)
+            and dynamic_loop_unroll_factor > 0
+        )
         assert num_dynamic_loop_steps is not None
         assert n_kv_head == 1, f"dynamic loop does not support SPMD launch"
         if decode_mode:
@@ -901,6 +905,7 @@ def flash_attn_varlen_blocksparse_nkifunc(
             )
             return flash_paged_attn_blockspase_prefill_dynamic[1, n_kv_head](**kwargs)
     else:
+        # dispatch to static loop kernel
         assert num_dynamic_loop_steps is None
         if decode_mode:
             kwargs = dict(
