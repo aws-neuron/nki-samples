@@ -322,7 +322,8 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
     - softmax_scale: scaling for softmax, is None, default is `1.0/(d**0.5)`
     - mixed_precision: flag to set non-matmul ops in fp32 precision, default is set to `true`, if false, we use same precision as input types
     - use_causal_mask: flag to set causal masking
-    - sliding_window: causal (or left) sliding window size, default is -1, which means sliding window is off
+    - sliding_window: causal (or left) sliding window size, default is -1, which means sliding window is off.
+        when turned on (sliding_window > 0), only the last previous `sliding_window` tokens are attended to. See more in Masking support Notes below.
     - config: Instance of :class:`nki.kernels.attention.FlashConfig` with Performance config parameters for flash attention with default values
         seq_tile_size: `default=2048`, size of the kv tile size for attention computation reduction
         training: bool to indicate training vs inference `default=True`
