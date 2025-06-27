@@ -137,7 +137,7 @@ def _flash_attention_core(q_local_tile, k, v,
       i_q_p, i_q_f = nl.mgrid[0:B_P_SIZE, 0:B_F_SIZE]
       q_pos = q_tile_idx * B_P_SIZE + i_q_p
       k_pos = local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
-      pred_causal = q_pos >= k_pos  # casual mask
+      pred_causal = q_pos >= k_pos  # causal mask
       pred_sliding = k_pos > q_pos - sliding_window  # sliding window mask
 
       qk_select_tmp = nl.ndarray(qk_psum.shape, dtype=qk_psum.dtype, buffer=nl.sbuf)
@@ -477,7 +477,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
             causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
             sliding_mask = ((j+1) * LARGE_TILE_SZ - 1) > ((i * B_P_SIZE) - sliding_window)
           else:
-            casual_mask = True
+            causal_mask = True
             sliding_mask = True
           
           if (i < n_tile_q) & causal_mask & sliding_mask:
