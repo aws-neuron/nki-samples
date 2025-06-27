@@ -101,7 +101,7 @@ def _flash_attention_core(q_local_tile, k, v,
   l_buffer: (B_P_SIZE, 1)
   m_buffer: (B_P_SIZE, 1)
   """
-  NEG_INFINITY = -9984.0  # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
+  NEG_INFINITY = nl.fp32.min
   LARGE_TILE_SZ = flash_config.seq_tile_size
   num_k_tile_per_large_tile = LARGE_TILE_SZ // B_F_SIZE
   seqlen_k = k.shape[-1]
@@ -438,7 +438,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
 
   for i_q_h in nl.affine_range(q_h_per_k_h):
     # =============== Global Flash Attention accumulators ====================== #
-    l_buffer = nl.full((par_dim(B_P_SIZE), n_tile_q), fill_value=-9984.0, dtype=acc_type,
+    l_buffer = nl.full((par_dim(B_P_SIZE), n_tile_q), fill_value=nl.fp32.min, dtype=acc_type,
                         buffer=nl.sbuf, lazy_initialization=False)
     # =============== Global Flash Attention accumulators END ================== #
 
@@ -446,7 +446,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
       # =============== Global Flash Attention accumulators ====================== #
       o_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), d), dtype=acc_type,
                           buffer=nl.sbuf, lazy_initialization=False)
-      m_buffer = nl.full((attn_core_tile_size, par_dim(B_P_SIZE), 1), fill_value=-9984.0,
+      m_buffer = nl.full((attn_core_tile_size, par_dim(B_P_SIZE), 1), fill_value=nl.fp32.min,
                           dtype=acc_type,
                           buffer=nl.sbuf, lazy_initialization=False)
       # =============== Global Flash Attention accumulators END ================== #
