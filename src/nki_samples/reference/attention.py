@@ -348,6 +348,15 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
       2. use_causal_mask=True, sliding_window=-1: causal
       3. use_causal_mask={True/False}, sliding_window > 0: causal & sliding window 
           - including current token, attend only the previous `sliding_window` tokens
+
+          e.g. seq_q = seq_k = 5, sliding_window = 2, the attn mask applied on QK^T is:
+
+          [[1 0 0 0 0]    # token 0 attends to [0]
+           [1 1 0 0 0]    # token 1 attends to [0,1]
+           [0 1 1 0 0]    # token 2 attends to [1,2]
+           [0 0 1 1 0]    # token 3 attends to [2,3]
+           [0 0 0 1 1]]   # token 4 attends to [3,4]
+
           - given sliding_window > 0, use_causal_mask is overriden to be True 
               i.e. no support for bidirectional sliding window
 
