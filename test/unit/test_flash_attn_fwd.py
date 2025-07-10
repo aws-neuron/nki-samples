@@ -23,7 +23,7 @@ def softmax(x: np.ndarray, dim: int, zero_max_mode=False,
     return exp / reduce
  
  
-def cpu_attention_forward(q, k, v, use_causal_mask=True, mixed_precision=True):
+def cpu_attention_forward(q, k, v, use_causal_mask=True, sliding_window=-1, mixed_precision=True):
     def mixed_precision_matmul(a, b):
         input_dtype = a.dtype
         a, b = a.astype(np.float32), b.astype(np.float32)
@@ -43,14 +43,21 @@ def cpu_attention_forward(q, k, v, use_causal_mask=True, mixed_precision=True):
     raw_score = mixed_precision_matmul(q_scaled.transpose(0, 1, 3, 2), k)
 
     if use_causal_mask:
-        # raw_score has K seq in the most inner dim
-        # we want to mask all elements where Q idx is smaller than K idx with -inf
-        # this maps to the upper triangle of the final two axes
-        for i in range(raw_score.shape[0]):
-            for j in range(raw_score.shape[1]):
-                # -inf triggers invalid input error in softmax implementation, use a small negative instead
-                # k=1 to exclude the diagonal, because each token can still attend to itself
-                raw_score[i, j][np.triu_indices_from(raw_score[i, j], k=1)] = -9984.0
+        _, _, Q, K = raw_score.shape
+
+        q_idx = np.arange(Q)[:, None]
+        k_idx = np.arange(K)[None, :]
+
+        if sliding_window > 0:
+            mask = (k_idx > q_idx) | (k_idx < q_idx - sliding_window + 1)
+        else:  # causal
+            mask = k_idx > q_idx
+
+        # Broadcast mask to shape (1, 1, Q, K)
+        raw_score = raw_score.copy()
+        # -inf triggers invalid input error in softmax implementation, use a small negative instead
+        raw_score[:, :, mask] = -9984.0
+
 
     norm_score, cached_negative_max, cached_sum_reciprocal = \
         softmax(raw_score, dim=-1, mixed_precision=mixed_precision, return_max_reduce=True)
@@ -62,16 +69,19 @@ def cpu_attention_forward(q, k, v, use_causal_mask=True, mixed_precision=True):
  
 class TestAttention:
  
-    @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask,\
-                              mixed_precision, training, tile_size, kv_heads, should_transpose_v, latency", [
-    [1, 6, 32*1024, 32*1024, 96, nl.bfloat16, True, True, True, 2048, 3, False, 87000000000],
-    [1, 1, 32*1024, 32*1024, 96, nl.bfloat16, True, True, False, 2048, None, False, 15100000000],
+    @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, \
+                              sliding_window, mixed_precision, training, tile_size, kv_heads, should_transpose_v, latency", [
+    [1, 6, 32*1024, 32*1024, 96, nl.bfloat16, True, -1, True, True, 2048, 3, False, 87000000000],
+    [1, 1, 32*1024, 32*1024, 96, nl.bfloat16, True, -1, True, False, 2048, None, False, 15100000000],
     # Non-square
-    [1, 3, 32*1024, 16*1024, 96, nl.bfloat16, True, True, False, 2048, None, False, 7550000000],
-    [1, 3, 16*1024, 32*1024, 96, nl.bfloat16, True, True, False, 2048, None, False, 7550000000],
+    [1, 3, 32*1024, 16*1024, 96, nl.bfloat16, True, -1, True, False, 2048, None, False, 7550000000],
+    [1, 3, 16*1024, 32*1024, 96, nl.bfloat16, True, -1, True, False, 2048, None, False, 7550000000],
+    # Causal vs. Sliding - test sliding window is faster
+    [1, 1, 16*1024, 16*1024, 96, nl.bfloat16, True, -1, True, False, 2048, None, False, 4000000000], 
+    [1, 1, 16*1024, 16*1024, 96, nl.bfloat16, True, 4096, True, False, 2048, None, False, 3000000000],
     ])
-    def test_flash_attn_fwd_perf(self, bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, 
-                                 mixed_precision, training, tile_size, kv_heads, should_transpose_v,latency):
+    def test_flash_attn_fwd_perf(self, bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask,
+                                 sliding_window, mixed_precision, training, tile_size, kv_heads, should_transpose_v,latency):
         q = (np.random.random_sample([bs, nheads, d, seqlen_q]) - 0.5) * 2
         k = (np.random.random_sample([bs, nheads, d, seqlen_k]) - 0.5) * 2
         if should_transpose_v:
@@ -91,22 +101,23 @@ class TestAttention:
         heads = nheads if kv_heads is None else kv_heads
 
         bench_func_ = bench_func[bs, heads]
-        bench_func_(q, k, v, seed, use_causal_mask=use_causal_mask,
+        bench_func_(q, k, v, seed, use_causal_mask=use_causal_mask, sliding_window=sliding_window,
                     mixed_precision=mixed_precision, config=config)
         latency_res = bench_func_.benchmark_result.nc_latency
-        p99 = latency_res.get_latency_percentile(50)
-        assert p99 <= latency
+        p50 = latency_res.get_latency_percentile(50)
+        assert p50 <= latency
     
     @pytest.mark.simulation
-    @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask,\
-                              training, tile_size, kv_heads, should_transpose_v", [
-    [1, 6, 4096, 4096, 128, np.float32, True, True, 2048, 3, False],
-    [1, 1, 4096, 4096, 128, np.float32, True, False, 2048, None, False],
-    [1, 1, 8192, 4096, 128, np.float32, True, False, 2048, None, False],
-    [1, 1, 4096, 8192, 128, np.float32, True, False, 2048, None, False],
+    @pytest.mark.parametrize("bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, \
+                              sliding_window, training, tile_size, kv_heads, should_transpose_v", [
+    [1, 6, 4096, 4096, 128, np.float32, True, -1, True, 2048, 3, False],
+    [1, 1, 4096, 4096, 128, np.float32, True, -1, False, 2048, None, False],
+    [1, 1, 8192, 4096, 128, np.float32, True, -1, False, 2048, None, False],
+    [1, 1, 4096, 8192, 128, np.float32, True, -1, False, 2048, None, False],
+    [1, 1, 4096, 4096, 128, np.float32, True, 1024, False, 2048, None, False],
     ])
     def test_flash_attn_fwd_numerical(self, simulation_only, bs, nheads, seqlen_q, seqlen_k, d, dtype, use_causal_mask, 
-                                     training, tile_size, kv_heads, should_transpose_v):
+                                    sliding_window, training, tile_size, kv_heads, should_transpose_v):
         q = (np.random.random_sample([bs, nheads, d, seqlen_q]) - 0.5) * 2
         k = (np.random.random_sample([bs, kv_heads or nheads, d, seqlen_k]) - 0.5) * 2
         if should_transpose_v:
@@ -122,7 +133,7 @@ class TestAttention:
         seed = None
 
         o_proj_golden, cached_negative_max, cached_sum_reciprocal  = \
-          cpu_attention_forward(q, k, v.transpose(cpu_permute), use_causal_mask=use_causal_mask,mixed_precision=True)
+          cpu_attention_forward(q, k, v.transpose(cpu_permute), use_causal_mask=use_causal_mask, sliding_window=sliding_window, mixed_precision=True)
         o_proj_golden = o_proj_golden.transpose(0,1,3,2) # (b,h, d, seq)
         cached_negative_max = cached_negative_max.reshape(bs, nheads, seqlen_q // nl.tile_size.pmax,
                                                           nl.tile_size.pmax).transpose(0, 1, 3, 2)
@@ -137,11 +148,13 @@ class TestAttention:
         if simulation_only:
             results = simulate_kernel(numeric_func[bs, heads], q, k, v, seed,
                                           use_causal_mask=use_causal_mask,
+                                          sliding_window=sliding_window,
                                           mixed_precision=True,
                                           config=config)
         else:
             results = numeric_func[bs, heads](q, k, v, seed,
                                           use_causal_mask=use_causal_mask,
+                                          sliding_window=sliding_window,
                                           mixed_precision=True,
                                           config=config)
 
