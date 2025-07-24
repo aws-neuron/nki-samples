@@ -216,15 +216,17 @@ def _flash_attention_core(q_local_tile, k, v,
 
   for k_r_i in nl.affine_range(LARGE_TILE_SZ // REDUCTION_TILE):
     k_r_i_reduce_slice = nl.ds(k_r_i * REDUCTION_TILE, REDUCTION_TILE)
+    # compute exp(qk-max)
+    # Compute partial row-tile sum of exp(qk-max))
+    # FIXME: Use activation accumulate to accumulate over k_r_i loop?
+    p_local[:, k_r_i_reduce_slice] = \
+      nisa.activation_reduce(np.exp, qk_res_buf[:, k_r_i_reduce_slice],
+                              bias=-1 * m_current, scale=1.0,
+                              reduce_op=nl.add, reduce_res=p_partial_sum[:, k_r_i],
+                              dtype=kernel_dtype)
 
     # dropout
     if dropout_p > 0.0:
-      # compute exp(qk-max)
-      p_local[:, k_r_i_reduce_slice] = \
-        nisa.activation(np.exp, qk_res_buf[:, k_r_i_reduce_slice],
-                        bias=-1 * m_current, scale=1.0,
-                        dtype=kernel_dtype)
-
       seed_offset_base = k_r_i * (REDUCTION_TILE // B_F_SIZE) \
                          + local_k_large_tile_idx * (LARGE_TILE_SZ // B_F_SIZE) \
                          + q_tile_idx * seq_k_num_tiles \
@@ -235,20 +237,6 @@ def _flash_attention_core(q_local_tile, k, v,
                       dropout_p_tensor=dropout_p_tensor, seed_tensor=seed_tensor,
                       seed_offset_base=seed_offset_base, k_r_i=k_r_i,
                       REDUCTION_TILE=REDUCTION_TILE)
-
-      # Compute partial row-tile sum of exp(qk-max))
-      # FIXME: Use activation accumulate and accumulate over k_r_i loop?
-      p_partial_sum[:, k_r_i] = nl.sum(p_local[:, k_r_i_reduce_slice],
-                                       axis=1, dtype=acc_type)
-    else:
-      # compute exp(qk-max)
-      # Compute partial row-tile sum of exp(qk-max))
-      # FIXME: Use activation accumulate to accumulate over k_r_i loop?
-      p_local[:, k_r_i_reduce_slice] = \
-        nisa.activation_reduce(np.exp, qk_res_buf[:, k_r_i_reduce_slice],
-                               bias=-1 * m_current, scale=1.0,
-                               reduce_op=nl.add, reduce_res=p_partial_sum[:, k_r_i],
-                               dtype=kernel_dtype)
 
   ps = nl.sum(p_partial_sum, axis=1, dtype=acc_type)
 
