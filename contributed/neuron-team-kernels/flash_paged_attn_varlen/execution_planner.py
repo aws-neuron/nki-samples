@@ -19,6 +19,8 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from constants import B_P_SIZE
+
 
 def _ceil_div(a, b):
     assert b != 0
@@ -26,7 +28,7 @@ def _ceil_div(a, b):
 
 
 @dataclass(frozen=True)
-class BlockSparsePlan:
+class TilePlan:
     tile_q_indices: npt.NDArray[np.int32]
     tile_block_table_offsets: npt.NDArray[np.int32]
     tile_q_seq_ids: npt.NDArray[np.int32]
@@ -58,7 +60,7 @@ class BlockSparsePlan:
     def num_tiles(self):
         return len(self.tile_q_indices)
 
-    def pad_plan(self, pad_num_tiles_to, q_skip_value=0):
+    def pad_plan(self, pad_num_tiles_to, q_pad_value=0):
         num_tiles = self.num_tiles
         if pad_num_tiles_to <= num_tiles:
             return self
@@ -72,7 +74,7 @@ class BlockSparsePlan:
         tile_q_indices = pad(
             self.tile_q_indices,
             pad_num_tiles_to,
-            pad_value=q_skip_value,
+            pad_value=q_pad_value,
         )
         tile_block_tables_offsets = pad(self.tile_block_table_offsets, pad_num_tiles_to)
         # pad different value for q and kv seq ids so that sequence affiliation mask is False
@@ -106,7 +108,6 @@ class BlockSparsePlan:
         self,
         block_tables,
         skip_value,
-        dynamic_loop_unrolling=None,
     ):
         """
         Materialize block_table for each tile using 2-D block_tables [batch_size,
@@ -123,17 +124,11 @@ class BlockSparsePlan:
         tile_block_tables = block_tables[self.tile_block_table_offsets]
         if self.tile_kv_skip_indices.size > 0:
             tile_kv_skip_indices = self.tile_kv_skip_indices
-            if dynamic_loop_unrolling:
-                indices_not_at_loop_start = (
-                    tile_kv_skip_indices % dynamic_loop_unrolling != 0
-                )
-                tile_kv_skip_indices = tile_kv_skip_indices[indices_not_at_loop_start]
             tile_block_tables[tile_kv_skip_indices, :] = skip_value
         return tile_block_tables
 
     def build_tile_masks(self, decode_kq_matmul):
         tile_kv_seq_ids = self.tile_kv_seq_ids
-        B_P_SIZE = 128
         num_tiles, tile_size_kv = tile_kv_seq_ids.shape
         assert tile_size_kv % B_P_SIZE == 0 and tile_size_kv % self.block_size == 0
         num_tiled_blocks = max(B_P_SIZE, tile_size_kv // self.block_size)
@@ -174,14 +169,17 @@ class BlockSparsePlan:
             )
         return tile_masks
 
-    def build_decode_tile_update_indices(
+    def build_tile_update_indices(
         self,
-        padded_seqlen_q,
-        build_update_pred=False,
+        max_num_q_tiles,
+        build_update_pred=True,
     ):
-        tile_q_indices = self.tile_q_indices[: self.num_real_tiles].flatten().copy()
-        _, num_tiles_per_seq = np.unique(tile_q_indices, return_counts=True)
+        tile_q_offsets = self.tile_q_indices[: self.num_real_tiles, :1].flatten().copy()
+        _, num_tiles_per_seq = np.unique(tile_q_offsets, return_counts=True)
         last_tile_indices = np.cumsum(num_tiles_per_seq) - 1
+        assert (
+            len(last_tile_indices) <= max_num_q_tiles
+        ), f"Number of q tiles is > {B_P_SIZE=}"
 
         if build_update_pred:
             update_indices = np.ones(self.num_tiles)
@@ -192,8 +190,8 @@ class BlockSparsePlan:
             # let kernel build update_indices using last_tile_indices
             update_indices = None
 
-        # pad last_tile_indices to match padded_seqlen_q
-        padded_last_tile_indices = np.empty(padded_seqlen_q, dtype=np.int32)
+        # pad last_tile_indices to match max_num_q_tiles
+        padded_last_tile_indices = np.empty(max_num_q_tiles, dtype=np.int32)
         padded_last_tile_indices[: len(last_tile_indices)] = last_tile_indices
         padded_last_tile_indices[len(last_tile_indices) :] = last_tile_indices[-1]
         return update_indices, padded_last_tile_indices
@@ -215,9 +213,9 @@ def _check_np_int_array(*arrays):
     return True
 
 
-class FlashAttentionPlanner:
+class VarlenAttentionPlanner:
     """
-    Generate execution plan for flash attention
+    Generate execution plan for flash attention on variable-length sequences
     """
 
     def __init__(
@@ -227,8 +225,8 @@ class FlashAttentionPlanner:
         tile_size_q,
         tile_size_kv,
         block_size,
-        traverse_in_column_order,
-        kv_dma_skipping,
+        traverse_in_column_order=False,
+        enable_kv_dma_skipping=None,
     ):
         assert (
             tile_size_kv % block_size == 0
@@ -245,7 +243,9 @@ class FlashAttentionPlanner:
         self.tile_size_kv = tile_size_kv
         self.block_size = block_size
         self.traverse_in_column_order = traverse_in_column_order
-        self.kv_dma_skipping = kv_dma_skipping
+        self.enable_kv_dma_skipping = enable_kv_dma_skipping
+        if self.enable_kv_dma_skipping is None:
+            self.enable_kv_dma_skipping = self.traverse_in_column_order
 
     def generate_plan(self):
         prompt_starts, _, _ = _get_seq_start_end(self.prompt_lens)
@@ -333,7 +333,7 @@ class FlashAttentionPlanner:
             tile_bt_offsets.append(bt_offsets)
             tile_q_seq_ids.append(q_seq_ids)
             tile_kv_seq_ids.append(kv_seq_ids)
-            if self.kv_dma_skipping:
+            if self.enable_kv_dma_skipping:
                 # DMA skipping is enabled, then if adjacent tiles use the same KV region, then we
                 # can skip KV load
                 prev_kv_indices = np.concatenate(([-1], kv_indices[:-1]))
@@ -349,7 +349,7 @@ class FlashAttentionPlanner:
             tile_bt_offsets = np.concatenate(tile_bt_offsets)
             tile_q_seq_ids = np.concatenate(tile_q_seq_ids)
             tile_kv_seq_ids = np.concatenate(tile_kv_seq_ids)
-            if self.kv_dma_skipping:
+            if self.enable_kv_dma_skipping:
                 tile_kv_skip_indices = np.concatenate(tile_kv_skip_indices)
                 if self.tile_size_q == 1:
                     assert len(tile_kv_skip_indices) == 0
@@ -365,7 +365,7 @@ class FlashAttentionPlanner:
             tile_kv_seq_ids = np.empty((0, self.tile_size_kv), dtype=np.int32)
             tile_kv_skip_indices = np.array([], dtype=np.int32)
 
-        return BlockSparsePlan(
+        return TilePlan(
             tile_q_offsets,
             tile_bt_offsets,
             tile_q_seq_ids,

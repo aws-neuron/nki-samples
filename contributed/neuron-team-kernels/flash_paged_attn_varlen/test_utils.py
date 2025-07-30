@@ -1,7 +1,6 @@
 from typing import Optional
 import os
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import logical_and, logical_or
@@ -93,11 +92,13 @@ class BlockDiagonalCausalFromBottomRightMask:
         return prior_mask
 
     @staticmethod
-    def from_seqlens(query_lens, seq_lens, block_size=None):
+    def from_seqlens(query_lens, seq_lens, block_size=None, skip_active=False):
         contexted = block_size is None
         if contexted:
             prior_mask = BlockDiagonalCausalFromBottomRightMask._from_seqlens(
-                query_lens, seq_lens
+                query_lens,
+                seq_lens,
+                skip_active=skip_active,
             )
             active_mask = None
         else:
@@ -180,7 +181,8 @@ def ref_context_attention(
         value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
 
     attn_mask, _ = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
-        query_lens, seq_lens
+        query_lens,
+        seq_lens,
     )
 
     # convert binary mask to -inf values
@@ -306,13 +308,14 @@ def sample_input_tensors(
     return query, k, v, k_cache, v_cache, block_tables, key, value
 
 
-def get_active_block_tables(block_tables, query_lens, seq_lens, block_size, num_blocks):
-    context_lens = seq_lens - query_lens
+def get_active_block_tables(block_tables, context_lens, block_size, num_blocks):
     blocks_per_seq = (context_lens + block_size - 1) // block_size
-    num_seqs = len(seq_lens)
+    num_seqs = len(context_lens)
     active_blocks: list[int] = []
     for seq_id in range(num_seqs):
-        active_blocks += block_tables[seq_id, : blocks_per_seq[seq_id]].tolist()
+        active_blocks = (
+            active_blocks + block_tables[seq_id, : blocks_per_seq[seq_id]].tolist()
+        )
     return F.pad(
         torch.tensor(active_blocks, dtype=torch.int32),
         (0, num_blocks - len(active_blocks)),
@@ -321,14 +324,17 @@ def get_active_block_tables(block_tables, query_lens, seq_lens, block_size, num_
     )
 
 
-def save_numpy_inputs(artifact_dir, kwargs):
-    tensor_map = []
-    numpy_tensor_dir = "input_tensors"
-    os.makedirs(os.path.join(artifact_dir, numpy_tensor_dir), exist_ok=True)
-    for key in kwargs:
-        value = kwargs[key]
-        if isinstance(value, np.ndarray):
-            relative_path = os.path.join(numpy_tensor_dir, f"input_{key}.npy")
-            np.save(os.path.join(artifact_dir, relative_path), kwargs[key])
-            tensor_map.append(f"{key} {relative_path}")
-    return tensor_map
+def convert_torch_tensor_to_numpy(input_kwargs, use_bf16):
+    new_input_kwargs = {}
+    for arg_name in input_kwargs:
+        arg = input_kwargs[arg_name]
+        if isinstance(arg, torch.Tensor):
+            if arg.dtype == torch.bfloat16:
+                if use_bf16:
+                    arg = arg.float().numpy().astype(bfloat16)
+                else:
+                    arg = arg.half().numpy()
+            else:
+                arg = arg.numpy()
+        new_input_kwargs[arg_name] = arg
+    return new_input_kwargs
