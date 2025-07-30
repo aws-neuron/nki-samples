@@ -89,7 +89,7 @@ def _flash_attention_core(q_local_tile, k, v,
                           local_k_large_tile_idx,
                           kernel_dtype, acc_type,
                           flash_config: FlashConfig,
-                          use_causal_mask, initialize,
+                          use_causal_mask, sliding_window,
                           B_P_SIZE=128, B_F_SIZE=512, B_D_SIZE=128,
                           dropout_p=0.0, dropout_p_tensor=None, seed_tensor=None,
                           logit_bias_tile=None):
@@ -101,6 +101,7 @@ def _flash_attention_core(q_local_tile, k, v,
   l_buffer: (B_P_SIZE, 1)
   m_buffer: (B_P_SIZE, 1)
   """
+  NEG_INFINITY = nl.fp32.min
   LARGE_TILE_SZ = flash_config.seq_tile_size
   num_k_tile_per_large_tile = LARGE_TILE_SZ // B_F_SIZE
   seqlen_k = k.shape[-1]
@@ -129,13 +130,15 @@ def _flash_attention_core(q_local_tile, k, v,
       left_diagonal_selection = q_tile_idx * B_P_SIZE >= local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE
       diagonal_and_right_selection = (q_tile_idx * B_P_SIZE < local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE)
       right_diagonal_selection = ((q_tile_idx + 1) * B_P_SIZE <= local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE)
+      diagonal_and_left_selection = ((q_tile_idx + 1) * B_P_SIZE > local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE)
       diagonal = ((q_tile_idx * B_P_SIZE < local_k_large_tile_idx * LARGE_TILE_SZ + (k_i + 1) * B_F_SIZE) &
                   ((q_tile_idx + 1) * B_P_SIZE > local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE))
 
       i_q_p, i_q_f = nl.mgrid[0:B_P_SIZE, 0:B_F_SIZE]
       q_pos = q_tile_idx * B_P_SIZE + i_q_p
       k_pos = local_k_large_tile_idx * LARGE_TILE_SZ + k_i * B_F_SIZE + i_q_f
-      pred = q_pos >= k_pos
+      pred_causal = q_pos >= k_pos  # causal mask
+      pred_sliding = k_pos > q_pos - sliding_window  # sliding window mask
 
       qk_select_tmp = nl.ndarray(qk_psum.shape, dtype=qk_psum.dtype, buffer=nl.sbuf)
 
@@ -144,37 +147,41 @@ def _flash_attention_core(q_local_tile, k, v,
           qk_select_tmp[...] = qk_psum
 
           # For tiles to the right of the diagonal, do affine_select.
-          # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
           qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
-              pred=pred,
-              on_true_tile=qk_select_tmp, on_false_value=-9984.0, dtype=acc_type)
+              pred=pred_causal,
+              on_true_tile=qk_select_tmp, on_false_value=NEG_INFINITY, dtype=acc_type)
 
         # For tiles on the diagonal, add logit bias and need to do affine_select.
         intermediate = \
             nl.add(qk_psum, logit_bias_tile[:, k_i_b_f_slice],
                    dtype=acc_type, mask=diagonal)
         qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
-            pred=pred,
-            on_true_tile=intermediate, on_false_value=-9984.0, dtype=acc_type,
+            pred=pred_causal,
+            on_true_tile=intermediate, on_false_value=NEG_INFINITY, dtype=acc_type,
             mask=diagonal)
 
-        # For tiles on the left of the diagonal, just add logit bias, no select required.
+        # For tiles on the left of the diagonal, add logit bias.
         qk_res_buf[:, k_i_b_f_slice] = \
             nl.add(qk_psum, logit_bias_tile[:, k_i_b_f_slice],
                    dtype=acc_type, mask=left_diagonal_selection)
-      else:
-        # For tiles on and to the right of the diagonal, need to do affine_select.
-        # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
-        if diagonal_and_right_selection:
-          qk_select_tmp[...] = qk_psum
 
+        if sliding_window > 0:  # Apply sliding window mask
           qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(
-            pred=pred,
-            on_true_tile=qk_select_tmp, on_false_value=-9984.0, dtype=acc_type)
-
-        # For tiles on the left of the diagonal, direct copy, no select required.
-        qk_res_buf[:, k_i_b_f_slice] = \
-          nl.copy(qk_psum, dtype=acc_type, mask=left_diagonal_selection)
+              pred=pred_sliding,
+              on_true_tile=intermediate, on_false_value=NEG_INFINITY, dtype=acc_type,
+              mask=left_diagonal_selection) 
+      else:
+        # Apply causal mask
+        qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(pred=pred_causal, 
+                                                          on_true_tile=qk_psum, 
+                                                          on_false_value=NEG_INFINITY,
+                                                          dtype=acc_type)
+        if sliding_window > 0:  # Apply sliding window mask
+          qk_res_buf[:, k_i_b_f_slice] = nisa.affine_select(pred=pred_sliding, 
+                                                            on_true_tile=qk_res_buf[:, k_i_b_f_slice], 
+                                                            on_false_value=NEG_INFINITY, 
+                                                            dtype=acc_type,
+                                                            mask=diagonal_and_left_selection)
     else:
       if logit_bias_tile is not None:
         # Simply add logit bias which copies back to sbuf at the same time
@@ -194,17 +201,13 @@ def _flash_attention_core(q_local_tile, k, v,
 
   o_previous_scaled = nl.ndarray((par_dim(B_P_SIZE), B_D_SIZE), dtype=o_buffer.dtype)
 
-  if initialize:
-    m_buffer[:, 0] = nl.copy(max_)
-    m_current = max_
-  else:
-    m_previous = nl.copy(m_buffer[:, 0])
-    m_buffer[:, 0] = nl.maximum(m_previous, max_) # (128,1)
+  m_previous = nl.copy(m_buffer[:, 0])
+  m_buffer[:, 0] = nl.maximum(m_previous, max_) # (128,1)
 
-    m_current = m_buffer[:, 0]
-    # Compute scaling factor
-    alpha = nisa.activation(np.exp, m_current, bias=m_previous, scale=-1.0)
-    o_previous_scaled[...] = nl.multiply(o_buffer[:, :], alpha)
+  m_current = m_buffer[:, 0]
+  # Compute scaling factor
+  alpha = nisa.activation(np.exp, m_current, bias=m_previous, scale=-1.0)
+  o_previous_scaled[...] = nl.multiply(o_buffer[:, :], alpha)
 
   p_local = nl.ndarray((par_dim(B_P_SIZE), LARGE_TILE_SZ), dtype=kernel_dtype)
   REDUCTION_TILE = min(2048, LARGE_TILE_SZ // 2)
@@ -259,14 +262,10 @@ def _flash_attention_core(q_local_tile, k, v,
     pv_psum[:, :] += nl.matmul(p_local_transposed[:, nl.ds(k_i * B_P_SIZE, B_P_SIZE)],
                                v[k_i, :, :], transpose_x=True) # (128, 128) (p(Br), d)
 
-  if initialize:
-    o_buffer[:, :] = nl.copy(pv_psum[:, :])
-    l_buffer[:, 0] = nl.add(nl.log(ps), max_)
-  else:
-    o_buffer[:, :] = nl.add(o_previous_scaled, pv_psum)
+  o_buffer[:, :] = nl.add(o_previous_scaled, pv_psum)
 
-    exp = nisa.activation(nl.exp, m_current, bias=l_buffer[:, 0], scale=-1.0)
-    l_buffer[:, 0] = nl.add(m_current, nisa.activation(nl.log, exp, bias=ps))
+  exp = nisa.activation(nl.exp, m_current, bias=l_buffer[:, 0], scale=-1.0)
+  l_buffer[:, 0] = nl.add(m_current, nisa.activation(nl.log, exp, bias=ps))
 
 
 @nki.jit(mode='trace')
@@ -297,6 +296,7 @@ def load_v_tile(v_hbm_tile, cur_v_tile, j, v_i, config):
 def flash_fwd(q, k, v, seed, logit_bias=None,
               softmax_scale=None,
               use_causal_mask=True,
+              sliding_window=-1,
               mixed_precision=True,
               dropout_p=0.0, config=None):
   """
@@ -321,7 +321,9 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
   Compile-time Constants:
     - softmax_scale: scaling for softmax, is None, default is `1.0/(d**0.5)`
     - mixed_precision: flag to set non-matmul ops in fp32 precision, default is set to `true`, if false, we use same precision as input types
-    - causal_mask: flag to set causal masking
+    - use_causal_mask: flag to set causal masking
+    - sliding_window: causal (or left) sliding window size, default is -1, which means sliding window is off.
+        when turned on (sliding_window > 0), only the last previous `sliding_window` tokens are attended to. See more in Masking support Notes below.
     - config: Instance of :class:`nki.kernels.attention.FlashConfig` with Performance config parameters for flash attention with default values
         seq_tile_size: `default=2048`, size of the kv tile size for attention computation reduction
         training: bool to indicate training vs inference `default=True`
@@ -339,6 +341,24 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
 
   GQA support Notes:
     the spmd kernel for launching kernel should be on kv_heads instead of nheads
+  
+  Masking support Notes:
+    3 masking options are supported:
+      1. use_causal_mask=False, sliding_window=-1: full (no masking)
+      2. use_causal_mask=True, sliding_window=-1: causal
+      3. use_causal_mask={True/False}, sliding_window > 0: causal & sliding window 
+          - including current token, attend only the previous `sliding_window` tokens
+
+          e.g. seq_q = seq_k = 5, sliding_window = 2, the attn mask applied on QK^T is:
+
+          [[1 0 0 0 0]    # token 0 attends to [0]
+           [1 1 0 0 0]    # token 1 attends to [0,1]
+           [0 1 1 0 0]    # token 2 attends to [1,2]
+           [0 0 1 1 0]    # token 3 attends to [2,3]
+           [0 0 0 1 1]]   # token 4 attends to [3,4]
+
+          - given sliding_window > 0, use_causal_mask is overriden to be True 
+              i.e. no support for bidirectional sliding window
 
   Example usage:
     MHA: q: [b, h, d, s], k: [b, h, d, s], v: [b, h, s, d]
@@ -359,6 +379,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
     assert tuple(v.shape) == (b, k_h, seqlen_k, d), f"Expect shape of V to be {(b, k_h, seqlen_k, d)} (batch, heads, seqlen_k, d_head) but got {v.shape}"
     assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
   assert d <= 128, f" we do not support head_dim > 128, got head dim {d}"
+  use_causal_mask = True if sliding_window > 0 else use_causal_mask  # setting sliding window assumes causal
   kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
   acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
 
@@ -417,16 +438,17 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
 
   for i_q_h in nl.affine_range(q_h_per_k_h):
     # =============== Global Flash Attention accumulators ====================== #
-    l_buffer = nl.zeros((par_dim(B_P_SIZE), n_tile_q), dtype=acc_type,
-                        buffer=nl.sbuf, lazy_initialization=True)
+    l_buffer = nl.full((par_dim(B_P_SIZE), n_tile_q), fill_value=nl.fp32.min, dtype=acc_type,
+                        buffer=nl.sbuf, lazy_initialization=False)
     # =============== Global Flash Attention accumulators END ================== #
 
     for i0 in nl.sequential_range(n_remat):
       # =============== Global Flash Attention accumulators ====================== #
       o_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), d), dtype=acc_type,
-                          buffer=nl.sbuf, lazy_initialization=True)
-      m_buffer = nl.zeros((attn_core_tile_size, par_dim(B_P_SIZE), 1), dtype=acc_type,
-                          buffer=nl.sbuf, lazy_initialization=True)
+                          buffer=nl.sbuf, lazy_initialization=False)
+      m_buffer = nl.full((attn_core_tile_size, par_dim(B_P_SIZE), 1), fill_value=nl.fp32.min,
+                          dtype=acc_type,
+                          buffer=nl.sbuf, lazy_initialization=False)
       # =============== Global Flash Attention accumulators END ================== #
 
       for j in nl.sequential_range(0, num_large_k_tile):
@@ -448,12 +470,17 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
           # which reduce the arthimetic intensity by half.
           # forward_mask imply initialize, i.e. if forward_mask is false, initialize will
           # be false as well
-          if use_causal_mask:
-            forward_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+          if use_causal_mask and sliding_window < 0:
+            causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+            sliding_mask = True
+          elif sliding_window > 0:
+            causal_mask = i * B_P_SIZE >= j * LARGE_TILE_SZ
+            sliding_mask = ((j+1) * LARGE_TILE_SZ - 1) > ((i * B_P_SIZE) - sliding_window)
           else:
-            forward_mask = True
-
-          if (i < n_tile_q) & forward_mask:
+            causal_mask = True
+            sliding_mask = True
+          
+          if (i < n_tile_q) & causal_mask & sliding_mask:
             q_tile = nl.ndarray((B_D_SIZE, B_P_SIZE),dtype=kernel_dtype)
             q_hbm_tile = q[batch_id, head_id * q_h_per_k_h + i_q_h]
             q_sbuf_tile = nl.load(q_hbm_tile[:, nl.ds(i * B_P_SIZE, B_P_SIZE)],
@@ -473,8 +500,8 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
                                   batch_id=batch_id, head_id=head_id,
                                   gqa_head_idx=i_q_h, q_tile_idx=i, local_k_large_tile_idx=j,
                                   kernel_dtype=kernel_dtype, acc_type=acc_type,
-                                  flash_config=config, use_causal_mask=use_causal_mask,
-                                  initialize=j == 0,
+                                  flash_config=config, 
+                                  use_causal_mask=use_causal_mask, sliding_window=sliding_window,
                                   B_P_SIZE=B_P_SIZE, B_F_SIZE=B_F_SIZE, B_D_SIZE=B_D_SIZE,
                                   dropout_p=dropout_p, dropout_p_tensor=dropout_p_tensor,
                                   seed_tensor=seed_local, logit_bias_tile=logit_bias_tile)
