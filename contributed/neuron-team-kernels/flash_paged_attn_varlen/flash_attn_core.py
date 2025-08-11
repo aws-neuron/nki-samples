@@ -40,14 +40,19 @@ def transpose_p_local(
     if is_nc_gen2 or not enable_dma_transpose:
         for i in nl.affine_range(LARGE_KV_TILE_SIZE // B_F_SIZE):
             p_local_t_tmp = nl.ndarray(
-                (par_dim(REDUCTION_SIZE), B_F_SIZE // REDUCTION_SIZE * Q_TILE_SIZE),
+                (
+                    par_dim(REDUCTION_SIZE),
+                    B_F_SIZE // REDUCTION_SIZE * Q_TILE_SIZE,
+                ),
                 buffer=nl.psum,
                 dtype=np.float32 if is_nc_gen2 else p_local.dtype,
             )
             for j in nl.affine_range(B_F_SIZE // REDUCTION_SIZE):
 
                 j_128_slice = nl.ds(j * Q_TILE_SIZE, Q_TILE_SIZE)
-                i_j_128_slice = nl.ds(i * B_F_SIZE + j * REDUCTION_SIZE, REDUCTION_SIZE)
+                i_j_128_slice = nl.ds(
+                    i * B_F_SIZE + j * REDUCTION_SIZE, REDUCTION_SIZE
+                )
                 p_local_t_tmp[:, j_128_slice] = nisa.nc_transpose(
                     p_local[:, i_j_128_slice],
                     engine=nisa.tensor_engine,
@@ -100,8 +105,6 @@ def _flash_attention_core(
     ), f"{LARGE_KV_TILE_SIZE=} not divisive by {B_F_SIZE=}"
     num_k_tile_per_large_tile = LARGE_KV_TILE_SIZE // B_F_SIZE
 
-    # mask are used to only apply computation to the lower half of the matrix,
-    # which reduce the arithmetic intensity by half
     qk_res_buf = nl.ndarray(
         (par_dim(Q_TILE_SIZE), LARGE_KV_TILE_SIZE),
         buffer=nl.sbuf,
@@ -124,7 +127,9 @@ def _flash_attention_core(
 
         if multiplication_required_selection:
             qk_psum = nl.ndarray(
-                (par_dim(Q_TILE_SIZE), B_F_SIZE), dtype=np.float32, buffer=nl.psum
+                (par_dim(Q_TILE_SIZE), B_F_SIZE),
+                dtype=np.float32,
+                buffer=nl.psum,
             )  # (128, 512)
             qk_psum[:, :] = nl.matmul(
                 q_local_tile, k[:, k_i_b_f_slice], transpose_x=True
@@ -157,9 +162,9 @@ def _flash_attention_core(
                 )
         else:
             qk_res_buf[:, k_i_b_f_slice] = NEG_INF
-            # Calculate max of the current tile
             max_local[:, k_i] = NEG_INF
 
+    # Calculate max of the current tile
     max_ = nisa.tensor_reduce(
         np.max,
         max_local[:, :],
@@ -173,10 +178,6 @@ def _flash_attention_core(
         dtype=olm_buffer.dtype,
     )
 
-    # m_previous = nl.copy(olm_buffer[:, B_D_SIZE + 1])
-    # olm_buffer[:, B_D_SIZE + 1] = nl.maximum(m_previous, max_)  # (128,1)
-    # m_current = olm_buffer[:, B_D_SIZE + 1]
-    # m_current_neg = nisa.activation(nl.copy, m_current, scale=-1.0)
     m_previous = olm_buffer[:, B_D_SIZE + 1]
     m_current_neg = nisa.tensor_scalar(
         max_,
@@ -191,7 +192,6 @@ def _flash_attention_core(
         dtype=kernel_dtype,
     )
     REDUCTION_TILE = min(2048, LARGE_KV_TILE_SIZE // 2)
-    # REDUCTION_TILE = min(1024, LARGE_KV_TILE_SIZE)
 
     p_partial_sum = nl.ndarray(
         (par_dim(Q_TILE_SIZE), LARGE_KV_TILE_SIZE // REDUCTION_TILE),
@@ -207,7 +207,6 @@ def _flash_attention_core(
         p_local[:, k_r_i_reduce_slice] = nisa.activation_reduce(
             np.exp,
             qk_res_buf[:, k_r_i_reduce_slice],
-            # bias=-1 * m_current,
             bias=m_current_neg,
             scale=1.0,
             reduce_op=nl.add,
@@ -245,13 +244,19 @@ def _flash_attention_core(
     alpha = nisa.activation(
         np.exp,
         m_previous,
-        # bias=-1 * m_current,
         bias=m_current_neg,
         scale=1.0,
     )
 
-    olm_buffer[:, B_D_SIZE + 1] = nisa.activation(nl.copy, m_current_neg, scale=-1.0)
-    o_previous_scaled[...] = nl.multiply(olm_buffer[:, nl.ds(0, B_D_SIZE)], alpha)
+    olm_buffer[:, B_D_SIZE + 1] = nisa.activation(
+        nl.copy,
+        m_current_neg,
+        scale=-1.0,
+    )
+    o_previous_scaled[...] = nl.multiply(
+        olm_buffer[:, nl.ds(0, B_D_SIZE)],
+        alpha,
+    )
     olm_buffer[:, nl.ds(0, B_D_SIZE)] = nl.add(o_previous_scaled, pv_psum)
 
     l_prev = olm_buffer[:, B_D_SIZE] * alpha
@@ -339,10 +344,16 @@ def _flash_attention_core_kq_matmul(
                     dtype=kernel_dtype,
                     buffer=nl.psum,
                 )
-                k_t_psum[...] = nisa.nc_transpose(k_src, engine=nisa.tensor_engine)
+                k_t_psum[...] = nisa.nc_transpose(
+                    k_src,
+                    engine=nisa.tensor_engine,
+                )
                 k[
                     :,
-                    nl.ds(load_idx * block_size * B_P_SIZE + tb_i * B_P_SIZE, B_P_SIZE),
+                    nl.ds(
+                        load_idx * block_size * B_P_SIZE + tb_i * B_P_SIZE,
+                        B_P_SIZE,
+                    ),
                 ] = nl.copy(k_t_psum, dtype=kernel_dtype)
 
     # load value cache
@@ -355,7 +366,10 @@ def _flash_attention_core_kq_matmul(
                 large_tile_idx % MULTI_BUFFER,
                 i_f + load_idx * block_size * B_D_SIZE,
             ] = nl.load(
-                value_cache[block_tables_sbuf[i_p, load_idx, large_tile_idx], i_f],
+                value_cache[
+                    block_tables_sbuf[i_p, load_idx, large_tile_idx],
+                    i_f,
+                ],
             )
         else:
             v_loaded = nl.ndarray(
@@ -363,7 +377,10 @@ def _flash_attention_core_kq_matmul(
                 dtype=value_cache.dtype,
             )
             v_loaded[...] = nl.load(
-                value_cache[block_tables_sbuf[i_p, load_idx, large_tile_idx], i_f],
+                value_cache[
+                    block_tables_sbuf[i_p, load_idx, large_tile_idx],
+                    i_f,
+                ],
             )
             v_load_buffer[
                 i_p,
@@ -378,13 +395,18 @@ def _flash_attention_core_kq_matmul(
         for load_idx in nl.affine_range(num_loads):
             i_p = nl.arange(B_P_SIZE)[:, None]
             i_f = nl.arange(block_size * B_D_SIZE)[None, :]
-            k_load_buffer[i_p, (large_tile_idx + 1) % MULTI_BUFFER, load_idx, i_f] = (
-                nl.load(
-                    key_cache[block_tables_sbuf[i_p, load_idx, large_tile_idx + 1], i_f]
-                )
+            k_load_buffer[
+                i_p, (large_tile_idx + 1) % MULTI_BUFFER, load_idx, i_f
+            ] = nl.load(
+                key_cache[
+                    block_tables_sbuf[i_p, load_idx, large_tile_idx + 1],
+                    i_f,
+                ]
             )
     KV_TILE_SIZE = k.shape[1]
-    assert KV_TILE_SIZE % B_P_SIZE == 0, f"{KV_TILE_SIZE=} not divisive by {B_P_SIZE=}"
+    assert (
+        KV_TILE_SIZE % B_P_SIZE == 0
+    ), f"{KV_TILE_SIZE=} not divisive by {B_P_SIZE=}"
     num_k_tile = KV_TILE_SIZE // B_P_SIZE
 
     kq_res_buf = nl.full(
@@ -451,7 +473,11 @@ def _flash_attention_core_kq_matmul(
     )
 
     m_previous = m_buffer_sbuf[:, large_tile_idx]
-    m_current = nisa.tensor_tensor(m_previous, max_transposed, np.maximum)  # (128,1)
+    m_current = nisa.tensor_tensor(
+        m_previous,
+        max_transposed,
+        np.maximum,
+    )  # (128,1)
 
     # Compute scaling factor
     bias = nl.zeros((par_dim(1), 1), dtype=m_previous.dtype)
@@ -477,7 +503,11 @@ def _flash_attention_core_kq_matmul(
         dtype=acc_type,
         buffer=nl.psum,
     )
-    broadcast_partition_with_PE(m_current, max_broadcasted[:, 0, :], out_in_psum=True)
+    broadcast_partition_with_PE(
+        m_current,
+        max_broadcasted[:, 0, :],
+        out_in_psum=True,
+    )
 
     p_local = nl.ndarray(
         (par_dim(B_P_SIZE), num_k_tile, Q_TILE_SIZE),

@@ -69,7 +69,8 @@ class ContextAttnInputs:
 
     def as_dict(self, prefix=""):
         return {
-            (prefix + field.name): getattr(self, field.name) for field in fields(self)
+            (prefix + field.name): getattr(self, field.name)
+            for field in fields(self)
         }
 
 
@@ -98,7 +99,7 @@ class NKIFlashPagedAttentionRunner:
         self.dynamic_loop_unrolling_size = dynamic_loop_unrolling_size
         self.exec_mode = _decide_execution_mode(exec_mode)
         self.skip_active = skip_active
-        self.numpy_kernel_use_bf16 = True  # use ml_dtypes.bfloat16 for baremetal mode
+        self.numpy_kernel_use_bf16 = True  # use ml_dtypes.bf16 for baremetal
         self.num_actual_tokens = None
         self.prefill_ctx_inputs: Optional[ContextAttnInputs] = None
         self.decode_ctx_inputs: Optional[ContextAttnInputs] = None
@@ -113,7 +114,9 @@ class NKIFlashPagedAttentionRunner:
 
     def _get_prefill_decode_batch_size(self):
         decode_batch_size = 0
-        assert torch.all(self.query_lens > 0), f"Expect nonzero {self.query_lens}"
+        assert torch.all(
+            self.query_lens > 0
+        ), f"Expect nonzero {self.query_lens}"
         for x in reversed(self.query_lens):
             if x > 1:
                 break
@@ -150,7 +153,9 @@ class NKIFlashPagedAttentionRunner:
     def _preprocess(self):
         self.num_actual_tokens = self.query_lens.sum().item()
         self._decide_padded_query_len()
-        prefill_batch_size, decode_batch_size = self._get_prefill_decode_batch_size()
+        prefill_batch_size, decode_batch_size = (
+            self._get_prefill_decode_batch_size()
+        )
         self._build_kernel_plan(prefill_batch_size, decode_batch_size)
 
         self.prefill_batch_size = prefill_batch_size
@@ -206,7 +211,10 @@ class NKIFlashPagedAttentionRunner:
         unroll_size = self.dynamic_loop_unrolling_size
         assert unroll_size > 0
 
-        def pad_plan_for_loop_unroll(plan: ContextAttnPlan, q_pad_value: int = 0):
+        def pad_plan_for_loop_unroll(
+            plan: ContextAttnPlan,
+            q_pad_value: int = 0,
+        ):
             assert plan is not None
             if unroll_size == 1:
                 return plan
@@ -238,9 +246,15 @@ class NKIFlashPagedAttentionRunner:
             tile_size_kv=self.large_kv_tile_size,
             block_size=self.block_size,
         )
-        self.decode_plan = pad_plan_for_loop_unroll(decode_planner.generate_plan())
+        self.decode_plan = pad_plan_for_loop_unroll(
+            decode_planner.generate_plan()
+        )
 
-    def _prepare_buffer_unroll_info(self, plan: ContextAttnPlan, max_num_q_tiles: int):
+    def _prepare_buffer_unroll_info(
+        self,
+        plan: ContextAttnPlan,
+        max_num_q_tiles: int,
+    ):
         max_num_q_tiles = pad_to_next_power_of_2(max_num_q_tiles)
         q_update_pred, last_tile_indices = plan.build_tile_update_indices(
             max_num_q_tiles=max_num_q_tiles,
@@ -294,7 +308,9 @@ class NKIFlashPagedAttentionRunner:
         max_kv_cache_size: int,
         query_start_offset: int = 0,
     ):
-        skip_value = 0 if is_decode_plan else self.num_active_tokens_after_padding * 10
+        skip_value = (
+            0 if is_decode_plan else self.num_active_tokens_after_padding * 10
+        )
         tile_q_indices = torch.tensor(
             ctx_plan.build_tile_q_indices(skip_value=skip_value)
         )
@@ -436,8 +452,15 @@ class NKIFlashPagedAttentionRunner:
         compiler_flags = [
             "-O1",
             "--lnc=1",
-            "--retry_failed_compilation",
         ]
+        if self.exec_mode == "xla":
+            compiler_flags.append("--retry_failed_compilation")
+
+        enable_branch_hint = os.getenv("ENABLE_BRANCH_HINT", "0") != "0"
+        if enable_branch_hint:
+            compiler_flags.append(
+                "--internal-backend-options='--enable-branch-hint'"
+            )
         compiler_flags_str = " ".join(compiler_flags)
         os.environ["NEURON_CC_FLAGS"] = compiler_flags_str
         if self.exec_mode == "xla":

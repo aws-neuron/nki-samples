@@ -149,8 +149,8 @@ def _run_test(
         (128, 2048, 16),  # 128 blocks
         (128, 4096, 32),  # 128 blocks
         (256, 2048, 256),  # 8 blocks
-        (256, 4096, 32),  # 128 blocks
         (256, 1024, 4),  # 256 blocks
+        (128, 8192, 32),  # 256 blocks
     ],
 )
 @pytest.mark.parametrize(

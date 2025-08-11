@@ -20,6 +20,7 @@ import numpy as np
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 from neuronxcc.nki.language import par_dim
+from neuronxcc.nki.isa.constants import oob_mode
 
 from constants import B_P_SIZE
 
@@ -34,10 +35,6 @@ def pad_to_multiple(a, b):
 
 def is_power_of_2(x):
     return x > 0 and (x & (x - 1)) == 0
-
-
-def round_down_to_power_of_2(x):
-    return 1 << (x.bit_length() - 1)
 
 
 def load_indices(indices_hbm):
@@ -76,26 +73,28 @@ def load_indices_for_loop_step(
     partition_offset_iota=None,
 ):
     """
-    Load a 2D indices array with dim 0 range [loop_index * step_size, (loop_index + 1) * size) from
-    HBM with start offset to SBUF
+    Load a 2D indices array with dim 0 range [loop_index * step_size,
+    (loop_index + 1) * size) from HBM with start offset to SBUF
 
-    To map num_tiles to SBUF partition dimension, this function automatically partitions num_tiles
-    with partition_size set to min(step_size, B_P_SIZE=128)
+    To map num_tiles to SBUF partition dimension, this function automatically
+    partitions num_tiles with partition_size set to min(step_size, B_P_SIZE=128)
 
-    Output SBUF tensor shape: [par_dim(partition_size), ceil_div(size, partition_size), num_indices]
+    Output SBUF tensor shape:
+    [par_dim(partition_size), ceil_div(size, partition_size), num_indices]
     """
 
     _, num_indices = indices_hbm.shape
     if partition_size is None:
         partition_size = min(B_P_SIZE, step_size)
     else:
-        assert partition_size <= B_P_SIZE, f"Expect {partition_size=} <= {B_P_SIZE=}"
+        assert (
+            partition_size <= B_P_SIZE
+        ), f"Expect {partition_size=} <= {B_P_SIZE=}"
     assert (
         step_size % partition_size == 0
     ), f"Expect {step_size=} % {partition_size=} == 0"
     num_partitions = step_size // partition_size
 
-    assert loop_index.shape == (1, 1)
     indices_sbuf = nl.ndarray(
         (par_dim(partition_size), num_partitions, num_indices),
         dtype=indices_hbm.dtype,
@@ -107,7 +106,12 @@ def load_indices_for_loop_step(
         )
     base_offsets = nisa.tensor_tensor(
         partition_size_iota,
-        nisa.activation(nl.copy, loop_index, scale=float(step_size), dtype=nl.uint32),
+        nisa.activation(
+            nl.copy,
+            loop_index,
+            scale=float(step_size),
+            dtype=nl.uint32,
+        ),
         nl.add,
         engine=nisa.vector_engine,
     )
@@ -146,7 +150,10 @@ def load_indices_for_loop_step(
     for i in nl.affine_range(num_partitions):
         i_p = nl.arange(partition_size)[:, None]
         i_f = nl.arange(num_indices)[None, :]
-        indices_sbuf[i_p, i, i_f] = nl.load(indices_hbm[offsets[i_p, i], i_f])
+        indices_sbuf[i_p, i, i_f] = nl.load(
+            indices_hbm[offsets[i_p, i], i_f],
+            mode=oob_mode.skip,
+        )
     return indices_sbuf
 
 
@@ -166,7 +173,9 @@ def transform_to_vector_dge_layout(
     if partition_size is None:
         partition_size = min(num_indices, B_P_SIZE)
     else:
-        assert partition_size <= B_P_SIZE, f"Expect {partition_size=} <= {B_P_SIZE=}"
+        assert (
+            partition_size <= B_P_SIZE
+        ), f"Expect {partition_size=} <= {B_P_SIZE=}"
     num_partitions = ceil_div(num_indices, partition_size)
     assert indices_out.shape == (
         partition_size,
@@ -279,13 +288,19 @@ class IdentityStore:
             else:
                 identity = self.cache[dtype].get(size, None)
             assert (
-                identity is not None or dtype not in self._manual_transpose_dtypes
+                identity is not None
+                or dtype not in self._manual_transpose_dtypes
             ), f"Missing identity for {dtype} {size}"
             out.append(identity)
         return tuple(out)
 
 
-def PF_transpose_with_PE(src, out, identity_for_transpose=None, out_in_psum=False):
+def PF_transpose_with_PE(
+    src,
+    out,
+    identity_for_transpose=None,
+    out_in_psum=False,
+):
     """
     Perform P-F Transpose with PE.
     """
@@ -323,7 +338,11 @@ def PF_transpose_with_PE(src, out, identity_for_transpose=None, out_in_psum=Fals
                 move_dtype = get_move_dtype(src)
                 src_reinterpreted = src.view(move_dtype)
                 out_reinterpreted = out.view(move_dtype)
-                out_psum = nl.ndarray(out.shape, dtype=move_dtype, buffer=nl.psum)
+                out_psum = nl.ndarray(
+                    out.shape,
+                    dtype=move_dtype,
+                    buffer=nl.psum,
+                )
                 out_psum[...] = nisa.nc_transpose(
                     src_reinterpreted,
                     engine=nisa.tensor_engine,
@@ -347,19 +366,35 @@ def PF_transpose_with_PE(src, out, identity_for_transpose=None, out_in_psum=Fals
                     is_transpose=True,
                 )
             else:
-                out_psum[...] = nisa.nc_transpose(src, engine=nisa.tensor_engine)
+                out_psum[...] = nisa.nc_transpose(
+                    src,
+                    engine=nisa.tensor_engine,
+                )
             out[...] = nl.copy(out_psum, dtype=out.dtype)
         else:
             assert src.dtype in (nl.bfloat16, nl.float16, nl.float32), src.dtype
             if is_nc_gen2:
-                out_psum = nl.ndarray(out.shape, dtype=nl.float32, buffer=nl.psum)
+                out_psum = nl.ndarray(
+                    out.shape,
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                )
             else:
-                out_psum = nl.ndarray(out.shape, dtype=src.dtype, buffer=nl.psum)
+                out_psum = nl.ndarray(
+                    out.shape,
+                    dtype=src.dtype,
+                    buffer=nl.psum,
+                )
             out_psum[...] = nisa.nc_transpose(src, engine=nisa.tensor_engine)
             out[...] = nl.copy(out_psum, dtype=out.dtype)
 
 
-def broadcast_partition_with_PE(src, out, src_one_zero=False, out_in_psum=False):
+def broadcast_partition_with_PE(
+    src,
+    out,
+    src_one_zero=False,
+    out_in_psum=False,
+):
     """
     Perform Partition Dimension Broadcast with PE rather than vector engine.
     """

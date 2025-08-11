@@ -26,7 +26,6 @@ from utils import (
     is_power_of_2,
     PF_transpose_with_PE,
 )
-from paged_cache import prepare_kv_block_dim_tiling
 from flash_attn_impl import (
     prepare_q_update_pred,
     allocate_prefill_accum_buffers,
@@ -49,25 +48,25 @@ def check_input_shape(
     active_mask,
 ):
     # tile size from prefill
-    _, PREFILL_LARGE_Q_TILE_SIZE, LARGE_KV_TILE_SIZE = prefill_tile_masks.shape
+    PREFILL_INNER_Q_TILE_SIZE = prefill_tile_masks.shape[0]
     # check decode input
-    DECODE_K_TILE_SIZE, _, N_DECODE_K_TILE = decode_tile_masks.shape
+    DECODE_K_TILE_SIZE = decode_tile_masks.shape[0]
     assert DECODE_K_TILE_SIZE == B_P_SIZE
-    assert LARGE_KV_TILE_SIZE == DECODE_K_TILE_SIZE * N_DECODE_K_TILE
 
     b, h, seqlen_q, d = query.shape
     assert seqlen_q <= 8192, f"Large {seqlen_q=} consumes too much sbuf space"
     if seqlen_q <= B_P_SIZE:
-        assert is_power_of_2(seqlen_q), f"{seqlen_q=} is expected to be power of 2"
+        assert is_power_of_2(
+            seqlen_q
+        ), f"{seqlen_q=} is expected to be power of 2"
     elif seqlen_q <= B_FMAX_SIZE:
-        assert seqlen_q % B_P_SIZE == 0, f"{seqlen_q=} must be mulitple of {B_P_SIZE=}"
+        assert (
+            seqlen_q % B_P_SIZE == 0
+        ), f"{seqlen_q=} must be mulitple of {B_P_SIZE=}"
     else:
         assert (
             seqlen_q % B_FMAX_SIZE == 0
         ), f"{seqlen_q=} must be multiple of {B_FMAX_SIZE=}"
-
-    PREFILL_INNER_Q_TILE_SIZE = min(B_P_SIZE, PREFILL_LARGE_Q_TILE_SIZE)
-    assert PREFILL_LARGE_Q_TILE_SIZE % PREFILL_INNER_Q_TILE_SIZE == 0
 
     assert (
         seqlen_q % PREFILL_INNER_Q_TILE_SIZE == 0
@@ -117,8 +116,6 @@ def check_input_shape(
         k_h,
         seqlen_q,
         d,
-        LARGE_KV_TILE_SIZE,
-        PREFILL_LARGE_Q_TILE_SIZE,
         PREFILL_INNER_Q_TILE_SIZE,
     )
 
@@ -145,7 +142,11 @@ def merge_decode_buffer(
             nl.arange(TILE_SIZE)[None, :] + i * TILE_SIZE,
             dtype=nl.int32,
         )
-        offsets = nisa.tensor_tensor(base_offset_iota, decode_q_start_offset, nl.add)
+        offsets = nisa.tensor_tensor(
+            base_offset_iota,
+            decode_q_start_offset,
+            nl.add,
+        )
         offsets_transposed = nl.ndarray((par_dim(TILE_SIZE), 1), dtype=nl.int32)
         PF_transpose_with_PE(
             offsets,
@@ -163,7 +164,10 @@ def merge_decode_buffer(
 
 
 @nki.compiler.skip_middle_end_transformations
-@nki.jit(experimental_flags="experimental-native-scalar-support")
+@nki.jit(
+    experimental_flags="experimental-native-scalar-support, experimental-local-tensor-parent",
+    enable_out_of_bound_check=False,
+)
 def flash_paged_attention_varlen(
     *,
     query,
@@ -202,7 +206,7 @@ def flash_paged_attention_varlen(
       - value_cache: (max_num_blocks, n_kv_heads, block_size, d)
       - prefill_tile_q_indices: (max_num_prefill_tiles, large_tile_size_q)
       - prefill_tile_block_tables: (max_num_prefill_tiles, num_block_per_large_tile)
-      - prefill_tile_masks: (max_num_prefill_tiles, large_tile_size_q, large_tile_size_k)
+      - prefill_tile_masks: (B_P_SIZE, max_num_prefill_tiles, large_tile_size_q // B_P_SIZE, large_tile_size_k)
       - prefill_num_dynamic_loop_steps: (1, 1)
       - decode_tile_q_indices: (max_num_decode_tiles, 1)
       - decode_tile_block_tables: (max_num_decode_tiles, num_block_per_large_tile)
@@ -238,16 +242,7 @@ def flash_paged_attention_varlen(
       GQA: q: [b, h, d, s], k: [b, kv_h, d, s], v: [b, kv_h, s, d]
         usage: `flash_fwd[b, kv_h](q, k, v, ...)`
     """
-    (
-        b,
-        h,
-        k_h,
-        seqlen_q,
-        d,
-        LARGE_KV_TILE_SIZE,
-        PREFILL_LARGE_Q_TILE_SIZE,
-        INNER_Q_TILE_SIZE,
-    ) = check_input_shape(
+    (b, h, k_h, seqlen_q, d, INNER_Q_TILE_SIZE) = check_input_shape(
         query,
         key,
         value,
@@ -272,13 +267,8 @@ def flash_paged_attention_varlen(
 
     softmax_scale = softmax_scale or (1.0 / (d**0.5))
 
-    key_cache, value_cache, block_size_tiling_factor, block_size = (
-        prepare_kv_block_dim_tiling(key_cache, value_cache, LARGE_KV_TILE_SIZE)
-    )
-    num_blocks_per_large_tile = LARGE_KV_TILE_SIZE // block_size
     B_D_SIZE = d
     q_h_per_k_h = h // k_h
-    n_small_in_large_q_tile = PREFILL_LARGE_Q_TILE_SIZE // INNER_Q_TILE_SIZE
 
     assert prefill_num_dynamic_loop_steps.dtype == nl.int32
     assert decode_num_dynamic_loop_steps.dtype == nl.int32
@@ -291,7 +281,7 @@ def flash_paged_attention_varlen(
         B_D_SIZE=B_D_SIZE,
         acc_type=acc_type,
     )
-    PREFILL_MAX_NUM_TILE = prefill_tile_masks.shape[0]
+    PREFILL_MAX_NUM_TILE = prefill_tile_masks.shape[1]
     assert PREFILL_MAX_NUM_TILE % dynamic_loop_unroll_factor == 0
     if prefill_q_update_pred is None:
         prefill_last_tile_indices_sbuf = nl.load(prefill_last_tile_indices)
@@ -321,11 +311,6 @@ def flash_paged_attention_varlen(
         kernel_dtype=kernel_dtype,
         acc_type=acc_type,
         loop_unroll_factor=dynamic_loop_unroll_factor,
-        n_small_in_large_q_tile=n_small_in_large_q_tile,
-        INNER_Q_TILE_SIZE=INNER_Q_TILE_SIZE,
-        num_blocks_per_large_tile=num_blocks_per_large_tile,
-        block_size=block_size,
-        block_size_tiling_factor=block_size_tiling_factor,
         batch_id=batch_id,
         head_id=head_id,
         k_h=k_h,
@@ -367,9 +352,6 @@ def flash_paged_attention_varlen(
         kernel_dtype=kernel_dtype,
         acc_type=acc_type,
         loop_unroll_factor=dynamic_loop_unroll_factor,
-        num_blocks_per_large_tile=num_blocks_per_large_tile,
-        block_size=block_size,
-        block_size_tiling_factor=block_size_tiling_factor,
         batch_id=batch_id,
         head_id=head_id,
         k_h=k_h,
@@ -469,17 +451,10 @@ def flash_attn_varlen_nkifunc(
         assert isinstance(
             query, np.ndarray
         ), "Only Numpy Kernel supports saving artifact"
-        additional_compile_opt = [
-            "-O1",
-            "--lnc=1",
-            "--internal-compiler-debug-mode=all",
-            "--tensorizer-options='--print-stats --dump-after=All'",
-        ]
         return nki.baremetal(
             flash_paged_attention_varlen,
             debug_kernel=True,
             artifacts_dir=save_artifact_dir,
-            additional_compile_opt=" ".join(additional_compile_opt),
         )[1, n_kv_head](**kwargs)
     else:
         return flash_paged_attention_varlen[1, n_kv_head](**kwargs)

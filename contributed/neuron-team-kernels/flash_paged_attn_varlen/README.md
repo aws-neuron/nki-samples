@@ -54,3 +54,9 @@ We also support parallel testing using multiple Neuron Cores with `pytest-xdist`
 nworker=8
 TEST_EXEC_MODE=$mode pytest test_kernel.py -xv -n$nworker
 ```
+
+
+### Branch hint
+On-chip control flow benefit from branch hint. One can use env variable
+`ENABLE_BRANCH_HINT=1` to enable branch hint. However, this might trigger
+compiler bugs on Trn2 and kernel might hang and time out.

@@ -30,12 +30,12 @@ from utils import (
 
 def prepare_kv_block_dim_tiling(key_cache, value_cache, LARGE_KV_TILE_SIZE):
     """
-    If number of blocks to load for a tile (i.e. LARGE_KV_TILE_SIZE // block_size) is smaller than
-    B_P_SIZE(128), tiling on block_size dimension is applied so that there are 128 loads to fully
-    utilize Vector DGE.
+    If number of blocks to load for a tile (i.e. LARGE_KV_TILE_SIZE //
+    block_size) is smaller than B_P_SIZE(128), tiling on block_size dimension is
+    applied so that there are 128 loads to fully utilize Vector DGE.
 
-    This function decides the new tiled_block_size. It also reshapes KV cache to a 2-D layout to
-    load KV data in block granularity
+    This function decides the new tiled_block_size. It also reshapes KV cache to
+    a 2-D layout to load KV data in block granularity
     """
     num_blocks, k_h, block_size, d = key_cache.shape
     num_blocks_per_large_tile = LARGE_KV_TILE_SIZE // block_size
@@ -73,20 +73,26 @@ def transform_block_tables_for_indirect_load(
     block_tiling_iota=None,
 ):
     """
-    This function calculates the new block ids after reshaping KV cache layout from [num_blocks,
-    k_h, block_size, d] to [num_blocks * k_h, bloock_size * d].
+    This function calculates the new block ids after reshaping KV cache from
+    [num_blocks, k_h, block_size, d] to [num_blocks * k_h, bloock_size * d].
 
-    And then block_tables is transposed (from [num_tiles, num_blocks_per_tile] to
-    [num_blocks_per_tile, num_tiles]) to map block_ids per tile to SBUF Partition Dimension for
-    vector DGE.
+    And then block_tables is transposed (from [num_tiles, num_blocks_per_tile]
+    to [num_blocks_per_tile, num_tiles]) to map block_ids per tile to SBUF
+    Partition Dimension for vector DGE.
     """
     # block_tables on HBM has layout [num_tiles, num_blocks_per_tile]. And after loaded to SBUF,
     # the layout becomes [par_dim(128), ceil_div(num_tiles, 128), num_blocks_per_tile]
-    num_tiles_per_partition, num_partitions, num_blocks_per_tile = block_tables.shape
+    num_tiles_per_partition, num_partitions, num_blocks_per_tile = (
+        block_tables.shape
+    )
 
     num_loads = ceil_div(num_blocks_per_tile, B_P_SIZE)
     block_tables_transposed = nl.ndarray(
-        (par_dim(B_P_SIZE), num_loads, num_partitions * num_tiles_per_partition),
+        (
+            par_dim(B_P_SIZE),
+            num_loads,
+            num_partitions * num_tiles_per_partition,
+        ),
         dtype=nl.uint32,
     )
 
@@ -96,13 +102,20 @@ def transform_block_tables_for_indirect_load(
         head_id_0 = nisa.iota(head_id, dtype=nl.uint32).reshape((1, 1))
         if num_tiles_per_partition > 1:
             if nisa.get_nc_version() == nisa.nc_version.gen3:
-                head_id = nl.broadcast_to(head_id_0, shape=(num_tiles_per_partition, 1))
+                head_id = nl.broadcast_to(
+                    head_id_0,
+                    shape=(num_tiles_per_partition, 1),
+                )
             else:
                 head_id = nl.ndarray(
                     (par_dim(num_tiles_per_partition), 1),
                     dtype=nl.uint32,
                 )
-                broadcast_partition_with_PE(head_id_0, head_id, out_in_psum=False)
+                broadcast_partition_with_PE(
+                    head_id_0,
+                    head_id,
+                    out_in_psum=False,
+                )
         else:
             head_id = head_id_0
         if num_blocks_per_tile > 1:
@@ -127,7 +140,11 @@ def transform_block_tables_for_indirect_load(
             if nisa.get_nc_version() == nisa.nc_version.gen3:
                 offset_br = nl.broadcast_to(
                     offset,
-                    shape=(num_tiles_per_partition, 1, block_size_tiling_factor),
+                    shape=(
+                        num_tiles_per_partition,
+                        1,
+                        block_size_tiling_factor,
+                    ),
                 )
             else:
                 offset_br = nl.ndarray(
@@ -176,7 +193,6 @@ def transform_block_tables_for_indirect_load(
                 offset_br,
                 nl.add,
                 dtype=nl.uint32,
-                # engine=nisa.vector_engine,  # XXX using vector engine converts int to float32
             )
             new_block_tables = new_block_tables.reshape(
                 (num_tiles_per_partition, B_P_SIZE)
@@ -208,8 +224,10 @@ def load_k_tile_from_cache(
     for load_idx in nl.affine_range(num_loads):
         i_p = nl.arange(B_P_SIZE)[:, None]
         i_f = nl.arange(block_size * B_D_SIZE)[None, :]
-        k_load_buffer[i_p, large_k_tile_idx % MULTI_BUFFER, load_idx, i_f] = nl.load(
-            key_cache[block_tables[i_p, load_idx, large_k_tile_idx], i_f],
+        k_load_buffer[i_p, large_k_tile_idx % MULTI_BUFFER, load_idx, i_f] = (
+            nl.load(
+                key_cache[block_tables[i_p, load_idx, large_k_tile_idx], i_f],
+            )
         )
 
 
@@ -276,7 +294,9 @@ def load_v_tile_from_cache(
         i_p = nl.arange(B_P_SIZE)[:, None]
         i_f = nl.arange(block_size * B_D_SIZE)[None, :]
         v_load_buffer[
-            i_p, large_k_tile_idx % MULTI_BUFFER, i_f + load_idx * block_size * B_D_SIZE
+            i_p,
+            large_k_tile_idx % MULTI_BUFFER,
+            i_f + load_idx * block_size * B_D_SIZE,
         ] = nl.load(
             value_cache[block_tables[i_p, load_idx, large_k_tile_idx], i_f],
         )

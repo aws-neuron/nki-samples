@@ -49,11 +49,13 @@ class TilePlan:
             self.tile_q_seq_ids,
             self.tile_kv_seq_ids,
         ]:
-            assert isinstance(arg, np.ndarray) and arg.dtype == np.int32, type(arg)
+            assert isinstance(arg, np.ndarray) and arg.dtype == np.int32
             assert arg.shape[0] == self.num_tiles, (arg.shape, self.num_tiles)
 
         if self.tile_kv_skip_indices.size > 0:
-            assert np.all(self.tile_kv_skip_indices > 0), f"We never skip first tile"
+            assert np.all(
+                self.tile_kv_skip_indices > 0
+            ), f"We never skip first tile"
             assert np.all(self.tile_kv_skip_indices < self.num_tiles)
 
     @property
@@ -69,17 +71,30 @@ class TilePlan:
             # always pad first dim of plan attribute
             shape = x.shape
             pad_width = [(0, pad_to - shape[0])] + [(0, 0)] * (len(shape) - 1)
-            return np.pad(x, pad_width, mode="constant", constant_values=pad_value)
+            return np.pad(
+                x, pad_width, mode="constant", constant_values=pad_value
+            )
 
         tile_q_indices = pad(
             self.tile_q_indices,
             pad_num_tiles_to,
             pad_value=q_pad_value,
         )
-        tile_block_tables_offsets = pad(self.tile_block_table_offsets, pad_num_tiles_to)
+        tile_block_tables_offsets = pad(
+            self.tile_block_table_offsets,
+            pad_num_tiles_to,
+        )
         # pad different value for q and kv seq ids so that sequence affiliation mask is False
-        tile_q_seq_ids = pad(self.tile_q_seq_ids, pad_num_tiles_to, pad_value=0)
-        tile_kv_seq_ids = pad(self.tile_kv_seq_ids, pad_num_tiles_to, pad_value=1)
+        tile_q_seq_ids = pad(
+            self.tile_q_seq_ids,
+            pad_num_tiles_to,
+            pad_value=0,
+        )
+        tile_kv_seq_ids = pad(
+            self.tile_kv_seq_ids,
+            pad_num_tiles_to,
+            pad_value=1,
+        )
         # add all padded tile ids to kv_skip_indices for DMA skipping
         tile_kv_skip_indices = np.array(
             self.tile_kv_skip_indices.tolist()
@@ -130,17 +145,20 @@ class TilePlan:
     def build_tile_masks(self, decode_kq_matmul):
         tile_kv_seq_ids = self.tile_kv_seq_ids
         num_tiles, tile_size_kv = tile_kv_seq_ids.shape
-        assert tile_size_kv % B_P_SIZE == 0 and tile_size_kv % self.block_size == 0
+        assert (
+            tile_size_kv % B_P_SIZE == 0 and tile_size_kv % self.block_size == 0
+        )
         num_tiled_blocks = max(B_P_SIZE, tile_size_kv // self.block_size)
         tiled_block_size = tile_size_kv // num_tiled_blocks
-        # Mask is only used to mask out paddings within a tile. As a result, the mask is a sequence
-        # affiliation mask: as long as Q token and KV token has the same sequence id, the mask is
-        # True
+        # Mask is only used to mask out paddings within a tile. As a result, the
+        # mask is a sequence affiliation mask: as long as Q token and KV token
+        # has the same sequence id, the mask is True
         if tiled_block_size > 1:
-            # Due to how computation is mapped to 2-D SBUF, our kernel does not aggregate KV token
-            # following token's position id order. Instead, each KV tile are reshaped to have
-            # layout (B_P_SIZE, block_size) on SBUF, and reduction is done column by column. As a
-            # result, we need to reorder tile mask accordingly.
+            # Due to how computation is mapped to 2-D SBUF, our kernel does not
+            # aggregate KV token following token's position id order. Instead,
+            # each KV tile are reshaped to have layout (B_P_SIZE, block_size) on
+            # SBUF, and reduction is done column by column. As a result, we need
+            # to reorder tile mask accordingly.
             tile_kv_seq_ids = tile_kv_seq_ids.reshape(
                 (
                     num_tiles,
@@ -153,10 +171,11 @@ class TilePlan:
                 (num_tiles, tile_size_kv)
             )
         if decode_kq_matmul:
-            # for decode, due to adopting kq matmul to improve , we need to transpose mask again
-            tile_masks = np.expand_dims(self.tile_q_seq_ids, 1) == np.expand_dims(
-                tile_kv_seq_ids, 2
-            )
+            # for decode, due to adopting kq matmul to improve , we need to
+            # transpose mask again
+            tile_masks = np.expand_dims(
+                self.tile_q_seq_ids, 1
+            ) == np.expand_dims(tile_kv_seq_ids, 2)
             tile_masks = tile_masks.reshape(
                 (num_tiles, tile_size_kv // B_P_SIZE, B_P_SIZE)
             )
@@ -164,9 +183,26 @@ class TilePlan:
             # New layout: (B_P_SIZE, num_tiles, tile_size_kv // B_P_SIZE)
             tile_masks = tile_masks.transpose(2, 0, 1)
         else:
-            tile_masks = np.expand_dims(self.tile_q_seq_ids, 2) == np.expand_dims(
-                tile_kv_seq_ids, 1
+            tile_masks = np.expand_dims(
+                self.tile_q_seq_ids, 2
+            ) == np.expand_dims(tile_kv_seq_ids, 1)
+            # Transpose for efficient load
+            # New layout:
+            # (num_tiles, B_P_SIZE, tile_size_q // B_P_SIZE, tile_size_kv)
+            tile_size_q = self.tile_q_seq_ids.shape[1]
+            inner_tile_size_q = min(tile_size_q, B_P_SIZE)
+            assert (
+                tile_size_q % inner_tile_size_q == 0
+            ), f"{tile_size_q=} not multiple of {inner_tile_size_q=}"
+            tile_masks = tile_masks.reshape(
+                (
+                    num_tiles,
+                    tile_size_q // inner_tile_size_q,
+                    inner_tile_size_q,
+                    tile_size_kv,
+                )
             )
+            tile_masks = tile_masks.transpose(2, 0, 1, 3)
         return tile_masks
 
     def build_tile_update_indices(
@@ -174,7 +210,9 @@ class TilePlan:
         max_num_q_tiles,
         build_update_pred=True,
     ):
-        tile_q_offsets = self.tile_q_indices[: self.num_real_tiles, :1].flatten().copy()
+        tile_q_offsets = (
+            self.tile_q_indices[: self.num_real_tiles, :1].flatten().copy()
+        )
         _, num_tiles_per_seq = np.unique(tile_q_offsets, return_counts=True)
         last_tile_indices = np.cumsum(num_tiles_per_seq) - 1
         assert (
@@ -190,10 +228,11 @@ class TilePlan:
             # let kernel build update_indices using last_tile_indices
             update_indices = None
 
-        # pad last_tile_indices to match max_num_q_tiles
+        # pad last_tile_indices to match padded_seqlen
+        num_q_tiles = len(last_tile_indices)
         padded_last_tile_indices = np.empty(max_num_q_tiles, dtype=np.int32)
-        padded_last_tile_indices[: len(last_tile_indices)] = last_tile_indices
-        padded_last_tile_indices[len(last_tile_indices) :] = last_tile_indices[-1]
+        padded_last_tile_indices[:num_q_tiles] = last_tile_indices
+        padded_last_tile_indices[num_q_tiles:] = last_tile_indices[-1]
         return update_indices, padded_last_tile_indices
 
 
@@ -236,7 +275,9 @@ class VarlenAttentionPlanner:
             context_lens
         ), "prompt_lens and context_lens must have the same length"
         self.num_seq = len(prompt_lens)
-        assert self.num_seq > 0, "prompt_lens and context_lens must be non-empty"
+        assert (
+            self.num_seq > 0
+        ), "prompt_lens and context_lens must be non-empty"
         self.prompt_lens = prompt_lens.astype(np.int32)
         self.context_lens = context_lens.astype(np.int32)
         self.tile_size_q = tile_size_q
@@ -263,9 +304,17 @@ class VarlenAttentionPlanner:
             seq_ids = seq_ids.reshape((num_tiles, tile_size))
             return seq_ids[indices]
 
-        def _build_load_offsets(start_id, seqlen, tile_size, indices, pad_value):
+        def _build_load_offsets(
+            start_id,
+            seqlen,
+            tile_size,
+            indices,
+            pad_value,
+        ):
             num_tiles = _ceil_div(seqlen, tile_size)
-            load_indices = np.arange(num_tiles * tile_size, dtype=np.int32) + start_id
+            load_indices = (
+                np.arange(num_tiles * tile_size, dtype=np.int32) + start_id
+            )
             load_indices[seqlen:] = pad_value
             load_indices = load_indices.reshape((num_tiles, tile_size))
             return load_indices[indices]
@@ -279,8 +328,8 @@ class VarlenAttentionPlanner:
         for seq_id, (num_q_tiles, num_kv_tiles) in enumerate(
             zip(num_seq_q_tiles, num_seq_kv_tiles)
         ):
-            # for each request / sequence, we cover the QK score region with tiles of shape [q_len
-            # // tile_size_q, kv_len // tile_size_kv]
+            # for each request / sequence, we cover the QK score region with
+            # tiles of shape [q_len // tile_size_q, kv_len // tile_size_kv]
             if num_q_tiles == 0 or num_kv_tiles == 0:
                 continue
             num_tiles = (num_q_tiles, num_kv_tiles)
@@ -288,7 +337,8 @@ class VarlenAttentionPlanner:
                 np.arange(num_q_tiles, dtype=np.int32).reshape(-1, 1), num_tiles
             )
             kv_indices = np.broadcast_to(
-                np.arange(num_kv_tiles, dtype=np.int32).reshape(1, -1), num_tiles
+                np.arange(num_kv_tiles, dtype=np.int32).reshape(1, -1),
+                num_tiles,
             )
             if self.traverse_in_column_order:
                 q_indices = q_indices.transpose()
@@ -311,9 +361,10 @@ class VarlenAttentionPlanner:
                 -1,
             )
 
-            # record which sequence each query / context token belongs to. Padded token in query has
-            # seq_id self.num_seq. Padded token in cotnext has seq_id self.num_seq + 1. This is to
-            # guarantee generated mask will be False.
+            # record which sequence each query / context token belongs to.
+            # Padded token in query has seq_id self.num_seq. Padded token in
+            # cotnext has seq_id self.num_seq + 1. This is to guarantee
+            # generated mask will be False.
             q_seq_ids = _build_seq_ids(
                 seq_id,
                 self.prompt_lens[seq_id],
@@ -334,11 +385,12 @@ class VarlenAttentionPlanner:
             tile_q_seq_ids.append(q_seq_ids)
             tile_kv_seq_ids.append(kv_seq_ids)
             if self.enable_kv_dma_skipping:
-                # DMA skipping is enabled, then if adjacent tiles use the same KV region, then we
-                # can skip KV load
+                # DMA skipping is enabled, then if adjacent tiles use the same
+                # KV region, then we can skip KV load
                 prev_kv_indices = np.concatenate(([-1], kv_indices[:-1]))
                 kv_skip_indices = (
-                    np.nonzero(kv_indices == prev_kv_indices)[0] + total_num_tiles
+                    np.nonzero(kv_indices == prev_kv_indices)[0]
+                    + total_num_tiles
                 ).astype(np.int32)
                 tile_kv_skip_indices.append(kv_skip_indices)
 
