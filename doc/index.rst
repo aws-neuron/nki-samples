@@ -37,6 +37,7 @@ kernels in the `neuronxcc` is synced with this repository on every Neuron SDK re
     nki_samples.reference.vision
     nki_samples.reference.allocated_fused_linear
     nki_samples.reference.allocated_attention
+    nki_samples.reference.rmsnorm_quant
 
 
 nki_samples.tutorial

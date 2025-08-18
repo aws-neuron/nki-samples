@@ -28,6 +28,9 @@ _insert_doc(alloc_attn.allocated_fused_self_attn_for_SD_small_head_size)
 import nki_samples.reference.allocated_fused_linear as alloc_fl
 _insert_doc(alloc_fl.allocated_fused_rms_norm_qkv)
 
+import nki_samples.reference.rmsnorm_quant.rmsnorm_quant as rmsnorm_quant
+_insert_doc(rmsnorm_quant.rmsnorm_quant_kernel)
+
 def run_apidoc(app):
     """Generate doc stubs using sphinx-apidoc."""
     module_dir = os.path.join(app.srcdir, "../src/")
