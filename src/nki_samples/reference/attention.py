@@ -14,6 +14,7 @@ from neuronxcc.nki.language import par_dim
 from dataclasses import dataclass
 from functools import reduce as functools_reduce
 from operator import mul as operator_mul
+from nki_samples.utils.flags import use_dma_transpose_default
 
 
 def n_elts(shape):
@@ -42,7 +43,14 @@ class FlashConfig:
 
 
 @nki.jit(mode='trace')
-def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ, use_dma_transpose=False):
+def transpose_p_local(p_local_transposed, p_local, LARGE_TILE_SZ, use_dma_transpose=None):
+  """
+  Transpose helper for flash attention.
+  """
+  # read env default if caller didn't override
+  if use_dma_transpose is None:
+    use_dma_transpose = use_dma_transpose_default()
+    
   for i in nl.affine_range(LARGE_TILE_SZ // 512):
     # Temporarily disable use_dma_tranpose by default until we stablized it
     if use_dma_transpose and nisa.get_nc_version() >= nisa.nc_version.gen3:
