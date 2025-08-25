@@ -190,24 +190,53 @@ def resize_nearest_fixed_dma_kernel(data_tensor, out_shape):
   assert in_b == out_b, "Input batch and output batch must be identical"
   assert in_c == out_c, "Input channel and output channel must be identical"
 
-  # Generate map
-  h_scale, w_scale = 1.0 * in_h / out_h, 1.0 * in_w / out_w
-  h_map = np.floor(np.fromfunction(lambda i, _: i * h_scale, (out_h, out_w), dtype=np.float32))
-  w_map = np.floor(np.fromfunction(lambda _, j: j * w_scale, (out_h, out_w), dtype=np.float32))
-  map = (h_map * in_w + w_map).astype(np.int32).flatten()
+  # Scaling factors for height and width
+  h_scale: float = 1.0 * in_h / out_h
+  w_scale: float = 1.0 * in_w / out_w
 
-  in_seqlen, out_seqlen = in_h * in_w, out_h * out_w
+  # Create flattened views
+  in_seqlen: int = in_h * in_w
+  out_seqlen: int = out_h * out_w
+  data_view_flattened = data_tensor.reshape(shape=(in_b, in_seqlen, in_c))
+  output_view_flattened = out_tensor.reshape(shape=(out_b, out_seqlen, out_c))
 
-  data_tile = data_tensor.reshape(shape=(in_b, in_seqlen, in_c))
-  out_tile = out_tensor.reshape(shape=(out_b, out_seqlen, out_c))
+  # Tile configuration
+  H_W_TILE_SIZE = 128
+  H_W_NUM_TILES = (out_seqlen + H_W_TILE_SIZE - 1) // H_W_TILE_SIZE
 
-  b_map = nl.arange(in_b)[:, None]
-  c_map = nl.arange(out_c)[None, :]
+  for b in nl.affine_range(out_b):
+    for h_w_tile in nl.affine_range(H_W_NUM_TILES):
+      # Partition dimension for image pixel spatial positions, free dimension for channels
+      i_p_hw = nl.arange(H_W_TILE_SIZE)[:, None]
+      i_f_channel = nl.arange(out_c)[None, :]
 
-  for i in nl.static_range(len(map)):
-    target_addr = data_tile[b_map, map[i], c_map]
-    local_data = nl.load(target_addr)
-    dst_addr_0 = out_tile[b_map, i, c_map]
-    nl.store(dst_addr_0, value=local_data)
+      # Output position for current tile
+      tile_start = h_w_tile * H_W_TILE_SIZE
+      output_pos = tile_start + i_p_hw
+      output_pos_iota = nisa.iota(output_pos, dtype=nl.int32)
+
+      # Convert flattened position to 2D coordinates
+      out_h_idx = nl.floor(output_pos_iota / out_w, dtype=nl.int32)
+      out_w_idx = nl.mod(output_pos_iota, out_w, dtype=nl.int32)
+
+      # Compute nearest neighbor source indices
+      src_h_idx = nl.floor(nl.multiply(out_h_idx, h_scale, dtype=nl.float32), dtype=nl.int32)
+      src_w_idx = nl.floor(nl.multiply(out_w_idx, w_scale, dtype=nl.float32), dtype=nl.int32)
+
+      # Convert to flattened index
+      load_indices = src_h_idx * in_w + src_w_idx
+
+      # Boundary mask
+      valid_mask = (output_pos < out_seqlen)
+
+      # Gather and store
+      target_addr = data_view_flattened[b, load_indices, i_f_channel]
+      loaded_tile_sbuf = nl.load(target_addr, mask=valid_mask)
+
+      nl.store(
+          output_view_flattened[b, output_pos, i_f_channel],
+          value=loaded_tile_sbuf,
+          mask=valid_mask
+      )
 
   return out_tensor
