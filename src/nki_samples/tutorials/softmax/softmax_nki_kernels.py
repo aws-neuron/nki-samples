@@ -11,8 +11,7 @@ def nki_softmax_kernel(a_tensor):
                           buffer=nl.shared_hbm)
 
   # Generate tensor indices to index input tensor
-  ix = nl.arange(128)[:, None]
-  iy = nl.arange(a_tensor.shape[1])[None, :]
+  ix, iy = nl.mgrid[0:128, 0:a_tensor.shape[1]]
 
   num_rows = a_tensor.shape[0]
 

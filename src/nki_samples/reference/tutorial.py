@@ -13,8 +13,7 @@ import neuronxcc.nki.language as nl
 def add_kernel_nx8x128x512(a_ptr, b_ptr, n_elements):
   c_ptr = nl.ndarray(a_ptr.shape, dtype=a_ptr.dtype, buffer=nl.shared_hbm)
 
-  ix = nl.arange(128)[:, None]
-  iy = nl.arange(512)[None, :]
+  ix, iy = nl.mgrid[0:128, 0:512]
 
   tile_size = 128 * 512
   block_size = 8 * tile_size

@@ -201,8 +201,7 @@ def resize_nearest_fixed_dma_kernel(data_tensor, out_shape):
   data_tile = data_tensor.reshape(shape=(in_b, in_seqlen, in_c))
   out_tile = out_tensor.reshape(shape=(out_b, out_seqlen, out_c))
 
-  b_map = nl.arange(in_b)[:, None]
-  c_map = nl.arange(out_c)[None, :]
+  b_map, c_map = nl.mgrid[0:in_b, 0:out_c]
 
   for i in nl.static_range(len(map)):
     target_addr = data_tile[b_map, map[i], c_map]
