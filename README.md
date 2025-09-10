@@ -47,7 +47,7 @@ but contain detailed inline comments and have accompanying documentation.
 The [contributed](contributed/) directory contains experimental and advanced NKI kernels from both community contributors and the AWS Neuron team. These kernels showcase cutting-edge optimizations and specialized implementations that demonstrate advanced NKI programming techniques beyond what's available in the reference kernels.
 
 **Important Notice**: All kernels in this directory:
-- Have been ested only against internal nightly builds
+- Have been tested only against internal nightly builds
 - May not be compatible with public NeuronSDK releases
 - Have not been extensively tested across all input configurations
 - Carry no compatibility guarantees
