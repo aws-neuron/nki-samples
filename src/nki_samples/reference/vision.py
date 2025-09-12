@@ -331,6 +331,12 @@ def adaptive_avg_pool2d_kernel(in_tensor, output_size):
         pool_h_size = h_end - h_start
         pool_w_size = w_end - w_start
         
+        # PERF NOTE:
+        # For pooling windows smaller than (H_TILE_SIZE x W_TILE_SIZE), we can simplify by lowering
+        # to a single dma_copy + tensor_reduce_mean over a compact tile, whereas the tiling path emits
+        # multiple dma_copy chunks + reduce_add accumulations and a final divide (more SBUF traffic +
+        # loop overhead). Keep the if/else fast path to preserve small-window performance.
+
         # Check if pooling region fits in a single tile
         if pool_h_size <= H_TILE_SIZE and pool_w_size <= W_TILE_SIZE:
           # Simple case: pooling region fits in one tile
