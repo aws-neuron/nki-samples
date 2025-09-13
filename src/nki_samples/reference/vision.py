@@ -299,16 +299,16 @@ def adaptive_avg_pool2d_kernel(in_tensor, output_size):
   
   # Spatial tile sizes to fit within SBUF memory constraints
   # SBUF limit is 192KB per partition, using conservative tile sizes
-  H_TILE_SIZE = 128
-  W_TILE_SIZE = 128
+  POOL_H_TILE_SIZE = 128
+  POOL_W_TILE_SIZE = 128
   
   # Flatten batch and channel dimensions for efficient processing
   in_flattened = in_tensor.reshape(shape=(N * C, H, W))
   out_flattened = out_tensor.reshape(shape=(N * C, OH, OW))
   
   # Allocate buffers with spatial tiling support
-  max_pool_h = min(int(h_spans.max()), H_TILE_SIZE)
-  max_pool_w = min(int(w_spans.max()), W_TILE_SIZE)
+  max_pool_h = min(int(h_spans.max()), POOL_H_TILE_SIZE)
+  max_pool_w = min(int(w_spans.max()), POOL_W_TILE_SIZE)
   
   in_tile_sbuf = nl.zeros((n_nc_tiles, nl.par_dim(NC_TILE_SIZE), max_pool_h, max_pool_w), 
                           dtype=in_tensor.dtype, buffer=nl.sbuf)
@@ -317,10 +317,10 @@ def adaptive_avg_pool2d_kernel(in_tensor, output_size):
 
   # Process tiles along the N*C dimension
   for nc_tile_idx in nl.affine_range(n_nc_tiles):
-    tile_start = nc_tile_idx * NC_TILE_SIZE
+    nc_tile_start = nc_tile_idx * NC_TILE_SIZE
     
     # Create partition indices for current tile
-    i_p_nc = nl.arange(NC_TILE_SIZE)[:, None, None] + tile_start
+    i_p_nc = nl.arange(NC_TILE_SIZE)[:, None, None] + nc_tile_start
     
     # Compute adaptive average for each output position
     for out_h_idx in nl.static_range(OH):
@@ -331,71 +331,51 @@ def adaptive_avg_pool2d_kernel(in_tensor, output_size):
         pool_h_size = h_end - h_start
         pool_w_size = w_end - w_start
         
-        # PERF NOTE:
-        # For pooling windows smaller than (H_TILE_SIZE x W_TILE_SIZE), we can simplify by lowering
-        # to a single dma_copy + tensor_reduce_mean over a compact tile, whereas the tiling path emits
-        # multiple dma_copy chunks + reduce_add accumulations and a final divide (more SBUF traffic +
-        # loop overhead). Keep the if/else fast path to preserve small-window performance.
-
-        # Check if pooling region fits in a single tile
-        if pool_h_size <= H_TILE_SIZE and pool_w_size <= W_TILE_SIZE:
-          # Simple case: pooling region fits in one tile
-          nisa.dma_copy(
-            src=in_flattened[tile_start:tile_start + NC_TILE_SIZE, 
-                             h_start:h_end, w_start:w_end],
-            dst=in_tile_sbuf[nc_tile_idx, :, 0:pool_h_size, 0:pool_w_size],
-            mask=(i_p_nc < N * C)
-          )
+        accumulator = nl.zeros((NC_TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+        total_elements = pool_h_size * pool_w_size
+        
+        n_pool_h_tiles = (pool_h_size + POOL_H_TILE_SIZE - 1) // POOL_H_TILE_SIZE
+        n_pool_w_tiles = (pool_w_size + POOL_W_TILE_SIZE - 1) // POOL_W_TILE_SIZE
+        
+        # Process pooling region in tiles
+        for pool_h_tile_idx in nl.sequential_range(n_pool_h_tiles):
+          cur_pool_h_tile_size = min(pool_h_size, POOL_H_TILE_SIZE)
+          pool_h_tile_start = pool_h_tile_idx * cur_pool_h_tile_size
+          i_f_pool_h = nl.arange(cur_pool_h_tile_size)[None, :, None] + pool_h_tile_start + h_start
           
-          # Compute mean across spatial dimensions
-          out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = nl.mean(
-            in_tile_sbuf[nc_tile_idx, :, 0:pool_h_size, 0:pool_w_size], 
-            axis=[-2, -1]
-          )
-        else:
-          # Complex case: pooling region requires tiling
-          accumulator = nl.zeros((NC_TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
-          total_elements = pool_h_size * pool_w_size
-          
-          n_h_tiles = (pool_h_size + H_TILE_SIZE - 1) // H_TILE_SIZE
-          n_w_tiles = (pool_w_size + W_TILE_SIZE - 1) // W_TILE_SIZE
-          
-          # Process pooling region in tiles
-          for h_tile_idx in nl.sequential_range(n_h_tiles):
-            h_tile_start = h_tile_idx * H_TILE_SIZE
-            i_f_h = nl.arange(H_TILE_SIZE)[None, :, None] + h_tile_start
+          for pool_w_tile_idx in nl.sequential_range(n_pool_w_tiles):
+            cur_pool_w_tile_size = min(pool_w_size, POOL_W_TILE_SIZE)
+            pool_w_tile_start = pool_w_tile_idx * cur_pool_w_tile_size
+            i_f_pool_w = nl.arange(cur_pool_w_tile_size)[None, None, :] + pool_w_tile_start + w_start
             
-            for w_tile_idx in nl.sequential_range(n_w_tiles):
-              w_tile_start = w_tile_idx * W_TILE_SIZE
-              i_f_w = nl.arange(W_TILE_SIZE)[None, None, :] + w_tile_start
-              
-              # Load current pooling region tile
-              nisa.dma_copy(
-                src=in_flattened[tile_start:tile_start + NC_TILE_SIZE,
-                                 h_tile_start:h_tile_start+H_TILE_SIZE, w_tile_start:w_tile_start+W_TILE_SIZE],
-                dst=in_tile_sbuf[nc_tile_idx, :, :, :],
-                mask=((i_p_nc < N * C) & (i_f_h < H) & (i_f_w < W))
-              )
-              
-              # Sum elements in current tile
-              tile_sum = nl.sum(
-                in_tile_sbuf[nc_tile_idx, :, :, :],
-                axis=[-2, -1],
-                mask=((i_f_h < H) & (i_f_w < W))
-              )
-              
-              # Accumulate sum
-              accumulator[:, :] = accumulator[:, :] + tile_sum
-          
-          # Compute average
-          if total_elements > 0:
-            out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = nl.divide(accumulator, total_elements)
-          else:
-            out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = 0.0
+            # Load current pooling region tile
+            nisa.dma_copy(
+              src=in_flattened[nc_tile_start : nc_tile_start + NC_TILE_SIZE,
+                               h_start + pool_h_tile_start : h_start + pool_h_tile_start + cur_pool_h_tile_size,
+                               w_start + pool_w_tile_start : w_start + pool_w_tile_start + cur_pool_w_tile_size],
+              dst=in_tile_sbuf[nc_tile_idx, :, 0:cur_pool_h_tile_size, 0:cur_pool_w_tile_size],
+              mask=((i_p_nc < N * C) & (i_f_pool_h < H) & (i_f_pool_w < W))
+            )
+            
+            # Sum elements in current tile
+            tile_sum = nl.sum(
+              in_tile_sbuf[nc_tile_idx, :, 0:cur_pool_h_tile_size, 0:cur_pool_w_tile_size],
+              axis=[-2, -1],
+              mask=((i_f_pool_h < H) & (i_f_pool_w < W))
+            )
+            
+            # Accumulate sum
+            accumulator[:, :] = accumulator[:, :] + tile_sum
+        
+        # Compute average
+        if total_elements > 0:
+          out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = nl.divide(accumulator, total_elements)
+        else:
+          out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = 0.0
     
     # Store output tile
     nl.store(
-      out_flattened[tile_start:tile_start + NC_TILE_SIZE, :, :],
+      out_flattened[nc_tile_start:nc_tile_start + NC_TILE_SIZE, :, :],
       value=out_tile_sbuf[nc_tile_idx],
       mask=(i_p_nc < N * C)
     )
