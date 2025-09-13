@@ -240,3 +240,144 @@ def resize_nearest_fixed_dma_kernel(data_tensor, out_shape):
       )
 
   return out_tensor
+
+
+@nki.jit
+def adaptive_avg_pool2d_kernel(in_tensor, output_size):
+  """
+  Implementation of adaptive average pooling 2D kernel.
+  
+  Applies a 2D adaptive average pooling over an input signal composed of several 
+  input planes. The output size is determined by the output_size parameter, and 
+  the kernel automatically computes the appropriate pooling regions for each output 
+  element.
+
+  This kernel implements the same functionality as PyTorch's AdaptiveAvgPool2d operation.
+  
+  IO Tensor layouts:
+   - in_tensor: shape (N, C, H, W) - NCHW format
+   - out_tensor: shape (N, C, OH, OW) - NCHW format
+   - N: batch size, C: channels, H: height, W: width
+   - OH, OW: output height and width determined by output_size
+  
+  Parameters:
+   - in_tensor: Input tensor in NCHW format
+   - output_size: Can be an integer or tuple of two integers
+     - If integer: output will be square (output_size x output_size)
+     - If tuple: output will be (OH x OW) where OH, OW = output_size
+  
+  IO tensor dtypes:
+   - This kernel supports float32, float16, and bfloat16 dtypes
+  """
+  N, C, H, W = in_tensor.shape
+  
+  # Handle output_size parameter
+  if isinstance(output_size, int):
+    OH = OW = output_size
+  else:
+    OH, OW = output_size
+  
+  # Validate output size
+  assert OH > 0 and OW > 0, "Output size must be positive"
+  assert OH <= H and OW <= W, "Output size cannot be larger than input size"
+  
+  # Create output tensor
+  out_tensor = nl.ndarray((N, C, OH, OW), dtype=in_tensor.dtype, buffer=nl.shared_hbm)
+  
+  # Compute the start and end indices for each pooling window
+  # These arrays define the pooling regions for each output position
+  h_start_indices = (np.arange(OH, dtype=np.int32) * H) // OH
+  h_end_indices = ((np.arange(1, OH + 1, dtype=np.int32) * H + OH - 1) // OH)
+  w_start_indices = (np.arange(OW, dtype=np.int32) * W) // OW
+  w_end_indices = ((np.arange(1, OW + 1, dtype=np.int32) * W + OW - 1) // OW)
+  h_spans = h_end_indices - h_start_indices
+  w_spans = w_end_indices - w_start_indices
+  
+  # Tile configuration for processing N*C dimension
+  NC_TILE_SIZE = min(N * C, nl.tile_size.pmax)
+  n_nc_tiles = (N * C + NC_TILE_SIZE - 1) // NC_TILE_SIZE
+  
+  # Spatial tile sizes to fit within SBUF memory constraints
+  # SBUF limit is 192KB per partition, using conservative tile sizes
+  POOL_H_TILE_SIZE = 128
+  POOL_W_TILE_SIZE = 128
+  
+  # Flatten batch and channel dimensions for efficient processing
+  in_flattened = in_tensor.reshape(shape=(N * C, H, W))
+  out_flattened = out_tensor.reshape(shape=(N * C, OH, OW))
+  
+  # Allocate buffers with spatial tiling support
+  max_pool_h = min(int(h_spans.max()), POOL_H_TILE_SIZE)
+  max_pool_w = min(int(w_spans.max()), POOL_W_TILE_SIZE)
+  
+  in_tile_sbuf = nl.zeros((n_nc_tiles, nl.par_dim(NC_TILE_SIZE), max_pool_h, max_pool_w), 
+                          dtype=in_tensor.dtype, buffer=nl.sbuf)
+  out_tile_sbuf = nl.zeros((n_nc_tiles, nl.par_dim(NC_TILE_SIZE), OH, OW), 
+                           dtype=in_tensor.dtype, buffer=nl.sbuf)
+
+  # Process tiles along the N*C dimension
+  for nc_tile_idx in nl.affine_range(n_nc_tiles):
+    nc_tile_start = nc_tile_idx * NC_TILE_SIZE
+    
+    # Create partition indices for current tile
+    i_p_nc = nl.arange(NC_TILE_SIZE)[:, None, None] + nc_tile_start
+    
+    # Compute adaptive average for each output position
+    for out_h_idx in nl.static_range(OH):
+      for out_w_idx in nl.static_range(OW):
+        # Define the pooling window for this output position
+        h_start, h_end = h_start_indices[out_h_idx], h_end_indices[out_h_idx]
+        w_start, w_end = w_start_indices[out_w_idx], w_end_indices[out_w_idx]
+        pool_h_size = h_end - h_start
+        pool_w_size = w_end - w_start
+        
+        accumulator = nl.zeros((NC_TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+        total_elements = pool_h_size * pool_w_size
+        
+        n_pool_h_tiles = (pool_h_size + POOL_H_TILE_SIZE - 1) // POOL_H_TILE_SIZE
+        n_pool_w_tiles = (pool_w_size + POOL_W_TILE_SIZE - 1) // POOL_W_TILE_SIZE
+        
+        # Process pooling region in tiles
+        for pool_h_tile_idx in nl.sequential_range(n_pool_h_tiles):
+          cur_pool_h_tile_size = min(pool_h_size, POOL_H_TILE_SIZE)
+          pool_h_tile_start = pool_h_tile_idx * cur_pool_h_tile_size
+          i_f_pool_h = nl.arange(cur_pool_h_tile_size)[None, :, None] + pool_h_tile_start + h_start
+          
+          for pool_w_tile_idx in nl.sequential_range(n_pool_w_tiles):
+            cur_pool_w_tile_size = min(pool_w_size, POOL_W_TILE_SIZE)
+            pool_w_tile_start = pool_w_tile_idx * cur_pool_w_tile_size
+            i_f_pool_w = nl.arange(cur_pool_w_tile_size)[None, None, :] + pool_w_tile_start + w_start
+            
+            # Load current pooling region tile
+            nisa.dma_copy(
+              src=in_flattened[nc_tile_start : nc_tile_start + NC_TILE_SIZE,
+                               h_start + pool_h_tile_start : h_start + pool_h_tile_start + cur_pool_h_tile_size,
+                               w_start + pool_w_tile_start : w_start + pool_w_tile_start + cur_pool_w_tile_size],
+              dst=in_tile_sbuf[nc_tile_idx, :, 0:cur_pool_h_tile_size, 0:cur_pool_w_tile_size],
+              mask=((i_p_nc < N * C) & (i_f_pool_h < H) & (i_f_pool_w < W))
+            )
+            
+            # Sum elements in current tile
+            tile_sum = nl.sum(
+              in_tile_sbuf[nc_tile_idx, :, 0:cur_pool_h_tile_size, 0:cur_pool_w_tile_size],
+              axis=[-2, -1],
+              mask=((i_f_pool_h < H) & (i_f_pool_w < W))
+            )
+            
+            # Accumulate sum
+            accumulator[:, :] = accumulator[:, :] + tile_sum
+        
+        # Compute average
+        if total_elements > 0:
+          out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = nl.divide(accumulator, total_elements)
+        else:
+          out_tile_sbuf[nc_tile_idx, :, out_h_idx, out_w_idx] = 0.0
+    
+    # Store output tile
+    nl.store(
+      out_flattened[nc_tile_start:nc_tile_start + NC_TILE_SIZE, :, :],
+      value=out_tile_sbuf[nc_tile_idx],
+      mask=(i_p_nc < N * C)
+    )
+  
+  return out_tensor

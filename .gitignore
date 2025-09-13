@@ -3,3 +3,4 @@ _apidoc
 doc/_apidoc
 doc/generated
 __pycache__
+venv
