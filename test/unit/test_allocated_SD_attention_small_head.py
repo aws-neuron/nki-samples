@@ -12,7 +12,7 @@ from scipy.special import softmax
 
 test_trace_file_path='local_trace.ntff'
 
-bench_func = benchmark(warmup=5, iters=20, save_trace_name=test_trace_file_path)(allocated_fused_self_attn_for_SD_small_head_size)
+bench_func = benchmark(warmup=20, iters=200, save_trace_name=test_trace_file_path)(allocated_fused_self_attn_for_SD_small_head_size)
 
 def cpu_golden_attn(q, k, v):
     softmax_scale = 0.125
