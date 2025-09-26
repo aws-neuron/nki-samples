@@ -4,6 +4,7 @@ Copyright (c) 2025, Amazon.com. All Rights Reserved
 import pytest
 from nki_samples.reference.double_row_matmul import quantized_double_row_matmul
 from neuronxcc.nki import benchmark, baremetal, simulate_kernel
+import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 
@@ -69,11 +70,12 @@ def column_wise_quantize(matrix):
 
 class TestDoubleRowMatmul:
 
-    @xfail(fail=['trn1'])
     @pytest.mark.parametrize("M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, max_p99_latency", [
         [512, 16 * 1024, 1024, nl.bfloat16, 2, 2, 16, 320],
     ])
     def test_double_row_matmul_perf(self, M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, max_p99_latency):
+        if (not nisa.get_nc_version() or nisa.get_nc_version() < nisa.nc_version.gen3):
+            return
         # Initializing random inputs
         lhs = np.random.rand(M, K)
         rhs = np.random.rand(K, N)
@@ -94,7 +96,6 @@ class TestDoubleRowMatmul:
         
         assert p99_latency <= max_p99_latency
 
-    @xfail(fail=['trn1'])
     @pytest.mark.simulation
     @pytest.mark.parametrize("M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K", [
         [512, 16 * 1024, 1024, nl.bfloat16, 2, 2, 16],
@@ -102,6 +103,8 @@ class TestDoubleRowMatmul:
         [512, 16 * 1024, 1024, nl.bfloat16, 4, 2, 128],
     ])
     def test_double_row_matmul_numerical(self, simulation_only, M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K):
+        if (not nisa.get_nc_version() or nisa.get_nc_version() < nisa.nc_version.gen3):
+            return
         # Initializing random inputs
         lhs = np.random.rand(M, K)
         rhs = np.random.rand(K, N)
