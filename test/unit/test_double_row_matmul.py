@@ -4,12 +4,21 @@ Copyright (c) 2025, Amazon.com. All Rights Reserved
 import pytest
 from nki_samples.reference.double_row_matmul import quantized_double_row_matmul
 from neuronxcc.nki import benchmark, baremetal, simulate_kernel
-import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 
-xfail = pytest.mark.arch_specific_xfail
+def get_target_string():
+    """ returns instance type, e.g. trn1, inf2, trn2. """
+    fpath = '/sys/devices/virtual/dmi/id/product_name'
+    try:
+        with open(fpath, 'r') as f:
+            fc = f.readline()
+    except IOError:
+        warnings.warn('Unable to read MLA target.')
+        return ""
 
+    instance_type = fc.split('.')[0]
+    return instance_type
 
 bench_func = benchmark(warmup=5, iters=10)(quantized_double_row_matmul)
 
@@ -74,7 +83,7 @@ class TestDoubleRowMatmul:
         [512, 16 * 1024, 1024, nl.bfloat16, 2, 2, 16, 320],
     ])
     def test_double_row_matmul_perf(self, M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, max_p99_latency):
-        if (not nisa.get_nc_version() or nisa.get_nc_version() < nisa.nc_version.gen3):
+        if (get_target_string() != "trn2"):
             return
         # Initializing random inputs
         lhs = np.random.rand(M, K)
@@ -103,7 +112,7 @@ class TestDoubleRowMatmul:
         [512, 16 * 1024, 1024, nl.bfloat16, 4, 2, 128],
     ])
     def test_double_row_matmul_numerical(self, simulation_only, M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K):
-        if (not nisa.get_nc_version() or nisa.get_nc_version() < nisa.nc_version.gen3):
+        if (get_target_string() != "trn2"):
             return
         # Initializing random inputs
         lhs = np.random.rand(M, K)
