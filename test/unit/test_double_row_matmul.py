@@ -69,7 +69,7 @@ def column_wise_quantize(matrix):
 
 class TestDoubleRowMatmul:
 
-    @xfail(fail=['trn1'])
+    @xfail # P307489162
     @pytest.mark.parametrize("M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, max_p99_latency", [
         [512, 16 * 1024, 1024, nl.bfloat16, 2, 2, 16, 320],
     ])
@@ -94,7 +94,7 @@ class TestDoubleRowMatmul:
         
         assert p99_latency <= max_p99_latency
 
-    @xfail(fail=['trn1'])
+    @xfail # P307489162
     @pytest.mark.simulation
     @pytest.mark.parametrize("M, K, N, dtype, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K", [
         [512, 16 * 1024, 1024, nl.bfloat16, 2, 2, 16],
