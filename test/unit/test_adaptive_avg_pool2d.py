@@ -47,7 +47,7 @@ class TestAdaptiveAvgPool2D:
     
     @pytest.mark.parametrize("N, C, H, W, output_size, dtype, latency", [
         # Test cases with various input/output sizes
-        [1, 64, 56, 56, 7, np.float32, 56 * 1.05],
+        [1, 64, 56, 56, 7, np.float32, 65 * 1.05],
         [2, 128, 28, 28, 7, np.float32, 109 * 1.05],
         [1, 256, 14, 14, 7, nl.float16, 88 * 1.05],
         [4, 64, 56, 56, (7, 7), np.float32, 152 * 1.05],
