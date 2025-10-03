@@ -15,12 +15,28 @@ from neuronxcc.starfish.support.util import allclose
 from flash_attention import nki_flash_attn_func
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize('causal', [True, False])
-def test_attention(dtype, causal):
-    def torch_golden_attn_cpu(query_states, key_states, value_states):
+@pytest.mark.parametrize('causal,sliding_window', [
+    (True, -1),             # causal, no sliding window
+    (True, 128),            # causal, sliding window of size 128
+    (True, float("inf")),   # causal, sliding window size same as sequence length
+    (False, -1),            # non-causal, no sliding window
+])
+def test_attention(dtype, causal, sliding_window):
+    def torch_golden_attn_cpu(query_states, key_states, value_states, causal, sliding_window):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * (query_states.shape[-1] ** (-0.5))
 
-        if causal:
+        if sliding_window == float("inf"): # same as causal attention
+            causal = True
+            sliding_window = -1
+
+        if sliding_window > 0:
+            causal_mask = torch.triu(
+                torch.tril(torch.ones(1, 1, query_states.shape[2], key_states.shape[2])),
+                diagonal=-(sliding_window - 1),
+            ).bool()
+            causal_mask = ~causal_mask
+            attn_weights = attn_weights.masked_fill_(causal_mask, -10000.0)
+        elif causal:
             causal_mask = torch.triu(torch.ones((1, 1, query_states.shape[2], key_states.shape[2])), diagonal=1).bool()
             attn_weights = attn_weights.masked_fill_(causal_mask, -10000.0)
 
@@ -42,7 +58,7 @@ def test_attention(dtype, causal):
     value_states_cpu.requires_grad_()
 
     # Run the CPU golden results
-    golden_attn = torch_golden_attn_cpu(query_states_cpu, key_states_cpu, value_states_cpu)
+    golden_attn = torch_golden_attn_cpu(query_states_cpu, key_states_cpu, value_states_cpu, causal, sliding_window)
     loss_golden = torch.sum(golden_attn**2)
     loss_golden.backward()
 
@@ -50,7 +66,7 @@ def test_attention(dtype, causal):
     query_states_xla = query_states_cpu.to(xm.xla_device()).detach().requires_grad_()
     key_states_xla = key_states_cpu.to(xm.xla_device()).detach().requires_grad_()
     value_states_xla = value_states_cpu.to(xm.xla_device()).detach().requires_grad_()
-    attn_nki = nki_flash_attn_func(query_states_xla, key_states_xla, value_states_xla, causal=causal)
+    attn_nki = nki_flash_attn_func(query_states_xla, key_states_xla, value_states_xla, causal=causal, sliding_window=sliding_window)
     loss_actual = torch.sum(attn_nki**2)
     loss_actual.backward()
     xm.mark_step()

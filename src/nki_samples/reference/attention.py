@@ -367,6 +367,7 @@ def flash_fwd(q, k, v, seed, logit_bias=None,
     assert tuple(v.shape) == (b, k_h, seqlen_k, d), f"Expect shape of V to be {(b, k_h, seqlen_k, d)} (batch, heads, seqlen_k, d_head) but got {v.shape}"
     assert tuple(k.shape) == (b, k_h, d, seqlen_k), f"Expect shape of K to be {(b, k_h, d, seqlen_k)} (batch, heads, d_head, seqlen_k) but got {k.shape}"
   assert d <= 128, f" we do not support head_dim > 128, got head dim {d}"
+  sliding_window = min(sliding_window, seqlen_k)
   use_causal_mask = True if sliding_window > 0 else use_causal_mask  # setting sliding window assumes causal
   kernel_dtype = nl.bfloat16 if mixed_precision else q.dtype
   acc_type = np.dtype(np.float32) if mixed_precision else kernel_dtype
@@ -528,6 +529,7 @@ def flash_attn_bwd(
   mixed_precision=False,
   dropout_p=0.0,
   softmax_scale=None,
+  sliding_window=-1,
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.
@@ -715,7 +717,8 @@ def flash_attn_bwd(
         kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
         softmax_scale=softmax_scale,
         seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
-        logit_bias_tile=logit_bias_tile
+        logit_bias_tile=logit_bias_tile,
+        sliding_window=min(sliding_window, seqlen_k),
       )
 
     # Write dK, dV
@@ -821,7 +824,7 @@ def _flash_attn_bwd_core(
   kernel_dtype, mixed_dtype,
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
-  logit_bias_tile=None):
+  logit_bias_tile=None, sliding_window=0):
   """
   The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
@@ -875,6 +878,17 @@ def _flash_attn_bwd_core(
         pred=causal_pred,
         on_true_tile=qk_psum[:, :], on_false_value=-9984.0, dtype=mixed_dtype,
         mask=mask)
+    
+    if sliding_window > 0:
+      swa_pred = local_i_q_seq_tile * q_seq_tile_size + iq - sliding_window < local_i_k_seq_tile * k_seq_tile_size + ik
+      qk_res_buf[:, :] = nisa.affine_select(
+        pred=swa_pred,
+        on_true_tile=qk_res_buf[:, :],
+        on_false_value=-9984.0,
+        dtype=mixed_dtype,
+        mask=mask,
+      )
+
   else:
     if logit_bias_tile is not None:
       # Simply add logit bias which copies back to sbuf at the same time
