@@ -1,141 +1,271 @@
 # NKI Batch Invariance Test
 
-Testing whether NKI's tile size constraints protect against batch-dependent non-determinism in matrix multiplication.
+Demonstrating batch invariance principles in NKI (Neuron Kernel Interface), replicating findings from [Thinking Machines' "Defeating Nondeterminism in LLM Inference"](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/).
 
-## Hypothesis
+## What is Batch Invariance?
 
-**NKI achieves batch invariance by default due to hardware tile constraints.**
+**Batch invariance** means that computing the same element in different batch sizes produces **identical numerical results**. The paper demonstrates that CUDA/PyTorch matrix multiplication is **NOT batch-invariant** due to dynamic optimization strategies that change based on batch size.
 
-Unlike CUDA/PyTorch, where batch size can influence the K-dimension reduction strategy (e.g., switching to split-K for better parallelism when M is small), NKI's hardware constraints enforce fixed tile sizes that decouple batch size from reduction order.
+## When Does Batch Variance Occur?
 
-### Key Protection Mechanisms
+Batch variance occurs when **ALL THREE conditions are met**:
 
-1. **K is the reduction axis, not the batch axis (M)**
-   - Reduction happens over K (contraction dimension)
-   - M (batch) loop is outer, K loop is inner
-   - Changing M doesn't affect K iteration count
+1. **Tiling the reduction dimension** (not parallelizable dimensions)
+   - MatMul: Tiling K (contraction dimension) ✓
+   - RMSNorm: Tiling hidden dimension in split reduction ✓
+   - RMSNorm: Tiling batch dimension ✗ (batch is parallelizable)
 
-2. **Hardware constraints enforce fixed tile sizes**
-   - Tensor Engine limits: P-dim ≤ 128, free-dim ≤ 512
-   - Forces compile-time constants (e.g., K_TILE=128)
-   - Prevents runtime adaptation based on batch size
+2. **Iterative accumulation across tiles** (not atomic reductions)
+   - `c_psum += matmul(a_tile, b_tile)` ✓ Creates variance
+   - `nl.sum(entire_row)` ✗ Atomic, no variance
 
-3. **Potential vulnerability: Split-K**
-   - NKI *could* split along K when M is small (like CUDA does)
-   - This would couple M and K reduction strategy
-   - Our tests verify this doesn't happen automatically
+3. **Dynamic tile size based on input characteristics**
+   - CUDA: Adapts K strategy based on batch size ✓
+   - NKI (fixed): `K_TILE = 128` always ✗
+   - NKI (variant): `K_TILE = 64 if K <= 512 else 128` ✓
 
-## Test Design
+## Test Environment
 
-Replicated [Thinking Machines' batch invariance test](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/):
+- **Instance**: `inf2.xlarge` (AWS Trainium)
+- **AMI ID**: `ami-0ec4ab14b1c5a10f2`
+- **AMI Name**: `Deep Learning AMI Neuron (Ubuntu 22.04) 20250919` 
+- **Compiler**: `neuronxcc-2.21.18209.0`
+- **Framework**: NKI (Neuron Kernel Interface)
 
-Instance_type: `inf2.xlarge`
-AMI ID: `ami-0ec4ab14b1c5a10f2`
-AMI NAME: `Deep Learning AMI Neuron (Ubuntu 22.04) 20250919` 
-```python
-# CUDA shows non-determinism:
-out1 = torch.mm(a[:1], b)      # M=1
-out2 = torch.mm(a, b)[:1]      # M=2048
-# Result: out1 ≠ out2 (diff: 1669.25)
+## Test Suite Overview
 
-# NKI test:
-out1 = matmul_nki(a[:128], b)[0]   # M=128
-out2 = matmul_nki(a, b)[0]         # M=2048
-# Result: out1 == out2 (diff: 0.0) ✓
-```
+We test three kernel implementations:
+
+1. **MatMul with K_TILE variation** - Demonstrates reduction dimension tiling variance
+2. **RMSNorm (standard)** - Demonstrates natural batch invariance with atomic reductions
+3. **RMSNorm (split reduction)** - Demonstrates hidden dimension tiling variance
+
+Each test compares:
+- **Invariant mode**: Fixed tile size (batch-invariant)
+- **Variant mode**: Adaptive tile size (batch-variant)
+- **Precision impact**: bfloat16 vs float32
 
 ## Results
 
-### Test 1: M_TILE Variation (64 vs 128)
-```
-M_TILE=64  → Result: [9664., 9600., ...]
-M_TILE=128 → Result: [9664., 9600., ...]
-Max difference: 0.0 ✓ INVARIANT
-```
-**Conclusion:** Batch tiling strategy doesn't affect results.
+### Test 1: MatMul - K_TILE Variance
 
-### Test 2: M (Batch Size) Variation (128 vs 2048)
-```
-M=128  → Result: [9664., 9600., ...]
-M=2048 → Result: [9664., 9600., ...]
-Max difference: 0.0 ✓ INVARIANT
-```
-**Conclusion:** True batch invariance achieved. Same element produces identical results regardless of batch size.
+**Configuration**: M=128, K=512, N=512
 
-### Test 3: K_TILE Variation (64 vs 128) - Simulated Dynamic Tiling
 ```
-K_TILE=128 → Result: [9664., 9600., ...]  (32 iterations)
-K_TILE=64  → Result: [9664., 9600., ...]  (64 iterations)
-Max difference: 256.0 ✓ VARIANT (expected)
-```
-**Conclusion:** Reduction order matters. Different K_TILE → different accumulation order → different floating-point results. This simulates what CUDA does when it adapts K strategy based on batch size.
+bfloat16:
+  K_TILE=128 (invariant):  4 accumulations over K dimension
+  K_TILE=64  (variant):    8 accumulations over K dimension
+  Max difference: 0.007812
+  Result: DIFFER ✓
 
-### Test 4: Loop Iterator (affine_range vs sequential_range)
-```
-affine_range     → Result: [9664., 9600., ...]
-sequential_range → Result: [9664., 9600., ...]
-Max difference: 0.0 ✓ INVARIANT
-```
-**Conclusion:** Loop iterator type is a compiler hint; doesn't affect numerical output.
+float32:
+  K_TILE=128 (invariant):  4 accumulations
+  K_TILE=64  (variant):    8 accumulations
+  Max difference: 0.000050
+  Result: DIFFER ✓
 
-### Test 5: Precision Impact (bfloat16 vs float32)
+Precision impact: bfloat16 error is 157x larger than float32
 ```
-bfloat16 K_TILE diff: 256.0    (2.67% relative error)
-float32  K_TILE diff: 15.125   (0.091% relative error)
-Amplification: 16.9x
-```
-**Conclusion:** Lower precision amplifies accumulation order effects. bfloat16's 7-bit mantissa shows 17x larger differences than float32's 23-bit mantissa.
 
-### Test 6: Consistency Check
+**Key Finding**: Different K_TILE sizes create different accumulation orders in the reduction:
+- K_TILE=128: `((chunk0 + chunk1) + chunk2) + chunk3` (4 tiles)
+- K_TILE=64: `(((((((ch0 + ch1) + ch2) + ch3) + ch4) + ch5) + ch6) + ch7)` (8 tiles)
+
+Due to floating-point associativity: `(a + b) + c ≠ a + (b + c)`
+
+### Test 2: RMSNorm (Standard) - Natural Batch Invariance
+
+**Configuration**: batch_size varies, hidden_dim=256
+
 ```
-Run 1: 256.0
-Run 2: 256.0
-Run 3: 256.0
-✓ FULLY DETERMINISTIC
+Same 32 rows computed in:
+  - batch=32 context
+  - batch=128 context
+
+Result: MATCH ✓ (identical)
+Max difference: 0.0
 ```
-**Conclusion:** The K_TILE difference is consistent and repeatable, not random.
+
+**Key Finding**: RMSNorm is naturally batch-invariant because:
+1. Each row computed independently (no inter-row dependencies)
+2. Reduction is atomic: `nl.sum(in_square, axis=[1])` reduces entire hidden dimension at once
+3. Batch tiling only affects parallelism, not computation order
+
+### Test 3: RMSNorm (Split Reduction) - Hidden Dimension Tiling Variance
+
+**Configuration**: batch_size=64, hidden_dim=512
+
+```
+bfloat16:
+  HIDDEN_TILE=256 (invariant):  2 chunks, 1 accumulation
+  HIDDEN_TILE=128 (variant):    4 chunks, 3 accumulations
+  Max difference: 0.007812
+  Result: DIFFER ✓
+
+float32:
+  HIDDEN_TILE=256 (invariant):  2 chunks, 1 accumulation
+  HIDDEN_TILE=128 (variant):    4 chunks, 3 accumulations
+  Max difference: 0.000000
+  Result: IDENTICAL
+
+Precision impact: Variance only visible in bfloat16
+```
+
+**Key Finding**: Split reduction creates variance by tiling the **reduction dimension** (hidden_dim):
+- Standard RMSNorm: `nl.sum(row)` - atomic, invariant
+- Split RMSNorm: `sum(chunk0) + sum(chunk1) + sum(chunk2) + sum(chunk3)` - iterative, variant
+
+**Important**: Float32 precision is sufficient to make simple addition accumulation errors negligible, unlike multiply-accumulate in MatMul.
 
 ## Key Findings
 
-### ✅ Hypothesis Confirmed
+### 🎯 Core Principle: Reduction Dimension Tiling Creates Variance
 
-**NKI IS BATCH INVARIANT**
-- M_TILE doesn't affect results (batch tiling invariant)
-- M (batch size) doesn't affect results (true batch invariance)
-- K_TILE DOES affect results (reduction order matters)
-- But K_TILE is a compile-time constant → fully deterministic
+**Operations are naturally batch-invariant UNTIL:**
 
-### 📊 Comparison: NKI vs CUDA
+1. ✅ You tile the **reduction dimension** (not parallelizable dimensions)
+2. ✅ Tile size changes **dynamically** based on input characteristics  
+3. ✅ Operation uses **iterative accumulation** (not atomic reductions)
 
-| Aspect | CUDA | NKI |
-|--------|------|-----|
-| Batch size affects K reduction? | ✗ Yes (split-K adaptation) | ✅ No (fixed K_TILE) |
-| Run-to-run deterministic? | ✗ No (varies ~1669) | ✅ Yes (always identical) |
-| K_TILE matters? | ✅ Yes | ✅ Yes |
-| Tile size constraints? | Flexible | Hardware-enforced (≤128/512) |
+**Examples:**
+- ❌ **No variance**: RMSNorm batch tiling - tiles parallelizable dimension (batch)
+- ✅ **Creates variance**: MatMul K tiling - tiles reduction dimension with accumulation
+- ✅ **Creates variance**: RMSNorm split reduction - tiles hidden dimension with accumulation
 
-### 🔬 Why NKI Wins
+### 📊 Precision Amplifies Variance
 
-1. **M/K decoupling:** Batch loop (M) is outer, reduction loop (K) is inner. Changing batch size doesn't affect K iteration count.
+| Operation | bfloat16 Error | float32 Error | Amplification |
+|-----------|---------------|---------------|---------------|
+| MatMul (K_TILE) | 0.007812 | 0.000050 | **157x** |
+| RMSNorm Split (HIDDEN_TILE) | 0.007812 | ~0.000000 | Only visible in bfloat16 |
 
-2. **Hardware constraints as a feature:** Tensor Engine limits force compile-time K_TILE constants, preventing runtime adaptation.
+**Critical Insight**: Reduced precision (bfloat16) amplifies tiling variance dramatically:
+- **Multiply-accumulate** (MatMul): Errors compound quickly, visible in both precisions
+- **Pure addition** (RMSNorm sum): Errors compound slowly, only visible in bfloat16
+- **Implication**: bfloat16 users need batch-invariant implementations more urgently
 
-3. **No automatic split-K:** NKI doesn't dynamically switch to split-K based on batch size. You'd need to write a separate kernel.
+### 🔬 Replicating Paper Findings with NKI
 
-## Implications
+Our results directly replicate [Thinking Machines' findings](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/):
 
-**For LLM Inference:**
-- Batch-invariant by default (no special kernels needed like Thinking Machines built for CUDA)
-- Deterministic sampling at temperature=0 (if K_TILE is fixed)
-- True on-policy RL possible (identical numerics between training and inference)
+**Paper's observation (CUDA):**
+> "CUDA adapts K reduction strategy based on batch size, causing non-determinism"
 
-**Caveats:**
-- K_TILE variation causes 2.67% relative error in bfloat16 (acceptable for most LLM use cases)
-- Must use consistent K_TILE across kernels for bitwise reproducibility
-- Lower precision (bfloat16) amplifies accumulation order effects 17x vs float32
+**Our NKI implementation:**
+```python
+# Batch-variant: Mimics CUDA's dynamic strategy
+K_TILE = 64 if K <= 512 else 128
+
+# Batch-invariant: Fixed strategy (paper's solution)
+K_TILE = 128  # Always
+```
+
+**Result**: Same variance pattern observed in NKI when we explicitly code dynamic tiling, confirming the paper's root cause analysis.
+
+### 🛡️ NKI's Natural Protection
+
+**Why NKI tends toward batch-invariance:**
+
+1. **Hardware constraints enforce constants**
+   - Tensor Engine limits: P-dim ≤ 128, free-dim ≤ 512
+   - Encourages fixed compile-time tile sizes
+   - Makes dynamic adaptation less natural
+
+2. **Explicit control over tiling**
+   - Developers explicitly set K_TILE, HIDDEN_TILE, etc.
+   - No "magic" runtime optimization that varies strategy
+   - Batch-invariance is default unless explicitly coded otherwise
+
+3. **Atomic operations where possible**
+   - `nl.sum(entire_dimension)` is atomic - naturally invariant
+   - Only manual tiling creates variance
+
+## Implications for LLM Inference
+
+### ✅ Benefits
+
+1. **Deterministic inference** - Same outputs for temperature=0 sampling regardless of batch size
+2. **On-policy RL** - Training and inference produce identical numerics
+3. **Debugging** - Reproducible results across batch sizes simplifies debugging
+4. **Cache coherence** - KV-cache values identical whether computed individually or batched
+
+### ⚠️ Requirements for Batch-Invariance
+
+1. **Fix reduction tile sizes**
+   ```python
+   # ❌ BAD: Dynamic tiling
+   K_TILE = 64 if K <= 512 else 128
+   
+   # ✅ GOOD: Fixed tiling
+   K_TILE = 128  # Always
+   ```
+
+2. **Use consistent precision**
+   - bfloat16 shows 157x larger variance than float32
+   - Mixed precision can break invariance
+
+3. **Avoid split reductions when possible**
+   - Prefer atomic reductions: `nl.sum(entire_dimension)`
+   - If split necessary, use fixed tile sizes
 
 ## Conclusion
 
-NKI's tile size constraints, enforced by hardware limitations, provide batch invariance as an inherent property rather than requiring specialized implementations. The decoupling of batch size (M) from reduction strategy (K_TILE) ensures that the same element produces identical results regardless of the batch it's computed in.
+NKI naturally encourages batch-invariant implementations through:
+- Hardware-enforced tile size constraints
+- Explicit tiling control (no magic runtime optimization)
+- Atomic reduction operations as primitives
 
-**Bottom line:** CUDA varies K reduction order *unpredictably* based on batch size. NKI keeps it *fixed* based on compile-time K_TILE. That's the win.
+However, variance can still occur when:
+- Manually implementing split reductions with dynamic tile sizes
+- Using reduced precision (bfloat16) with iterative accumulation
+- Adapting strategies based on input characteristics
+
+**Our findings directly replicate the Thinking Machines paper**: Batch variance stems from **dynamic tiling of reduction dimensions**, and the solution is **fixed tiling strategies**. NKI makes this easier by design, but developers must still be intentional about tile size choices, especially when using bfloat16 precision.
+
+## Running the Tests
+
+```bash
+cd contributed/batch_invariance
+python test_batch_invariance.py
+```
+
+**Expected Output:**
+```
+================================================================================
+Testing MatMul batch invariance...
+  Testing with bfloat16:
+    Max difference between K_TILE strategies: 0.007812
+    Results differ
+  Testing with float32:
+    Max difference between K_TILE strategies: 0.000050
+    Results differ
+  Precision impact: bfloat16 error is 157x larger than float32
+
+================================================================================
+Testing RMSNorm batch invariance...
+  First 32 rows: batch=32 vs batch=128: MATCH ✓
+  ✓ RMSNorm is batch-invariant!
+
+================================================================================
+Testing RMSNorm with Split Reduction...
+  Testing with bfloat16:
+    Max difference between HIDDEN_TILE strategies: 0.007812
+    Results differ
+  Testing with float32:
+    Max difference between HIDDEN_TILE strategies: 0.000000
+    Results identical
+```
+
+## Files
+
+- `kernels/matmul_batch_invariant.py` - MatMul with configurable K_TILE
+- `kernels/rmsnorm_batch_invariant.py` - Standard RMSNorm (atomic reduction)
+- `kernels/rmsnorm_split_reduction.py` - RMSNorm with split reduction (demonstrates variance)
+- `test_batch_invariance.py` - Comprehensive test suite
+- `README.md` - This document
+
+## References
+
+- [Thinking Machines: Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+- [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/)
+- [NKI Programming Guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/)
