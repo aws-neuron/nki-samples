@@ -13,7 +13,6 @@ Batch variance occurs when **ALL THREE conditions are met**:
 1. **Tiling the reduction dimension** (not parallelizable dimensions)
    - MatMul: Tiling K (contraction dimension) ✓
    - RMSNorm: Tiling hidden dimension in split reduction ✓
-   - RMSNorm: Tiling batch dimension ✗ (batch is parallelizable)
 
 2. **Iterative accumulation across tiles** (not atomic reductions)
    - `c_psum += matmul(a_tile, b_tile)` ✓ Creates variance
@@ -86,10 +85,10 @@ Result: MATCH ✓ (identical)
 Max difference: 0.0
 ```
 
-**Key Finding**: RMSNorm is naturally batch-invariant because:
-1. Each row computed independently (no inter-row dependencies)
-2. Reduction is atomic: `nl.sum(in_square, axis=[1])` reduces entire hidden dimension at once
-3. Batch tiling only affects parallelism, not computation order
+**RMSNorm remains batch-invariant UNTIL you:**
+- Tile the **hidden dimension** (the reduction axis) instead of the batch dimension
+- Make that tile size **dynamic** based on input characteristics
+- Use **iterative accumulation** across hidden dimension chunks (see Test 3 for this scenario)
 
 ### Test 3: RMSNorm (Split Reduction) - Hidden Dimension Tiling Variance
 
@@ -108,14 +107,14 @@ float32:
   Max difference: 0.000000
   Result: IDENTICAL
 
-Precision impact: Variance only visible in bfloat16
+Precision impact: Variance only visible in bfloat16 for this test
 ```
 
 **Key Finding**: Split reduction creates variance by tiling the **reduction dimension** (hidden_dim):
 - Standard RMSNorm: `nl.sum(row)` - atomic, invariant
 - Split RMSNorm: `sum(chunk0) + sum(chunk1) + sum(chunk2) + sum(chunk3)` - iterative, variant
 
-**Important**: Float32 precision is sufficient to make simple addition accumulation errors negligible, unlike multiply-accumulate in MatMul.
+**Important**: Float32 precision may be sufficient to make simple addition accumulation errors negligible, unlike multiply-accumulate in MatMul.
 
 ## Key Findings
 
@@ -142,7 +141,7 @@ Precision impact: Variance only visible in bfloat16
 **Critical Insight**: Reduced precision (bfloat16) amplifies tiling variance dramatically:
 - **Multiply-accumulate** (MatMul): Errors compound quickly, visible in both precisions
 - **Pure addition** (RMSNorm sum): Errors compound slowly, only visible in bfloat16
-- **Implication**: bfloat16 users need batch-invariant implementations more urgently
+- **Implication**: bfloat16 sees more extreme batch variance
 
 ### 🔬 Replicating Paper Findings with NKI
 
@@ -220,7 +219,7 @@ However, variance can still occur when:
 - Using reduced precision (bfloat16) with iterative accumulation
 - Adapting strategies based on input characteristics
 
-**Our findings directly replicate the Thinking Machines paper**: Batch variance stems from **dynamic tiling of reduction dimensions**, and the solution is **fixed tiling strategies**. NKI makes this easier by design, but developers must still be intentional about tile size choices, especially when using bfloat16 precision.
+**My findings directly replicate the Thinking Machines paper**: Batch variance stems from **dynamic tiling of reduction dimensions**, and the solution is **fixed tiling strategies**. NKI makes this easier by design, but developers must still be intentional about tile size choices, especially when using bfloat16 precision.
 
 ## Running the Tests
 
