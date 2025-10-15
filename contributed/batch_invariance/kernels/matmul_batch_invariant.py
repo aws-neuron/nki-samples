@@ -31,7 +31,6 @@ def nki_matmul_kernel(a, b, batch_invariant=True):
     
     result = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
     
-    # Use EXACT same logic as working matmul_m128
     for m in nl.affine_range(M // M_TILE):
         # Accumulator for this M chunk
         c_psum = nl.zeros((M_TILE, N), dtype=nl.float32, buffer=nl.psum)

@@ -12,9 +12,10 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
   """
   RMSNorm with batch invariance parameter
   
-  This demonstrates TRUE batch invariance testing:
+  This demonstrates batch invariance testing:
   - batch_invariant=True: Always uses tile_size=128 (same strategy regardless of batch)
   - batch_invariant=False: Adapts tile_size based on batch size (different strategies)
+  - This shows that varying the tiling strategy based on batch size does NOT affect results as we are not reducing across the batch dimension
   """
   out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype,
                           buffer=nl.shared_hbm)
@@ -25,13 +26,11 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
   num_rows = a_tensor.shape[0]
   hidden_dim = a_tensor.shape[1]
   
-  # CRITICAL: Tile size based on BATCH SIZE (not hidden_dim)
-  # This is what creates batch variance!
   if batch_invariant:
     # INVARIANT: Fixed strategy regardless of batch size
     tile_size = 128
   else:
-    # VARIANT: Strategy changes based on batch size
+    # Also INVARIANT: Strategy changes based on batch size
     # Small batches get smaller tiles -> different processing pattern
     if num_rows <= 64:
       tile_size = 32  # Small batch: smaller tiles
