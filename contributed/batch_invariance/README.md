@@ -23,6 +23,62 @@ Batch variance occurs when **ALL THREE conditions are met**:
    - NKI (fixed): `K_TILE = 128` always ✗
    - NKI (variant): `K_TILE = 64 if K <= 512 else 128` ✓
 
+```mermaid
+flowchart TD
+    Start[Input Tensor: batch_size x hidden_dim 1024] --> CheckBatch{What is batch_size?}
+    
+    CheckBatch -->|batch < 64| SmallBatch[Small Batch Strategy]
+    CheckBatch -->|64 ≤ batch < 128| MediumBatch[Medium Batch Strategy]
+    CheckBatch -->|batch ≥ 128| LargeBatch[Large Batch Strategy]
+    
+    SmallBatch --> TileSmall[TILE_SIZE = 64]
+    MediumBatch --> TileMedium[TILE_SIZE = 128]
+    LargeBatch --> TileLarge[TILE_SIZE = 256]
+    
+    TileSmall --> ChunkSmall[Split hidden_dim into 16 chunks]
+    TileMedium --> ChunkMedium[Split hidden_dim into 8 chunks]
+    TileLarge --> ChunkLarge[Split hidden_dim into 4 chunks]
+    
+    ChunkSmall --> ReduceSmall[Reduce each chunk:<br/>sum elements 0:64<br/>sum elements 64:128<br/>... 16 partial sums]
+    ChunkMedium --> ReduceMedium[Reduce each chunk:<br/>sum elements 0:128<br/>sum elements 128:256<br/>... 8 partial sums]
+    ChunkLarge --> ReduceLarge[Reduce each chunk:<br/>sum elements 0:256<br/>sum elements 256:512<br/>... 4 partial sums]
+    
+    ReduceSmall --> AccumSmall[Accumulate 16 partials:<br/>p1 + p2 = t1<br/>t1 + p3 = t2<br/>... 15 additions]
+    ReduceMedium --> AccumMedium[Accumulate 8 partials:<br/>p1 + p2 = t1<br/>t1 + p3 = t2<br/>... 7 additions]
+    ReduceLarge --> AccumLarge[Accumulate 4 partials:<br/>p1 + p2 = t1<br/>t1 + p3 = t2<br/>... 3 additions]
+    
+    AccumSmall --> ResultSmall[result_small<br/>15 rounding errors]
+    AccumMedium --> ResultMedium[result_medium<br/>7 rounding errors]
+    AccumLarge --> ResultLarge[result_large<br/>3 rounding errors]
+    
+    ResultSmall --> Compare{Compare Results}
+    ResultMedium --> Compare
+    ResultLarge --> Compare
+    
+    Compare --> NotEqual[❌ result_small ≠ result_medium ≠ result_large<br/>Different accumulation orders<br/>Different floating-point rounding<br/>NON-DETERMINISTIC]
+    
+    NotEqual --> Problem[🔥 PROBLEM: Same input data,<br/>different batch sizes yield<br/>different numerical results!]
+    
+    Problem --> Solution[✅ SOLUTION: Hardcode TILE_SIZE]
+    
+    Solution --> FixedTile[TILE_SIZE = 128 always]
+    FixedTile --> FixedChunks[Always 8 chunks<br/>Always 7 accumulations<br/>for ALL batch sizes]
+    FixedChunks --> Deterministic[✅ DETERMINISTIC RESULTS<br/>batch=32: 8 chunks, 7 adds<br/>batch=96: 8 chunks, 7 adds<br/>batch=256: 8 chunks, 7 adds]
+    
+    style Start fill:#e3f2fd
+    style CheckBatch fill:#fff3e0
+    style SmallBatch fill:#ffebee
+    style MediumBatch fill:#e8eaf6
+    style LargeBatch fill:#f3e5f5
+    style TileSmall fill:#ef5350,color:#fff
+    style TileMedium fill:#42a5f5,color:#fff
+    style TileLarge fill:#ab47bc,color:#fff
+    style NotEqual fill:#ffcdd2
+    style Problem fill:#ff5252,color:#fff
+    style Solution fill:#81c784
+    style Deterministic fill:#66bb6a,color:#fff
+    style FixedTile fill:#4caf50,color:#fff
+```
 ## Test Environment
 
 - **Instance**: `inf2.xlarge` (AWS Trainium)
