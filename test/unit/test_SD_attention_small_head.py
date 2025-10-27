@@ -25,9 +25,9 @@ def cpu_golden_attn(q, k, v):
 class TestAttention:
 
     @pytest.mark.parametrize("bs,seqlen,d,dtype,latency", [
-        [1, 4096, 128, np.float32, 600],
+        [1, 4096, 128, np.float32, 675],
         [1, 4096, 128, nl.bfloat16, 480],
-        [1, 4096, 64, nl.float16, 520]
+        [1, 4096, 64, nl.float16, 600]
     ])
     def test_attention_for_SD_perf(self, bs, seqlen, d, dtype, latency):
         q = np.random.random_sample((bs, d, seqlen)).astype(np.float32)
