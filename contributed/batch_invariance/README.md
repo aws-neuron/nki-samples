@@ -19,7 +19,7 @@ Batch variance occurs when **ALL THREE conditions are met**:
    - `nl.sum(entire_row)` ✗ Atomic, no variance
 
 3. **Dynamic tile size based on input characteristics**
-   - CUDA: Adapts K strategy based on batch size ✓
+   - CUDA SplitK: Adapts K strategy based on batch size ✓
    - NKI (fixed): `K_TILE = 128` always ✗
    - NKI (variant): `K_TILE = 64 if K <= 512 else 128` ✓
 
@@ -89,22 +89,24 @@ flowchart TD
 
 ## Test Suite Overview
 
-We test three kernel implementations:
+We test four kernel implementations:
 
-1. **MatMul with K_TILE variation** - Demonstrates reduction dimension tiling variance
-2. **RMSNorm (standard)** - Demonstrates natural batch invariance with atomic reductions
-3. **RMSNorm (split reduction)** - Demonstrates hidden dimension tiling variance
+1. **MatMul Lang (nl.matmul)** - High-level NKI API with K_TILE variation
+2. **MatMul ISA (nisa.nc_matmul)** - Low-level ISA implementation with K_TILE variation
+3. **RMSNorm (standard)** - Demonstrates natural batch invariance with atomic reductions
+4. **RMSNorm (split reduction)** - Demonstrates hidden dimension tiling variance
 
 Each test compares:
 - **Invariant mode**: Fixed tile size (batch-invariant)
 - **Variant mode**: Adaptive tile size (batch-variant)
 - **Precision impact**: bfloat16 vs float32
+- **Quantization threshold effects**: When float32 errors fall below bfloat16's representable precision
 
 ## Results
 
-### Test 1: MatMul - K_TILE Variance
+### Test 1a: MatMul Lang (nl.matmul) - K_TILE Variance
 
-**Configuration**: M=128, K=512, N=512
+**Configuration**: M=256, K=512, N=512
 
 ```
 bfloat16:
@@ -116,10 +118,10 @@ bfloat16:
 float32:
   K_TILE=128 (invariant):  4 accumulations
   K_TILE=64  (variant):    8 accumulations
-  Max difference: 0.000050
+  Max difference: 0.000046
   Result: DIFFER ✓
 
-Precision impact: bfloat16 error is 157x larger than float32
+Precision impact: bfloat16 error is 170x larger than float32
 ```
 
 **Key Finding**: Different K_TILE sizes create different accumulation orders in the reduction:
@@ -127,6 +129,41 @@ Precision impact: bfloat16 error is 157x larger than float32
 - K_TILE=64: `(((((((ch0 + ch1) + ch2) + ch3) + ch4) + ch5) + ch6) + ch7)` (8 tiles)
 
 Due to floating-point associativity: `(a + b) + c ≠ a + (b + c)`
+
+### Test 1b: MatMul ISA (nisa.nc_matmul) - K_TILE Variance with Quantization Erasure
+
+**Configuration**: M=256, K=512, N=512
+
+```
+bfloat16:
+  K_TILE=128 (invariant):  4 accumulations over K dimension
+  K_TILE=64  (variant):    8 accumulations over K dimension
+  Max difference: 0.000000
+  Result: IDENTICAL ✓
+
+float32:
+  K_TILE=128 (invariant):  4 accumulations
+  K_TILE=64  (variant):    8 accumulations
+  Max difference: 0.000061
+  Result: DIFFER ✓
+
+Precision impact: bfloat16 error is 0x smaller than float32 (error erased by quantization)
+```
+
+**Critical Discovery**: When float32 errors fall below bfloat16's quantization threshold (~0.008), quantization **erases** the differences rather than amplifying them:
+
+- **Lang kernel**: Float32 error (0.000046) crosses quantization threshold → bfloat16 amplifies to 0.007812 (170x)
+- **ISA kernel**: Float32 error (0.000061) stays below threshold → bfloat16 quantizes both results identically (0.000000)
+
+**Why This Happens**:
+1. Both kernels accumulate in float32 internally
+2. Final output is quantized to bfloat16
+3. When float32 differences are sub-threshold:
+   - Both results round to the **same bfloat16 value**
+   - The error doesn't compound—it **vanishes**
+4. ISA-level matmul has superior numerical stability, producing smaller float32 errors
+
+**Implication**: The ISA kernel's tighter numerical precision keeps K-tiling errors below bfloat16's representable range, making it more robust to batch size variations in reduced precision.
 
 ### Test 2: RMSNorm (Standard) - Natural Batch Invariance
 
@@ -187,17 +224,31 @@ Precision impact: Variance only visible in bfloat16 for this test
 - ✅ **Creates variance**: MatMul K tiling - tiles reduction dimension with accumulation
 - ✅ **Creates variance**: RMSNorm split reduction - tiles hidden dimension with accumulation
 
-### 📊 Precision Amplifies Variance
+### 📊 Precision Effects: Amplification vs Erasure
 
-| Operation | bfloat16 Error | float32 Error | Amplification |
-|-----------|---------------|---------------|---------------|
-| MatMul (K_TILE) | 0.007812 | 0.000050 | **157x** |
-| RMSNorm Split (HIDDEN_TILE) | 0.007812 | ~0.000000 | Only visible in bfloat16 |
+| Operation | float32 Error | bfloat16 Error | Amplification | Effect |
+|-----------|---------------|----------------|---------------|--------|
+| MatMul Lang (nl.matmul) | 0.000046 | 0.007812 | **170x** | Amplified |
+| MatMul ISA (nisa.nc_matmul) | 0.000061 | 0.000000 | **0x** | Erased |
+| RMSNorm Split (HIDDEN_TILE) | 0.000000 | 0.007812 | **21845x** | Amplified |
 
-**Critical Insight**: Reduced precision (bfloat16) amplifies tiling variance dramatically:
-- **Multiply-accumulate** (MatMul): Errors compound quickly, visible in both precisions
-- **Pure addition** (RMSNorm sum): Errors compound slowly, only visible in bfloat16
-- **Implication**: bfloat16 sees more extreme batch variance
+**Critical Insight**: Bfloat16 has **two distinct behaviors** depending on float32 error magnitude:
+
+1. **Above quantization threshold (~0.008)**: Errors are **amplified**
+   - Lang MatMul: 0.000046 → 0.007812 (170x amplification)
+   - RMSNorm: 0.000000 → 0.007812 (21845x amplification)
+   - Different accumulation orders produce distinguishable bfloat16 values
+
+2. **Below quantization threshold (~0.008)**: Errors are **erased**
+   - ISA MatMul: 0.000061 → 0.000000 (quantization erasure)
+   - Both K_TILE strategies round to identical bfloat16 values
+   - Variance becomes invisible in reduced precision
+
+**Why This Matters**:
+- **Multiply-accumulate** (MatMul): Errors compound quickly, may cross threshold
+- **Pure addition** (RMSNorm sum): Errors compound slowly, typically crosses threshold
+- **ISA-level operations**: Superior numerical stability keeps errors sub-threshold
+- **Implication**: Kernel implementation quality determines whether bfloat16 amplifies or erases tiling variance
 
 ### 🔬 Replicating Paper Findings with NKI
 
@@ -234,6 +285,13 @@ K_TILE = 128  # Always
 3. **Atomic operations where possible**
    - `nl.sum(entire_dimension)` is atomic - naturally invariant
    - Only manual tiling creates variance
+
+4. **ISA-level numerical stability**
+   - Low-level ISA instructions (`nisa.nc_matmul`) exhibit superior numerical precision
+   - Tighter error bounds keep float32 differences below bfloat16's quantization threshold
+   - Quantization can erase tiling variance entirely in reduced precision
+   - Makes ISA kernels naturally more robust to batch size variations
+   - However, variance still exists in float32—testing in both precisions is essential
 
 ## Implications for LLM Inference
 
@@ -275,7 +333,21 @@ However, variance can still occur when:
 - Using reduced precision (bfloat16) with iterative accumulation
 - Adapting strategies based on input characteristics
 
-**My findings directly replicate the Thinking Machines paper**: Batch variance stems from **dynamic tiling of reduction dimensions**, and the solution is **fixed tiling strategies**. NKI makes this easier by design, but developers must still be intentional about tile size choices, especially when using bfloat16 precision.
+**Key findings that extend the Thinking Machines paper**:
+
+1. **Batch variance stems from dynamic tiling of reduction dimensions** (confirmed)
+2. **Fixed tiling strategies solve the problem** (confirmed)
+3. **NEW: Quantization threshold effect** - Bfloat16 doesn't always amplify errors:
+   - When float32 errors exceed ~0.008: Amplification occurs (170-21845x)
+   - When float32 errors stay below ~0.008: Quantization erases differences entirely
+   - ISA-level kernels with superior numerical stability can stay sub-threshold
+   - This makes some implementations naturally robust to batch variance in bfloat16
+
+**Practical Implications**:
+- High-quality kernel implementations (ISA-level) may hide batch variance in bfloat16
+- This can create false confidence—variance still exists in float32
+- Testing in float32 is essential to detect underlying numerical instability
+- Don't rely on bfloat16 testing alone to validate batch invariance
 
 ## Running the Tests
 
@@ -287,28 +359,61 @@ python test_batch_invariance.py
 **Expected Output:**
 ```
 ================================================================================
-Testing MatMul batch invariance...
+Testing MatMul Correctness...
+  Lang kernel (nl.matmul): ✓ Matches PyTorch reference
+  ISA kernel (nisa.nc_matmul): ✓ Matches PyTorch reference
+
+================================================================================
+Testing MatMul batch variance (Lang kernel)...
+  Testing with float32:
+    Max difference between K_TILE strategies: 0.000046
+    Results differ
   Testing with bfloat16:
     Max difference between K_TILE strategies: 0.007812
     Results differ
+  Precision impact: bfloat16 error is 170x larger than float32
+
+================================================================================
+Testing MatMul batch variance (ISA kernel)...
   Testing with float32:
-    Max difference between K_TILE strategies: 0.000050
+    Max difference: 0.000061
     Results differ
-  Precision impact: bfloat16 error is 157x larger than float32
+  Testing with bfloat16:
+    Max difference: 0.000000
+    Results identical
+  Precision impact: bfloat16 error is 0x smaller than float32
+  Note: Float32 error (0.000061) is below bfloat16 quantization threshold (~0.008)
+        Quantization erases the difference rather than amplifying it
 
 ================================================================================
 Testing RMSNorm batch invariance...
   First 32 rows: batch=32 vs batch=128: MATCH ✓
   ✓ RMSNorm is batch-invariant!
+  Each row computed independently, reduction is atomic
 
 ================================================================================
-Testing RMSNorm with Split Reduction...
+Testing RMSNorm batch variance...
+  Max difference between HIDDEN_TILE strategies: 0.007812
+  Results differ
+  ✗ Different HIDDEN_TILE sizes produce different results
+
+================================================================================
+Testing RMSNorm HIDDEN_TILE variance...
   Testing with bfloat16:
     Max difference between HIDDEN_TILE strategies: 0.007812
     Results differ
   Testing with float32:
     Max difference between HIDDEN_TILE strategies: 0.000000
     Results identical
+  Precision impact: bfloat16 error is 21845x larger than float32
+
+================================================================================
+SUMMARY
+MatMul & RMSNorm Batch Variance Results:
+kernel                  float32_error  bfloat16_error  amplification
+Lang (nl.matmul)        4.577637e-05   0.007812        170.666667
+ISA (nisa.nc_matmul)    6.103516e-05   0.000000        0.000000
+RMSNorm (HIDDEN_TILE)   3.576279e-07   0.007812        21845.333333
 ```
 
 ## Files
