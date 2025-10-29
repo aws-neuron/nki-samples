@@ -1,5 +1,8 @@
 """
-Batch-Invariant RMSNorm Kernel
+RMSNorm to demonstrate Batch Variance
+
+This kernel tiles the HIDDEN DIMENSION (reduction axis) instead of just the batch dimension.
+This creates different accumulation orders and breaks batch-invariance!
 """
 
 import math
@@ -9,73 +12,93 @@ import neuronxcc.nki.language as nl
 
 @nki.jit
 def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
-  """
-  RMSNorm with batch invariance parameter
-  
-  This demonstrates batch invariance testing:
-  - batch_invariant=True: Always uses tile_size=128 (same strategy regardless of batch)
-  - batch_invariant=False: Adapts tile_size based on batch size (different strategies)
-  - This shows that varying the tiling strategy based on batch size does NOT affect results as we are not reducing across the batch dimension
-  """
-  out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype,
-                          buffer=nl.shared_hbm)
-
-  # Make sure shapes match
-  assert a_tensor.shape[1] == g_tensor.shape[0]
-
-  num_rows = a_tensor.shape[0]
-  hidden_dim = a_tensor.shape[1]
-  
-  if batch_invariant:
-    # INVARIANT: Fixed strategy regardless of batch size
-    tile_size = 128
-  else:
-    # Also INVARIANT: Strategy changes based on batch size
-    # Small batches get smaller tiles -> different processing pattern
-    if num_rows <= 64:
-      tile_size = 32  # Small batch: smaller tiles
+    """
+    RMSNorm with split reduction along hidden dimension
+    
+    batch_invariant=True:  HIDDEN_TILE=256 (fewer chunks, fewer accumulations)
+    batch_invariant=False: HIDDEN_TILE=128 (more chunks, more accumulations)
+    
+    This demonstrates REAL batch variance because different tile sizes
+    change the order of floating-point additions during reduction.
+    """
+    out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype,
+                            buffer=nl.shared_hbm)
+    
+    assert a_tensor.shape[1] == g_tensor.shape[0]
+    
+    num_rows = a_tensor.shape[0]
+    hidden_dim = a_tensor.shape[1]
+    BATCH_TILE = 128
+    
+    # CRITICAL: Tile size for REDUCTION dimension (hidden_dim)
+    # Different sizes = different number of accumulations = variance!
+    if batch_invariant:
+        HIDDEN_TILE = 256  # Fewer chunks (e.g., 2 for hidden_dim=512)
     else:
-      tile_size = 128  # Large batch: larger tiles
-  
-  # Generate tensor indices based on tile_size
-  ix = nl.arange(tile_size)[:, None]
-  iw = nl.arange(1)[:, None]
-  iy = nl.arange(hidden_dim)[None, :]
-
-  # Load RMSNorm weight once
-  g_tile = nl.load(g_tensor.reshape((1, hidden_dim))[iw, iy])
-
-  # Process tile_size rows at a time
-  for i in nl.affine_range(math.ceil(num_rows / tile_size)):
-
-    # Load input data from external memory to on-chip memory
-    a_tile = nl.load(a_tensor[i * tile_size + ix, iy],
-                    mask=(i * tile_size + ix < num_rows))
-
-    # Compute element-wise square of a_tensor
-    in_square = nl.square(a_tile)
-
-    # Calculate sum of squared elements, along last dimension
-    square_sum = nl.sum(in_square, axis=[1])
-
-    # Scale and get a reciprocal
-    mean = square_sum / hidden_dim
-
-    # Take square root of mean and then reciprocal with rsqrt API
-    rms_reciprocal = nl.rsqrt(mean)
-
-    # Scale the input tensor
-    out_tile = nl.multiply(a_tile, rms_reciprocal)
-
-    # Broadcast weight along first axis to match tensor shape
-    g_bcast = g_tile.broadcast_to((tile_size, hidden_dim))
-
-    # Multiply with the RMSNorm weight
-    out_tile[...] = nl.multiply(out_tile, g_bcast,
-                           mask=(i * tile_size + ix < num_rows))
-
-    # store the results back to external memory
-    nl.store(out_tensor[i * tile_size + ix, iy], value=out_tile,
-            mask=(i * tile_size + ix < num_rows))
-
-  return out_tensor
+        HIDDEN_TILE = 128  # More chunks (e.g., 4 for hidden_dim=512)
+    
+    ix = nl.arange(BATCH_TILE)[:, None]
+    iw = nl.arange(1)[:, None]
+    
+    # Process batch in tiles
+    for i in nl.affine_range(math.ceil(num_rows / BATCH_TILE)):
+        
+        # SPLIT REDUCTION: Accumulate partial sums across hidden dimension chunks
+        # Use PSUM for accumulation (always float32 internally)
+        partial_square_sum = nl.zeros((BATCH_TILE, 1), dtype=nl.float32, buffer=nl.psum)
+        
+        # Iterate over hidden dimension in chunks
+        num_hidden_tiles = math.ceil(hidden_dim / HIDDEN_TILE)
+        for h in nl.affine_range(num_hidden_tiles):
+            h_start = h * HIDDEN_TILE
+            
+            # Create indices for this hidden chunk (always use full HIDDEN_TILE, mask later)
+            iy = nl.arange(HIDDEN_TILE)[None, :]
+            
+            # Create mask for valid hidden indices
+            valid_mask = ((i * BATCH_TILE + ix < num_rows) & 
+                         (h * HIDDEN_TILE + iy < hidden_dim))
+            
+            # Load a CHUNK of the hidden dimension with proper indexing
+            a_chunk = nl.load(
+                a_tensor[i * BATCH_TILE + ix, h * HIDDEN_TILE + iy],
+                mask=valid_mask
+            )
+            
+            # Square this chunk
+            in_square_chunk = nl.square(a_chunk)
+            
+            # Reduce this chunk (sum along hidden dimension)
+            # Mask ensures we only sum valid elements
+            chunk_sum = nl.sum(in_square_chunk, axis=[1], keepdims=True, 
+                              mask=valid_mask)
+            
+            # ACCUMULATE: This is where variance enters!
+            # Different HIDDEN_TILE sizes mean different number of additions
+            partial_square_sum += chunk_sum
+        
+        # Compute mean and RMS
+        mean = partial_square_sum / hidden_dim
+        rms_reciprocal = nl.rsqrt(mean)
+        
+        # Now load full row for normalization
+        iy_full = nl.arange(hidden_dim)[None, :]
+        a_tile = nl.load(
+            a_tensor[i * BATCH_TILE + ix, iy_full],
+            mask=(i * BATCH_TILE + ix < num_rows)
+        )
+        
+        # Normalize by RMS
+        out_tile = nl.multiply(a_tile, rms_reciprocal)
+        
+        # Apply weight
+        g_tile = nl.load(g_tensor.reshape((1, hidden_dim))[iw, iy_full])
+        g_bcast = g_tile.broadcast_to((BATCH_TILE, hidden_dim))
+        out_tile = nl.multiply(out_tile, g_bcast,
+                              mask=(i * BATCH_TILE + ix < num_rows))
+        
+        # Store result
+        nl.store(out_tensor[i * BATCH_TILE + ix, iy_full], value=out_tile,
+                mask=(i * BATCH_TILE + ix < num_rows))
+    
+    return out_tensor
