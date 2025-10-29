@@ -150,20 +150,24 @@ float32:
 Precision impact: bfloat16 error is 0x smaller than float32 (error erased by quantization)
 ```
 
-**Critical Discovery**: When float32 errors fall below bfloat16's quantization threshold (~0.008), quantization **erases** the differences rather than amplifying them:
+**Critical Discovery**: Identical tiling variance can be visible or invisible in bfloat16 depending on implementation—not because of error magnitude, but because of **quantization alignment**.
 
-- **Lang kernel**: Float32 error (0.000046) crosses quantization threshold → bfloat16 amplifies to 0.007812 (170x)
-- **ISA kernel**: Float32 error (0.000061) stays below threshold → bfloat16 quantizes both results identically (0.000000)
+- **Lang kernel**: Float32 error (0.000046) → bfloat16 amplifies to 0.007812 (170x)
+- **ISA kernel**: Float32 error (0.000061) → bfloat16 erases to 0.000000
 
-**Why This Happens**:
-1. Both kernels accumulate in float32 internally
-2. Final output is quantized to bfloat16
-3. When float32 differences are sub-threshold:
-   - Both results round to the **same bfloat16 value**
-   - The error doesn't compound—it **vanishes**
-4. ISA-level matmul has superior numerical stability, producing smaller float32 errors
+**The Quantization Alignment Effect**:
 
-**Implication**: The ISA kernel's tighter numerical precision keeps K-tiling errors below bfloat16's representable range, making it more robust to batch size variations in reduced precision.
+Both implementations produce small float32 errors (< 0.008), yet they behave completely differently in bfloat16. The difference isn't error magnitude—it's whether the two tiling strategies produce float32 values that fall into the **same or different bfloat16 quantization buckets**.
+
+1. **ISA kernel**: The two K_TILE strategies yield float32 outputs that, despite differing by 0.000061, happen to quantize to **identical bfloat16 values**. The variance exists in float32 but becomes invisible after quantization.
+
+2. **Lang kernel**: The two K_TILE strategies produce float32 outputs that fall into **different bfloat16 quantization buckets**. The 0.000046 float32 difference crosses a quantization boundary, manifesting as a full 0.007812 bfloat16 step.
+
+**Why This Matters**:
+
+ISA's superior numerical stability doesn't just produce smaller errors—it produces errors that **align better with bfloat16 quantization boundaries**, making variance less likely to manifest in reduced precision. However, the variance still exists in float32.
+
+**Implication**: ISA-level implementations may appear batch-invariant in bfloat16 while still exhibiting variance in float32. Testing in bfloat16 alone is insufficient—the underlying numerical instability remains and may compound in deeper networks.
 
 ### Test 2: RMSNorm (Standard) - Natural Batch Invariance
 
@@ -232,23 +236,23 @@ Precision impact: Variance only visible in bfloat16 for this test
 | MatMul ISA (nisa.nc_matmul) | 0.000061 | 0.000000 | **0x** | Erased |
 | RMSNorm Split (HIDDEN_TILE) | 0.000000 | 0.007812 | **21845x** | Amplified |
 
-**Critical Insight**: Bfloat16 has **two distinct behaviors** depending on float32 error magnitude:
+**Critical Insight**: Bfloat16 has **two distinct behaviors** depending on quantization alignment:
 
-1. **Above quantization threshold (~0.008)**: Errors are **amplified**
+1. **Errors cross quantization boundaries**: Variance is **amplified**
    - Lang MatMul: 0.000046 → 0.007812 (170x amplification)
    - RMSNorm: 0.000000 → 0.007812 (21845x amplification)
-   - Different accumulation orders produce distinguishable bfloat16 values
+   - Different accumulation orders produce float32 values in different bfloat16 buckets
 
-2. **Below quantization threshold (~0.008)**: Errors are **erased**
+2. **Errors stay within quantization boundaries**: Variance is **erased**
    - ISA MatMul: 0.000061 → 0.000000 (quantization erasure)
-   - Both K_TILE strategies round to identical bfloat16 values
+   - Different accumulation orders produce float32 values in the same bfloat16 bucket
    - Variance becomes invisible in reduced precision
 
 **Why This Matters**:
-- **Multiply-accumulate** (MatMul): Errors compound quickly, may cross threshold
-- **Pure addition** (RMSNorm sum): Errors compound slowly, typically crosses threshold
-- **ISA-level operations**: Superior numerical stability keeps errors sub-threshold
-- **Implication**: Kernel implementation quality determines whether bfloat16 amplifies or erases tiling variance
+- **Multiply-accumulate** (MatMul): Errors compound quickly, more likely to cross boundaries
+- **Pure addition** (RMSNorm sum): Errors compound slowly, typically crosses boundaries
+- **ISA-level operations**: Superior numerical stability produces errors that align better with quantization boundaries
+- **Implication**: Kernel implementation quality determines whether bfloat16 amplifies or erases tiling variance through quantization alignment, not just error magnitude
 
 ### 🔬 Replicating Paper Findings with NKI
 
@@ -286,12 +290,12 @@ K_TILE = 128  # Always
    - `nl.sum(entire_dimension)` is atomic - naturally invariant
    - Only manual tiling creates variance
 
-4. **ISA-level numerical stability**
+4. **ISA-level numerical stability and quantization alignment**
    - Low-level ISA instructions (`nisa.nc_matmul`) exhibit superior numerical precision
-   - Tighter error bounds keep float32 differences below bfloat16's quantization threshold
-   - Quantization can erase tiling variance entirely in reduced precision
-   - Makes ISA kernels naturally more robust to batch size variations
-   - However, variance still exists in float32—testing in both precisions is essential
+   - Produces errors that align better with bfloat16 quantization boundaries
+   - Different tiling strategies may quantize to identical bfloat16 values, erasing variance
+   - Makes ISA kernels appear more robust to batch size variations in reduced precision
+   - However, variance still exists in float32—comprehensive testing in both precisions is essential
 
 ## Implications for LLM Inference
 
@@ -337,11 +341,11 @@ However, variance can still occur when:
 
 1. **Batch variance stems from dynamic tiling of reduction dimensions** (confirmed)
 2. **Fixed tiling strategies solve the problem** (confirmed)
-3. **NEW: Quantization threshold effect** - Bfloat16 doesn't always amplify errors:
-   - When float32 errors exceed ~0.008: Amplification occurs (170-21845x)
-   - When float32 errors stay below ~0.008: Quantization erases differences entirely
-   - ISA-level kernels with superior numerical stability can stay sub-threshold
-   - This makes some implementations naturally robust to batch variance in bfloat16
+3. **NEW: Quantization alignment effect** - Bfloat16 doesn't always amplify errors:
+   - When float32 differences cross quantization boundaries: Amplification occurs (170-21845x)
+   - When float32 differences stay within quantization boundaries: Variance is erased entirely
+   - ISA-level kernels with superior numerical stability produce errors that align better with boundaries
+   - This makes some implementations appear robust to batch variance in bfloat16, while variance still exists in float32
 
 **Practical Implications**:
 - High-quality kernel implementations (ISA-level) may hide batch variance in bfloat16
