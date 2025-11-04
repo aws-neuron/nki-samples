@@ -6,7 +6,7 @@ import torch
 import time
 import torch_neuronx
 import numpy as np
-from kernels.rmsnorm_batch_invariant import nki_rmsnorm_kernel
+from kernels.rmsnorm_batch_invariant import nki_rmsnorm_kernel_lang, nki_rmsnorm_kernel_isa
 from kernels.matmul_batch_invariant import nki_matmul_kernel_isa, nki_matmul_kernel_lang
 
 # Prove that the kernels match pytorch and are functionally correct
@@ -254,108 +254,22 @@ def test_matmul_lang():
         "amplification": ratio
     }
 
-def test_rmsnorm_invariant():
-    """
-    RMSNorm demonstrates batch INVARIANCE with consistent tiling.
-    
-    When using the same batch_invariant=True setting, results should be
-    identical regardless of batch size because each row is computed independently.
-    
-    Returns:
-        dict: Test results showing invariance
-    """
-    print("Testing RMSNorm batch invariance...")
-    
-    device = 'xla'
-    hidden_dim = 256
-    
-    # Create a large input with many rows
-    large_batch = 128
-    a_large = torch.linspace(-1, 1, large_batch * hidden_dim, device=device).reshape(large_batch, hidden_dim).to(torch.bfloat16)
-    g = torch.ones(hidden_dim, device=device, dtype=torch.bfloat16)
-    
-    # Test the SAME 32 rows in different batch contexts
-    a_small = a_large[:32, :]
-    
-    # Process as small batch (32 rows)
-    result_small = nki_rmsnorm_kernel(a_small, g, batch_invariant=True)
-    
-    # Process as part of large batch (128 rows)
-    result_large = nki_rmsnorm_kernel(a_large, g, batch_invariant=True)
-    
-    # Compare the SAME rows
-    diff = torch.max(torch.abs(result_small - result_large[:32])).item()
-    match = diff < 1e-6
-    
-    print(f"  First 32 rows: batch=32 vs batch=128: {'MATCH ✓' if match else 'DIFFER ✗'}")
-    print(f"  Max difference: {diff:.6f}")
-    
-    if match:
-        print(f"  ✓ RMSNorm is batch-invariant!")
-        print(f"    Each row computed independently, reduction is atomic")
-        print(f"    Tile size only affects parallelism, not computation order")
-    
-    return {
-        "test": "RMSNorm Invariant",
-        "max_difference": diff,
-        "is_invariant": match
-    }
-
-def test_rmsnorm_variant():
-    """
-    RMSNorm demonstrates batch VARIANCE with different tiling strategies.
-    
-    When using different batch_invariant settings (True vs False), results may
-    differ due to different HIDDEN_TILE sizes affecting reduction chunking.
-    
-    Returns:
-        dict: Test results showing variance
-    """
-    print("Testing RMSNorm batch variance...")
-    
-    device = 'xla'
-    hidden_dim = 256
-    
-    # Create a large input with many rows
-    large_batch = 128
-    a_large = torch.linspace(-1, 1, large_batch * hidden_dim, device=device).reshape(large_batch, hidden_dim).to(torch.bfloat16)
-    g = torch.ones(hidden_dim, device=device, dtype=torch.bfloat16)
-    
-    # Test the SAME 32 rows in different batch contexts
-    a_small = a_large[:32, :]
-    
-    # Process as small batch (32 rows) with batch_invariant=True
-    result_small = nki_rmsnorm_kernel(a_small, g, batch_invariant=True)
-    
-    # Process as part of large batch (128 rows) with batch_invariant=False
-    result_large = nki_rmsnorm_kernel(a_large, g, batch_invariant=False)
-    
-    diff_bf16 = torch.max(torch.abs(result_small - result_large[:32])).item()
-    print(f"  Max difference between HIDDEN_TILE strategies: {diff_bf16:.6f}")
-    print(f"  Results {'identical' if diff_bf16 < 1e-6 else 'differ'}")
-    
-    if diff_bf16 > 1e-6:
-        print(f"  ✗ Different HIDDEN_TILE sizes produce different results")
-        print(f"    This demonstrates tiling strategy affects reduction order")
-    
-    return {
-        "test": "RMSNorm Variant",
-        "max_difference": diff_bf16,
-        "is_invariant": diff_bf16 < 1e-6
-    }
 
 
-def test_rmsnorm_accuracy_diff():
+
+def test_rmsnorm_lang():
     """
-    RMSNorm HIDDEN_TILE variance with precision effects.
+    RMSNorm Lang kernel HIDDEN_TILE variance with precision effects.
     
-    Tests how different HIDDEN_TILE sizes affect reduction chunking and
-    whether precision amplifies these differences.
+    Uses nl.load, nl.store, nl.sum for data movement and reduction.
+    Different HIDDEN_TILE sizes create different reduction orders.
+    
+    Expected: Shows variance in both float32 and bfloat16
     
     Returns:
         dict: Test results with float32 and bfloat16 errors
     """
-    print("Testing RMSNorm HIDDEN_TILE variance...")
+    print("Testing RMSNorm batch variance (Lang kernel)...")
     device = 'xla'
     hidden_dim = 512
     large_batch = 128
@@ -366,59 +280,128 @@ def test_rmsnorm_accuracy_diff():
     print(f"    batch_invariant=False: HIDDEN_TILE=128 (4 chunks, 3 accumulations)")
     print()
     
-    # Test with bfloat16
-    print("  Testing with bfloat16:")
-    a_large_bf16 = torch.linspace(-1, 1, large_batch * hidden_dim, device=device).reshape(large_batch, hidden_dim).to(torch.bfloat16)
-    g_bf16 = torch.ones(hidden_dim, device=device, dtype=torch.bfloat16)
-    
-    # Test the SAME 32 rows in different batch contexts
-    a_small_bf16 = a_large_bf16[:small_batch, :]
-    
-    # Process as small batch (32 rows)
-    result_small_bf16 = nki_rmsnorm_kernel(a_small_bf16, g_bf16, batch_invariant=True)   # HIDDEN_TILE=256
-    
-    # Process as part of large batch (128 rows)
-    result_large_bf16 = nki_rmsnorm_kernel(a_large_bf16, g_bf16, batch_invariant=False)  # HIDDEN_TILE=128
-    
-    # Compare the SAME rows
-    diff_bf16 = torch.max(torch.abs(result_small_bf16 - result_large_bf16[:small_batch])).item()
-    print(f"    Max difference between HIDDEN_TILE strategies: {diff_bf16:.6f}")
-    print(f"    Results {'identical' if diff_bf16 < 1e-6 else 'differ'}")
-    print()
-    
-    # Test with float32
-    print("  Testing with float32:")
+    # Create data ONCE in float32
+    print("  Creating data in float32...")
     a_large_f32 = torch.linspace(-1, 1, large_batch * hidden_dim, device=device).reshape(large_batch, hidden_dim).to(torch.float32)
     g_f32 = torch.ones(hidden_dim, device=device, dtype=torch.float32)
     
-    # Test the SAME 32 rows in different batch contexts
+    # Test with float32 FIRST
+    print("  Testing with float32:")
     a_small_f32 = a_large_f32[:small_batch, :]
     
-    # Process as small batch (32 rows)
-    result_small_f32 = nki_rmsnorm_kernel(a_small_f32, g_f32, batch_invariant=True)   # HIDDEN_TILE=256
+    result_small_f32 = nki_rmsnorm_kernel_lang(a_small_f32, g_f32, batch_invariant=True)
+    result_large_f32 = nki_rmsnorm_kernel_lang(a_large_f32, g_f32, batch_invariant=False)
     
-    # Process as part of large batch (128 rows)
-    result_large_f32 = nki_rmsnorm_kernel(a_large_f32, g_f32, batch_invariant=False)  # HIDDEN_TILE=128
-    
-    # Compare the SAME rows
     diff_f32 = torch.max(torch.abs(result_small_f32 - result_large_f32[:small_batch])).item()
     print(f"    Max difference between HIDDEN_TILE strategies: {diff_f32:.6f}")
     print(f"    Results {'identical' if diff_f32 < 1e-6 else 'differ'}")
     print()
     
+    # Cast to bfloat16
+    print("  Testing with bfloat16:")
+    a_large_bf16 = a_large_f32.to(torch.bfloat16)
+    g_bf16 = g_f32.to(torch.bfloat16)
+    a_small_bf16 = a_large_bf16[:small_batch, :]
+    
+    result_small_bf16 = nki_rmsnorm_kernel_lang(a_small_bf16, g_bf16, batch_invariant=True)
+    result_large_bf16 = nki_rmsnorm_kernel_lang(a_large_bf16, g_bf16, batch_invariant=False)
+    
+    diff_bf16 = torch.max(torch.abs(result_small_bf16 - result_large_bf16[:small_batch])).item()
+    print(f"    Max difference between HIDDEN_TILE strategies: {diff_bf16:.6f}")
+    print(f"    Results {'identical' if diff_bf16 < 1e-6 else 'differ'}")
+    print()
+    
     if diff_f32 > 0:
         ratio = diff_bf16 / diff_f32
         print(f"  Precision impact: bfloat16 error is {ratio:.2f}x {'larger' if diff_bf16 > diff_f32 else 'smaller'} than float32")
+        print(f"  Lang kernel shows variance due to different reduction chunking")
     else:
         ratio = 0.0
         print(f"  Precision impact: N/A (no float32 difference detected)")
     
     return {
-        "kernel": "RMSNorm (HIDDEN_TILE)",
+        "kernel": "RMSNorm Lang (nl.sum)",
         "float32_error": diff_f32,
         "bfloat16_error": diff_bf16,
         "amplification": ratio
     }
+
+
+def test_rmsnorm_isa():
+    """
+    RMSNorm ISA kernel demonstrates batch INVARIANCE.
+    
+    Uses nisa.dma_copy and nisa.tensor_reduce with skip_middle_end_transformations.
+    Despite different HIDDEN_TILE sizes, ISA produces identical results.
+    
+    Expected: No variance in either float32 or bfloat16
+    Reason: ISA-level operations are deterministic regardless of tiling strategy
+    
+    Returns:
+        dict: Test results with float32 and bfloat16 errors (should be 0.0)
+    """
+    print("Testing RMSNorm batch INVARIANCE (ISA kernel)...")
+    device = 'xla'
+    hidden_dim = 512
+    large_batch = 128
+    small_batch = 32
+    
+    print(f"  hidden_dim={hidden_dim}")
+    print(f"    batch_invariant=True:  HIDDEN_TILE=256 (2 chunks, 1 accumulation)")
+    print(f"    batch_invariant=False: HIDDEN_TILE=128 (4 chunks, 3 accumulations)")
+    print(f"  Note: ISA kernel uses @skip_middle_end_transformations")
+    print()
+    
+    # Create data ONCE in float32
+    print("  Creating data in float32...")
+    a_large_f32 = torch.linspace(-1, 1, large_batch * hidden_dim, device=device).reshape(large_batch, hidden_dim).to(torch.float32)
+    g_f32 = torch.ones(hidden_dim, device=device, dtype=torch.float32)
+    
+    # Test with float32 FIRST
+    print("  Testing with float32:")
+    a_small_f32 = a_large_f32[:small_batch, :]
+    
+    result_small_f32 = nki_rmsnorm_kernel_isa(a_small_f32, g_f32, batch_invariant=True)
+    result_large_f32 = nki_rmsnorm_kernel_isa(a_large_f32, g_f32, batch_invariant=False)
+    
+    diff_f32 = torch.max(torch.abs(result_small_f32 - result_large_f32[:small_batch])).item()
+    print(f"    Max difference between HIDDEN_TILE strategies: {diff_f32:.6f}")
+    print(f"    Results {'identical' if diff_f32 < 1e-6 else 'differ'}")
+    print()
+    
+    # Cast to bfloat16
+    print("  Testing with bfloat16:")
+    a_large_bf16 = a_large_f32.to(torch.bfloat16)
+    g_bf16 = g_f32.to(torch.bfloat16)
+    a_small_bf16 = a_large_bf16[:small_batch, :]
+    
+    result_small_bf16 = nki_rmsnorm_kernel_isa(a_small_bf16, g_bf16, batch_invariant=True)
+    result_large_bf16 = nki_rmsnorm_kernel_isa(a_large_bf16, g_bf16, batch_invariant=False)
+    
+    diff_bf16 = torch.max(torch.abs(result_small_bf16 - result_large_bf16[:small_batch])).item()
+    print(f"    Max difference between HIDDEN_TILE strategies: {diff_bf16:.6f}")
+    print(f"    Results {'identical' if diff_bf16 < 1e-6 else 'differ'}")
+    print()
+    
+    if diff_f32 == 0.0 and diff_bf16 == 0.0:
+        print(f"  ✓ ISA kernel is BATCH INVARIANT!")
+        print(f"    @skip_middle_end_transformations ensures deterministic reduction")
+        print(f"    regardless of HIDDEN_TILE size")
+        ratio = 0.0
+    elif diff_f32 > 0:
+        ratio = diff_bf16 / diff_f32 if diff_f32 > 0 else 0.0
+        print(f"  Precision impact: bfloat16 error is {ratio:.2f}x {'larger' if diff_bf16 > diff_f32 else 'smaller'} than float32")
+    else:
+        ratio = 0.0
+        print(f"  Precision impact: N/A")
+    
+    return {
+        "kernel": "RMSNorm ISA (nisa.tensor_reduce)",
+        "float32_error": diff_f32,
+        "bfloat16_error": diff_bf16,
+        "amplification": ratio
+    }
+
 
 if __name__ == "__main__":
     import pandas as pd
@@ -442,35 +425,22 @@ if __name__ == "__main__":
     
     print("=" * 80)
     
-    # Test RMSNorm invariance
-    print("=" * 80)
-    print("\nRunning RMSNorm batch invariance test...")
-    rmsnorm_invariant = test_rmsnorm_invariant()
+    # Test RMSNorm Lang kernel
+    print("\nRunning RMSNorm Lang kernel test...")
+    rmsnorm_lang_results = test_rmsnorm_lang()
     
     print("=" * 80)
     
-    # Test RMSNorm variance
-    print("\nRunning RMSNorm batch variance test...")
-    rmsnorm_variant = test_rmsnorm_variant()
-    
-    print("=" * 80)
-    
-    # Test RMSNorm HIDDEN_TILE precision effects
-    print("\nRunning RMSNorm HIDDEN_TILE variance test...")
-    rmsnorm_results = test_rmsnorm_accuracy_diff()
+    # Test RMSNorm ISA kernel
+    print("\nRunning RMSNorm ISA kernel test...")
+    rmsnorm_isa_results = test_rmsnorm_isa()
     
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
     
-    # Create results dataframes
-    print("\nMatMul & RMSNorm Batch Variance Results:")
-    variance_df = pd.DataFrame([lang_results, isa_results, rmsnorm_results])
+    # Create results dataframe
+    print("\nBatch Variance Results:")
+    variance_df = pd.DataFrame([lang_results, isa_results, rmsnorm_lang_results, rmsnorm_isa_results])
     print(variance_df.to_string(index=False))
     print()
-    
-    print("\nRMSNorm Invariance vs Variance:")
-    invariance_df = pd.DataFrame([rmsnorm_invariant, rmsnorm_variant])
-    print(invariance_df.to_string(index=False))
-    print()
-   
