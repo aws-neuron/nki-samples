@@ -38,22 +38,32 @@ def nki_matmul_kernel_isa(a, b, batch_invariant=True):
         
         # Reduction over K
         for k in nl.affine_range(K // K_TILE):
-            # Load a: [K_TILE, M_TILE]
+            # Allocate and load a: [K_TILE, M_TILE]
             i_a_p, i_a_f = nl.mgrid[0:K_TILE, 0:M_TILE]
-            a_tile = nl.load(a[k*K_TILE + i_a_p, m*M_TILE + i_a_f])
+            a_tile = nl.ndarray((K_TILE, M_TILE), dtype=a.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(
+                src=a[k*K_TILE + i_a_p, m*M_TILE + i_a_f],
+                dst=a_tile[i_a_p, i_a_f]
+            )
             
-            # Load b: [K_TILE, N]
+            # Allocate and load b: [K_TILE, N]
             i_b_p, i_b_f = nl.mgrid[0:K_TILE, 0:N]
-            b_tile = nl.load(b[k*K_TILE + i_b_p, i_b_f])
+            b_tile = nl.ndarray((K_TILE, N), dtype=b.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(
+                src=b[k*K_TILE + i_b_p, i_b_f],
+                dst=b_tile[i_b_p, i_b_f]
+            )
             
             # Matmul
-
-            print(a_tile.shape, b_tile.shape)
             c_psum += nisa.nc_matmul(a_tile, b_tile)
+        
         # Store this M chunk
         i_out_p, i_out_f = nl.mgrid[0:M_TILE, 0:N]
         c_sbuf = nl.copy(c_psum, dtype=result.dtype)
-        nl.store(result[m*M_TILE + i_out_p, i_out_f], value=c_sbuf)
+        nisa.dma_copy(
+            src=c_sbuf[i_out_p, i_out_f],
+            dst=result[m*M_TILE + i_out_p, i_out_f]
+        )
     
     return result
 
