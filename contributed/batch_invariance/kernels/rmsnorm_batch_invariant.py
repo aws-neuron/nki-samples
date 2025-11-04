@@ -43,9 +43,13 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
     # Create indices for full tile
     ix_full, iy_full = nl.mgrid[0:BATCH_TILE, 0:hidden_dim]
     
-    # Load weight once
+    # Load weight once using nisa.dma_copy
     iw, iy_g = nl.mgrid[0:1, 0:hidden_dim]
-    g_tile = nl.load(g_tensor.reshape((1, hidden_dim))[iw, iy_g])
+    g_tile = nl.ndarray((1, hidden_dim), dtype=g_tensor.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(
+        src=g_tensor.reshape((1, hidden_dim))[iw, iy_g],
+        dst=g_tile[iw, iy_g]
+    )
 
     # Loop over batch dimension
     for i in nl.affine_range(math.ceil(num_rows / BATCH_TILE)):
@@ -54,9 +58,13 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
         
         # Iterate over hidden dimension in chunks
         for h in nl.affine_range(math.ceil(hidden_dim / HIDDEN_TILE)):
-            # Load chunk with mask
-            a_chunk = nl.load(
-                a_tensor[i * BATCH_TILE + ix, h * HIDDEN_TILE + iy],
+            # Allocate buffer for chunk
+            a_chunk = nl.ndarray((BATCH_TILE, HIDDEN_TILE), dtype=a_tensor.dtype, buffer=nl.sbuf)
+            
+            # Load chunk with mask using nisa.dma_copy
+            nisa.dma_copy(
+                src=a_tensor[i * BATCH_TILE + ix, h * HIDDEN_TILE + iy],
+                dst=a_chunk[ix, iy],
                 mask=(i * BATCH_TILE + ix < num_rows) & (h * HIDDEN_TILE + iy < hidden_dim)
             )
             
@@ -74,9 +82,13 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
         mean = partial_square_sum * (1.0 / hidden_dim)
         rms_reciprocal = nl.rsqrt(mean)
         
-        # Load full row for normalization with mask
-        a_tile = nl.load(
-            a_tensor[i * BATCH_TILE + ix_full, iy_full],
+        # Allocate buffer for full tile
+        a_tile = nl.ndarray((BATCH_TILE, hidden_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
+        
+        # Load full row for normalization with mask using nisa.dma_copy
+        nisa.dma_copy(
+            src=a_tensor[i * BATCH_TILE + ix_full, iy_full],
+            dst=a_tile[ix_full, iy_full],
             mask=(i * BATCH_TILE + ix_full < num_rows)
         )
         
@@ -87,10 +99,10 @@ def nki_rmsnorm_kernel(a_tensor, g_tensor, batch_invariant=True):
         g_bcast = g_tile.broadcast_to((BATCH_TILE, hidden_dim))
         out_tile = nl.multiply(out_tile, g_bcast, mask=(i * BATCH_TILE + ix_full < num_rows))
         
-        # Store result with mask
-        nl.store(
-            out_tensor[i * BATCH_TILE + ix_full, iy_full], 
-            value=out_tile,
+        # Store result with mask using nisa.dma_copy
+        nisa.dma_copy(
+            src=out_tile[ix_full, iy_full],
+            dst=out_tensor[i * BATCH_TILE + ix_full, iy_full],
             mask=(i * BATCH_TILE + ix_full < num_rows)
         )
 
