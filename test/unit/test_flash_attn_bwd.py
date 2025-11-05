@@ -35,7 +35,7 @@ def softmax_dx(dy: np.ndarray, y: np.ndarray, dim: int, mixed_precision=False):
     subtract = dy - reduce
     return subtract * y
 
-def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=True, sinks=None):
+def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=True, sliding_window=-1, sinks=None):
   """
   Compute the attention backward with the softmax recomputation
   """
@@ -60,6 +60,12 @@ def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=Tr
         # -inf triggers invalid input error in softmax implementation, use a small negative instead
         # k=1 to exclude the diagonal, because each token can still attend to itself
         raw_score[i, j][np.triu_indices_from(raw_score[i, j], k=1)] = -9984.0
+    
+        if sliding_window > 0:
+           q_pos = np.arange(raw_score.shape[2])[:, None]
+           k_pos = np.arange(raw_score.shape[3])[None, :]
+           sliding_window_mask = k_pos < (q_pos - sliding_window + 1)
+           raw_score[i, j][sliding_window_mask] = -9984.0
 
   # Add sink tokens to the raw_score along the innermost dimension
   if sinks is not None:
@@ -140,8 +146,9 @@ class TestAttention:
     @pytest.mark.parametrize("bs, nheads, seqlen, d, dtype", [
         [1, 4, 4096, 128, np.float32],
     ])
+    @pytest.mark.parametrize("sliding_window", [-1, 128])
     @pytest.mark.parametrize("sinks", [False, True])
-    def test_flash_attn_bwd_numerical(self, simulation_only, bs, nheads, seqlen, d, dtype, sinks):
+    def test_flash_attn_bwd_numerical(self, simulation_only, bs, nheads, seqlen, d, dtype, sliding_window, sinks):
         q = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
         k = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
         v = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
@@ -154,7 +161,7 @@ class TestAttention:
         sinks_tensor = np.random.randn(bs, nheads).astype(dtype) if sinks else None
 
         dq_golden, dk_golden, dv_golden, cached_negative_max, cached_sum_reciprocal, o_proj, dsinks_golden = \
-          cpu_attention_backward(q, k, v, dy, use_causal_mask=True, sinks=sinks_tensor)
+          cpu_attention_backward(q, k, v, dy, use_causal_mask=True, sliding_window=sliding_window, sinks=sinks_tensor)
         cached_negative_max = cached_negative_max.reshape(bs, nheads, seqlen // nl.tile_size.pmax,
                                                           nl.tile_size.pmax).transpose(0, 1, 3, 2)
         cached_sum_reciprocal = cached_sum_reciprocal.reshape(bs, nheads, seqlen // nl.tile_size.pmax,
@@ -165,11 +172,13 @@ class TestAttention:
         if simulation_only:
            kernel_outputs = simulate_kernel(numeric_func[bs, nheads], q, k, v, o_proj, dy, lse, seed,
                                                           use_causal_mask=True,
-                                                          mixed_precision=True, sinks=sinks_tensor)
+                                                          mixed_precision=True,
+                                                          sliding_window=sliding_window, sinks=sinks_tensor)
         else:
           kernel_outputs = numeric_func[bs, nheads](q, k, v, o_proj, dy, lse, seed,
                                                           use_causal_mask=True,
-                                                          mixed_precision=True, sinks=sinks_tensor)
+                                                          mixed_precision=True,
+                                                          sliding_window=sliding_window, sinks=sinks_tensor)
         if sinks_tensor is not None:
             if len(kernel_outputs) == 4:
                 out_dq, out_dk, out_dv, dsinks = kernel_outputs
