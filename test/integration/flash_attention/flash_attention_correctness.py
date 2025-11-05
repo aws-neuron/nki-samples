@@ -15,12 +15,19 @@ from neuronxcc.starfish.support.util import allclose
 from flash_attention import nki_flash_attn_func
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize('causal', [True, False])
-def test_attention(dtype, causal):
+@pytest.mark.parametrize('causal,sliding_window', [(True, -1), (True, 128), (False, -1)])
+def test_attention(dtype, causal, sliding_window):
     def torch_golden_attn_cpu(query_states, key_states, value_states):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * (query_states.shape[-1] ** (-0.5))
 
-        if causal:
+        if sliding_window > 0:
+            causal_mask = torch.triu(
+                torch.tril(torch.ones(1, 1, query_states.shape[2], key_states.shape[2])),
+                diagonal=-(sliding_window - 1),
+            ).bool()
+            causal_mask = ~causal_mask
+            attn_weights = attn_weights.masked_fill_(causal_mask, -10000.0)
+        elif causal:
             causal_mask = torch.triu(torch.ones((1, 1, query_states.shape[2], key_states.shape[2])), diagonal=1).bool()
             attn_weights = attn_weights.masked_fill_(causal_mask, -10000.0)
 
@@ -50,7 +57,9 @@ def test_attention(dtype, causal):
     query_states_xla = query_states_cpu.to(xm.xla_device()).detach().requires_grad_()
     key_states_xla = key_states_cpu.to(xm.xla_device()).detach().requires_grad_()
     value_states_xla = value_states_cpu.to(xm.xla_device()).detach().requires_grad_()
-    attn_nki = nki_flash_attn_func(query_states_xla, key_states_xla, value_states_xla, causal=causal)
+    attn_nki = nki_flash_attn_func(
+        query_states_xla, key_states_xla, value_states_xla, causal=causal, sliding_window=sliding_window
+    )
     loss_actual = torch.sum(attn_nki**2)
     loss_actual.backward()
     xm.mark_step()
