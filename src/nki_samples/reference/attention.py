@@ -578,7 +578,8 @@ def flash_attn_bwd(
   _, _, _, seqlen_k = k_ref.shape
   sliding_window = min(sliding_window, seqlen_k)
 
-  assert sliding_window <= 0 or use_causal_mask
+  assert sliding_window <= 0 or use_causal_mask, \
+    "Sliding window is supported for causal attention only"
   assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen_k), \
     f"Input K shape mismatch, got {k_ref.shape}"
   assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen_k), \
@@ -694,16 +695,23 @@ def flash_attn_bwd(
       dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
       q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
 
+      # Tile-level early exit: Skip tiles where no query token can attend to any key token.
       if use_causal_mask:
-        multiplication_required_selection = (i_q_seq_tile + 1) * q_seq_tile_size > i_k_seq_tile * k_seq_tile_size
+        # Causal: max query position >= min key position
+        q_tile_max_pos = (i_q_seq_tile + 1) * q_seq_tile_size - 1
+        k_tile_min_pos = i_k_seq_tile * k_seq_tile_size
+        tile_required = q_tile_max_pos >= k_tile_min_pos
+
         if sliding_window > 0:
-          multiplication_required_selection = multiplication_required_selection and (
-            i_q_seq_tile * q_seq_tile_size - sliding_window < (i_k_seq_tile + 1) * k_seq_tile_size
-          )
+          # Sliding window: max key position >= earliest position any query can attend to
+          q_tile_min_pos = i_q_seq_tile * q_seq_tile_size
+          k_tile_max_pos = (i_k_seq_tile + 1) * k_seq_tile_size - 1
+          earliest_attendable_pos = q_tile_min_pos - sliding_window + 1
+          tile_required = tile_required and (k_tile_max_pos >= earliest_attendable_pos)
       else:
-        multiplication_required_selection = True
-      
-      if multiplication_required_selection:
+        tile_required = True
+
+      if tile_required:
         load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
                   q_ref_hbm_tile = q_ref[batch_id, head_id],
                   dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
@@ -873,8 +881,13 @@ def _flash_attn_bwd_core(
   # Step 2.2. Apply optional causal mask
   ######################################
   if use_causal_mask:
+    # Generate element-wise position indices within tiles
     iq, ik = nl.mgrid[0:q_seq_tile_size, 0:k_seq_tile_size]
+
+    # Causal mask: query at position q can only attend to keys at positions [0, q]
+    # Keep elements where q_pos >= k_pos
     causal_pred = (local_i_q_seq_tile * q_seq_tile_size + iq >= local_i_k_seq_tile * k_seq_tile_size + ik)
+
     if logit_bias_tile is not None:
       # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
       intermediate = \
@@ -884,14 +897,15 @@ def _flash_attn_bwd_core(
         on_true_tile=intermediate, on_false_value=-9984.0, dtype=mixed_dtype,
         mask=mask
       )
-
     else:
       # Magic number -9984.0 to replace -inf similar to what Tensorizer uses
       qk_res_buf[:, :] = nisa.affine_select(
         pred=causal_pred,
         on_true_tile=qk_psum[:, :], on_false_value=-9984.0, dtype=mixed_dtype,
         mask=mask)
-    
+
+    # Sliding window mask: query at position q can only attend to keys at [q - window + 1, q]
+    # Keep elements where k_pos > q_pos - sliding_window (i.e., k_pos >= q_pos - window + 1)
     if sliding_window > 0:
       swa_pred = local_i_q_seq_tile * q_seq_tile_size + iq - sliding_window < local_i_k_seq_tile * k_seq_tile_size + ik
       qk_res_buf[:, :] = nisa.affine_select(
