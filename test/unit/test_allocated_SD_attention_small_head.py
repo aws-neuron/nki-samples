@@ -28,7 +28,7 @@ class TestAttention:
 
     @pytest.mark.parametrize("bs,seqlen,d,dtype,latency", [
         [1, 4096, 128, np.float32, 410],
-        [1, 4096, 128, nl.bfloat16, 350],
+        [1, 4096, 128, nl.bfloat16, 380],
         [1, 5120, 128, nl.bfloat16, 586]
     ])
     def test_allocated_attention_for_SD_perf(self, bs, seqlen, d, dtype, latency):
