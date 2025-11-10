@@ -16,8 +16,12 @@ from flash_attention import nki_flash_attn_func
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize('causal,sliding_window', [(True, -1), (True, 128), (False, -1)])
-def test_attention(dtype, causal, sliding_window):
+@pytest.mark.parametrize('num_heads,num_kv_heads', [(4, 4), (4, 1), (8, 2)]) # MHA, MQA, GQA
+def test_attention(dtype, causal, sliding_window, num_heads, num_kv_heads):
     def torch_golden_attn_cpu(query_states, key_states, value_states):
+        if num_heads != num_kv_heads:
+            key_states = key_states.repeat_interleave(num_heads // num_kv_heads, dim=1)
+            value_states = value_states.repeat_interleave(num_heads // num_kv_heads, dim=1)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * (query_states.shape[-1] ** (-0.5))
 
         if sliding_window > 0:
@@ -38,14 +42,13 @@ def test_attention(dtype, causal, sliding_window):
 
     torch.manual_seed(0)
     bs = 1
-    num_heads = 4
     head_dim = 128
     seq_len = 4096
     query_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
     query_states_cpu.requires_grad_()
-    key_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
+    key_states_cpu = torch.randn(bs, num_kv_heads, seq_len, head_dim, dtype=dtype) - 0.5
     key_states_cpu.requires_grad_()
-    value_states_cpu = torch.randn(bs, num_heads, seq_len, head_dim, dtype=dtype) - 0.5
+    value_states_cpu = torch.randn(bs, num_kv_heads, seq_len, head_dim, dtype=dtype) - 0.5
     value_states_cpu.requires_grad_()
 
     # Run the CPU golden results

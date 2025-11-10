@@ -9,8 +9,9 @@ from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd
 
 
 def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softmax_scale, sliding_window):
-    bs, num_heads, _, _ = q.shape
-    attn_output, lse = flash_fwd[bs, num_heads](
+    # flash_fwd assumes spmd grid uses key/value heads
+    bs, num_heads_kv, _, _ = k.shape
+    attn_output, lse = flash_fwd[bs, num_heads_kv](
         q,
         k,
         v,
@@ -27,8 +28,8 @@ def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softm
 def _flash_attn_backward(
     q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale, sliding_window
 ):
-    bs, num_heads, _, _ = q.shape
-    dq, dk, dv = flash_attn_bwd[bs, num_heads](
+    bs, num_heads_kv, _, _ = k.shape
+    dq, dk, dv = flash_attn_bwd[bs, num_heads_kv](
         q,
         k,
         v,
