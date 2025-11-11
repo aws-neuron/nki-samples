@@ -529,6 +529,7 @@ def flash_attn_bwd(
   dropout_p=0.0,
   softmax_scale=None,
   sliding_window=-1,
+  sinks=None
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.
@@ -545,6 +546,7 @@ def flash_attn_bwd(
    - out_dq_ref: shape (bs, nheads, head_size, seq)
    - out_dk_ref: shape (bs, nheads, head_size, seq)
    - out_dv_ref: shape (bs, nheads, head_size, seq)
+   - out_dsinks_rows_ref: shape (bs, nheads)
 
   Detailed steps:
     1. D = rowsum(dO ◦ O) (pointwise multiply)
@@ -602,6 +604,11 @@ def flash_attn_bwd(
   out_dk_ref = nl.ndarray((bs, nheads_kv, d_head, seqlen_k), dtype=q_ref.dtype,
                           buffer=nl.shared_hbm)
   out_dv_ref = nl.ndarray((bs, nheads_kv, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  if sinks is not None:
+    # Assume sink tensors have been replicated along batch dim
+    assert tuple(sinks.shape) == (bs, nheads)
+    out_dsinks_ref = nl.ndarray((bs, nheads), dtype=mixed_dtype, 
                           buffer=nl.shared_hbm)
 
   # FIXME: Add masking for different seqlen values.
@@ -667,6 +674,7 @@ def flash_attn_bwd(
 
   dq_local_reduced = nl.zeros((nheads_per_kv_head, q_seq_n_tiles, d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size),
                               dtype=mixed_dtype)
+  dsinks_rows_acc = nl.zeros((nheads_per_kv_head, par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
 
   # affine_range give the compiler permission to vectorize instructions
   # inside the loop which improves the performance. However, when using the
@@ -734,6 +742,10 @@ def flash_attn_bwd(
                                          buffer=nl.sbuf, dtype=kernel_dtype)
             logit_bias_tile[:, :] = nl.load(
               logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+          
+          sink_sigma = None
+          if sinks is not None:
+            sink_sigma = nl.load(sinks[batch_id, i_q_head + q_head_offset], dtype=mixed_dtype)
 
           _flash_attn_bwd_core(
             q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
@@ -748,6 +760,8 @@ def flash_attn_bwd(
             seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
             logit_bias_tile=logit_bias_tile,
             sliding_window=sliding_window,
+            sink_sigma=sink_sigma,
+            dsinks_rows_acc=dsinks_rows_acc[i_q_head],
           )
 
     # Write dK, dV
@@ -767,7 +781,18 @@ def flash_attn_bwd(
           value=dq_local_reduced[i_q_head, i_q_seq_tile, i_d_head_tile, :, :],
         )
 
-  return out_dq_ref, out_dk_ref, out_dv_ref
+  if sinks is not None:
+    for i_q_head in nl.affine_range(nheads_per_kv_head):
+      # Sum all Q tiles first, then reduce partition dimension
+      total_dsinks = nl.sum(dsinks_rows_acc[i_q_head], axis=1)  # Sum across Q tiles
+      reduced_dsinks = nisa.tensor_partition_reduce(np.add, total_dsinks)
+      nl.store(out_dsinks_ref[batch_id, i_q_head + q_head_offset], value=reduced_dsinks) 
+
+  # Return dsinks rows only if sinks provided
+  if sinks is not None:
+    return out_dq_ref, out_dk_ref, out_dv_ref, out_dsinks_ref
+  else:
+    return out_dq_ref, out_dk_ref, out_dv_ref
 
 
 @nki.jit(mode='trace')
@@ -855,7 +880,9 @@ def _flash_attn_bwd_core(
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
   logit_bias_tile=None,
-  sliding_window=-1):
+  sliding_window=-1,
+  sink_sigma=None,
+  dsinks_rows_acc=None):
   """
   The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
@@ -952,6 +979,17 @@ def _flash_attn_bwd_core(
     nl.random_seed(seed=offset_seed, mask=mask)
     softmax_y[:, :] = nl.dropout(softmax_y[:, :], rate=dropout_p_local[:, 0], mask=mask)
     softmax_y[:, :] = nl.multiply(softmax_y[:, :], 1 / (1 - dropout_p), mask=mask)
+    
+  have_sink = sink_sigma is not None
+  if have_sink:
+    # broadcast sink_sigma (SBUF scalar) to a [par_dim(q), 1] tile; exp with row-wise bias
+    sigma_plane = nl.add(nl.zeros((par_dim(q_seq_tile_size), 1), dtype=mixed_dtype),
+                          sink_sigma, dtype=mixed_dtype)
+    p_sink = nisa.activation(np.exp,
+                              data=sigma_plane,
+                              bias=softmax_exp_bias[:, local_i_q_seq_tile],
+                              scale=1.0,
+                              mask=mask)  # [par_dim(q), 1]
 
   #####################################################################
   # Step 3.1 Calculate the backward gradients dL/dV, where y=softmax@V
@@ -983,6 +1021,8 @@ def _flash_attn_bwd_core(
   # Step 4 Calculate the softmax backward gradients dL/dx, where y=softmax(x)
   # dL/dx = y * (dL/dy - rowsum(dO_O)), where y = softmax(x)
   #####################################################################
+  if have_sink:
+    row_dot = nisa.tensor_reduce(np.add, nl.multiply(softmax_dy, softmax_y), axis=(1,), dtype=mixed_dtype)
   softmax_dx_local = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
   softmax_dx_local[:, :] = \
     nisa.scalar_tensor_tensor(data=softmax_dy[:, :],
@@ -991,6 +1031,18 @@ def _flash_attn_bwd_core(
                               op1=np.multiply,
                               operand1=softmax_y[:, :],
                               mask=mask)
+  
+  # sink gradient rows: dZ_sink = -(row_dot) * p_sink
+  if have_sink:
+    dZ_sink = nl.multiply(nl.multiply(row_dot, -1.0, mask=mask), p_sink, mask=mask)  # [par_dim(q), 1]
+    dZ_sink_rows = nisa.tensor_reduce(np.add, data=dZ_sink, axis=(1,), dtype=mixed_dtype)  # [par_dim(q)]
+    dsinks_rows_acc[:, local_i_q_seq_tile] = nl.loop_reduce(
+      dZ_sink_rows,
+      op=np.add,
+      loop_indices=(local_i_k_seq_tile,),
+      dtype=mixed_dtype,
+      mask=mask
+    )
 
   #####################################################################
   # Step 5.1 Calculate dK, with matmul(stationary=Q, moving=softmax_dx)
