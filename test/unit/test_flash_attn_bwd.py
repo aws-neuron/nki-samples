@@ -45,11 +45,18 @@ def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=Tr
     c = np.matmul(a, b)
     return c.astype(input_dtype)
 
-  _, _, d, _ = q.shape
+  bs, nheads, d, seqlen = q.shape
+  _, nheads_kv, _, _ = k.shape
+  nheads_per_kv_head = nheads // nheads_kv
+
+  # Expand key and value to match query heads
+  k_expanded = np.repeat(k, nheads_per_kv_head, axis=1)
+  v_expanded = np.repeat(v, nheads_per_kv_head, axis=1)
+
   # Compute golden output
   softmax_scale = 1.0 / (d ** 0.5)
   q_scaled = q * softmax_scale
-  raw_score = mixed_precision_matmul(q_scaled.transpose(0, 1, 3, 2), k)
+  raw_score = mixed_precision_matmul(q_scaled.transpose(0, 1, 3, 2), k_expanded)
 
   if use_causal_mask:
     # raw_score has K seq in the most inner dim
@@ -83,12 +90,9 @@ def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=Tr
     norm_score = norm_score_combined[..., :-1]  # Remove last dimension (sink)
   else:
     norm_score = norm_score_combined
-    
-  # Calculate dv = (dL/dy) @ softmax_y
-  dv_golden = mixed_precision_matmul(dy, norm_score)
 
   # Calculate softmax_dy = (dL/dy)^T @ V
-  softmax_dy = mixed_precision_matmul(dy.transpose(0, 1, 3, 2), v)
+  softmax_dy = mixed_precision_matmul(dy.transpose(0, 1, 3, 2), v_expanded)
 
   if sinks is not None:
     # Combine gradients: softmax_dy for attention, zeros for sinks
@@ -100,14 +104,21 @@ def cpu_attention_backward(q, k, v, dy, use_causal_mask=True, mixed_precision=Tr
     softmax_dx_golden = softmax_dx(softmax_dy, norm_score, dim=-1, mixed_precision=mixed_precision)
     dsinks_golden = None
 
+  # Calculate dv = (dL/dy) @ softmax_y
+  dv_expanded = mixed_precision_matmul(dy, norm_score)
+  dv_reshaped = dv_expanded.reshape(bs, nheads_kv, nheads_per_kv_head, d, seqlen)
+  dv_golden = np.sum(dv_reshaped, axis=2)
+
   # Calculate dq
-  dq_golden = mixed_precision_matmul(k, softmax_dx_golden.transpose(0, 1, 3, 2)) * softmax_scale
+  dq_golden = mixed_precision_matmul(k_expanded, softmax_dx_golden.transpose(0, 1, 3, 2)) * softmax_scale
 
   # Calculate dk
-  dk_golden = mixed_precision_matmul(q_scaled, softmax_dx_golden)
+  dk_expanded = mixed_precision_matmul(q_scaled, softmax_dx_golden)
+  dk_reshaped = dk_expanded.reshape(bs, nheads_kv, nheads_per_kv_head, d, seqlen)
+  dk_golden = np.sum(dk_reshaped, axis=2)
 
   # Calculate output projection
-  o_proj = np.matmul(norm_score, v.transpose(0, 1, 3, 2)).transpose(0, 1, 3, 2)
+  o_proj = np.matmul(norm_score, v_expanded.transpose(0, 1, 3, 2)).transpose(0, 1, 3, 2)
 
   # Calculate 
   return dq_golden, dk_golden, dv_golden, cached_negative_max, cached_sum_reciprocal, o_proj, dsinks_golden
@@ -143,15 +154,18 @@ class TestAttention:
         assert p99 <= latency
 
     @pytest.mark.simulation
-    @pytest.mark.parametrize("bs, nheads, seqlen, d, dtype", [
-        [1, 4, 4096, 128, np.float32],
+    @pytest.mark.parametrize("bs, nheads, nheads_kv, seqlen, d, dtype", [
+        [1, 4, 4, 4096, 128, np.float32],
+        [1, 4, 1, 4096, 128, np.float32],
+        [1, 8, 2, 4096, 128, np.float32],
+        [1, 8, 2, 8192, 128, np.float32],
     ])
     @pytest.mark.parametrize("sliding_window", [-1, 128])
     @pytest.mark.parametrize("sinks", [False, True])
-    def test_flash_attn_bwd_numerical(self, simulation_only, bs, nheads, seqlen, d, dtype, sliding_window, sinks):
+    def test_flash_attn_bwd_numerical(self, simulation_only, bs, nheads, nheads_kv, seqlen, d, dtype, sliding_window, sinks):
         q = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
-        k = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
-        v = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
+        k = (np.random.random_sample([bs, nheads_kv, d, seqlen]) - 0.5) * 2
+        v = (np.random.random_sample([bs, nheads_kv, d, seqlen]) - 0.5) * 2
         dy = (np.random.random_sample([bs, nheads, d, seqlen]) - 0.5) * 2
         q = nl.static_cast(q, dtype)
         k = nl.static_cast(k, dtype)
@@ -170,12 +184,12 @@ class TestAttention:
 
         numeric_func = baremetal(flash_attn_bwd)
         if simulation_only:
-           kernel_outputs = simulate_kernel(numeric_func[bs, nheads], q, k, v, o_proj, dy, lse, seed,
+          kernel_outputs = simulate_kernel(numeric_func[bs, nheads_kv], q, k, v, o_proj, dy, lse, seed,
                                                           use_causal_mask=True,
                                                           mixed_precision=True,
                                                           sliding_window=sliding_window, sinks=sinks_tensor)
         else:
-          kernel_outputs = numeric_func[bs, nheads](q, k, v, o_proj, dy, lse, seed,
+          kernel_outputs = numeric_func[bs, nheads_kv](q, k, v, o_proj, dy, lse, seed,
                                                           use_causal_mask=True,
                                                           mixed_precision=True,
                                                           sliding_window=sliding_window, sinks=sinks_tensor)
