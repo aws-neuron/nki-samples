@@ -249,7 +249,10 @@ def mamba_v3(delta, u, A, B, C):
 
                     # Step 5: Element-wise multiplication of scan_res and C_i
                     C_i_bcast = C_i.broadcast_to((channel_psize, seq_len_fsize))
-                    scanC = nisa.tensor_tensor(scan_res, C_i_bcast, op=nl.multiply)
+                    
+                    # Use PSUM buffer to reduce accumulation latency
+                    scanC = nl.ndarray((channel_psize, seq_len_fsize), dtype=delta.dtype, buffer=nl.psum)
+                    scanC[...] = nisa.tensor_tensor(scan_res, C_i_bcast, op=nl.multiply)
 
                     # Step 6: Accumulation of scanC along state_size dimension
                     scanC_accum[0:channel_psize, seq_len_start:seq_len_start+seq_len_fsize] += scanC
