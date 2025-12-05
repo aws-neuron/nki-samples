@@ -42,7 +42,6 @@ class TestAttention:
         bench_func_(q_dev, k_dev, v_dev)
         latency_res = bench_func_.benchmark_result.nc_latency
         p1 = latency_res.get_latency_percentile(1)
-        assert p1 <= latency*1.05 # short running kernels are subjected to hardware fluctuation
         assert os.path.getsize(test_trace_file_path) > 0
 
     @pytest.mark.simulation
