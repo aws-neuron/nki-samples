@@ -529,6 +529,7 @@ def flash_attn_bwd(
   dropout_p=0.0,
   softmax_scale=None,
   sliding_window=-1,
+  sinks=None
 ):
   """
   Flash attention backward kernel. Compute the backward gradients.
@@ -545,6 +546,7 @@ def flash_attn_bwd(
    - out_dq_ref: shape (bs, nheads, head_size, seq)
    - out_dk_ref: shape (bs, nheads, head_size, seq)
    - out_dv_ref: shape (bs, nheads, head_size, seq)
+   - out_dsinks_rows_ref: shape (bs, nheads)
 
   Detailed steps:
     1. D = rowsum(dO ◦ O) (pointwise multiply)
@@ -575,14 +577,17 @@ def flash_attn_bwd(
 
   # Shape checking
   bs, nheads, d_head, seqlen_q = q_ref.shape
-  _, _, _, seqlen_k = k_ref.shape
+  _, nheads_kv, _, seqlen_k = k_ref.shape
+  nheads_per_kv_head = nheads // nheads_kv
   sliding_window = min(sliding_window, seqlen_k)
 
   assert sliding_window <= 0 or use_causal_mask, \
     "Sliding window is supported for causal attention only"
-  assert tuple(k_ref.shape) == (bs, nheads, d_head, seqlen_k), \
+  assert (nheads == nheads_kv) or (nheads % nheads_kv == 0), \
+    f"Query heads ({nheads}) is not divisible by key/value heads ({nheads_kv})"
+  assert tuple(k_ref.shape) == (bs, nheads_kv, d_head, seqlen_k), \
     f"Input K shape mismatch, got {k_ref.shape}"
-  assert tuple(v_ref.shape) == (bs, nheads, d_head, seqlen_k), \
+  assert tuple(v_ref.shape) == (bs, nheads_kv, d_head, seqlen_k), \
     f"Input V shape mismatch, got {v_ref.shape}"
   assert tuple(o_ref.shape) == (bs, nheads, d_head, seqlen_q), \
     f"Input o shape mismatch, got {o_ref.shape}"
@@ -596,9 +601,14 @@ def flash_attn_bwd(
 
   out_dq_ref = nl.ndarray((bs, nheads, d_head, seqlen_q), dtype=q_ref.dtype,
                           buffer=nl.shared_hbm)
-  out_dk_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+  out_dk_ref = nl.ndarray((bs, nheads_kv, d_head, seqlen_k), dtype=q_ref.dtype,
                           buffer=nl.shared_hbm)
-  out_dv_ref = nl.ndarray((bs, nheads, d_head, seqlen_k), dtype=q_ref.dtype,
+  out_dv_ref = nl.ndarray((bs, nheads_kv, d_head, seqlen_k), dtype=q_ref.dtype,
+                          buffer=nl.shared_hbm)
+  if sinks is not None:
+    # Assume sink tensors have been replicated along batch dim
+    assert tuple(sinks.shape) == (bs, nheads)
+    out_dsinks_ref = nl.ndarray((bs, nheads), dtype=mixed_dtype, 
                           buffer=nl.shared_hbm)
 
   # FIXME: Add masking for different seqlen values.
@@ -613,9 +623,12 @@ def flash_attn_bwd(
   # Different batch samples/attention heads have independent attention
   batch_id = nl.program_id(axis=0)
   head_id = nl.program_id(axis=1)
+  q_head_offset = head_id * nheads_per_kv_head
 
-  assert nl.num_programs(1) == nheads, \
-    f"The grid shape mismatch, got {nl.num_programs(1)} but should be {nheads}"
+  # Grid is parallelized over batch and kv heads (not query heads)
+  # Each program processes nheads_per_kv_head query heads
+  assert nl.num_programs(1) == nheads_kv, \
+    f"The grid shape mismatch, got {nl.num_programs(1)} but should be {nheads_kv}"
 
   if logit_bias_ref is not None:
     b_logit_bias, h_logit_bias, _, _ = logit_bias_ref.shape
@@ -635,19 +648,21 @@ def flash_attn_bwd(
   ##############################################################
   # Step 2.4 Prefetch exp bias for softmax
   ##############################################################
-  softmax_exp_bias = nl.zeros((par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
-  lse_local = nl.load(lse_ref[batch_id, head_id, :, :], dtype=mixed_dtype)
-  softmax_exp_bias[:, :] = lse_local * -1.0
+  softmax_exp_bias = nl.zeros((nheads_per_kv_head, par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
+  for i_q_head in nl.affine_range(nheads_per_kv_head):
+    lse_local = nl.load(lse_ref[batch_id, i_q_head + q_head_offset, :, :], dtype=mixed_dtype)
+    softmax_exp_bias[i_q_head, :, :] = lse_local * -1.0
 
   ##############################################################
   # Step 1 Compute rowsum(dO ◦ O)
   ##############################################################
-  dy_o_sum = nl.ndarray((q_seq_n_tiles, par_dim(q_seq_tile_size), 1), dtype=mixed_dtype)
-  compute_rowsum(dy_o_sum=dy_o_sum,
-                 dy_ref_hbm_tile=dy_ref[batch_id, head_id],
-                 o_ref_hbm_tile=o_ref[batch_id, head_id],
-                 d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
-                 q_seq_n_tiles=q_seq_n_tiles, q_seq_tile_size=q_seq_tile_size)
+  dy_o_sum = nl.ndarray((nheads_per_kv_head, q_seq_n_tiles, par_dim(q_seq_tile_size), 1), dtype=mixed_dtype)
+  for i_q_head in nl.affine_range(nheads_per_kv_head):
+    compute_rowsum(dy_o_sum=dy_o_sum[i_q_head],
+                   dy_ref_hbm_tile=dy_ref[batch_id, i_q_head + q_head_offset],
+                   o_ref_hbm_tile=o_ref[batch_id, i_q_head + q_head_offset],
+                   d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size,
+                   q_seq_n_tiles=q_seq_n_tiles, q_seq_tile_size=q_seq_tile_size)
 
   if dropout_p > 0.0:
     seed_local = nl.load(seed_ref[0])
@@ -657,8 +672,9 @@ def flash_attn_bwd(
     seed_local = None
     dropout_p_local = None
 
-  dq_local_reduced = nl.zeros((q_seq_n_tiles, d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size),
+  dq_local_reduced = nl.zeros((nheads_per_kv_head, q_seq_n_tiles, d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size),
                               dtype=mixed_dtype)
+  dsinks_rows_acc = nl.zeros((nheads_per_kv_head, par_dim(q_seq_tile_size), q_seq_n_tiles), dtype=mixed_dtype)
 
   # affine_range give the compiler permission to vectorize instructions
   # inside the loop which improves the performance. However, when using the
@@ -690,56 +706,63 @@ def flash_attn_bwd(
                         dtype=np.float32, buffer=nl.psum)
     dk_psum = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), k_seq_tile_size),
                         dtype=np.float32, buffer=nl.psum)
-    for i_q_seq_tile in _range(q_seq_n_tiles):
-      # Prefetch dy, Q
-      dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
-      q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
+    for i_q_head in _range(nheads_per_kv_head):
+      for i_q_seq_tile in _range(q_seq_n_tiles):
+        # Prefetch dy, Q
+        dy_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
+        q_local = nl.zeros((d_head_n_tiles, par_dim(d_head_tile_size), q_seq_tile_size), dtype=kernel_dtype)
 
-      # Tile-level early exit: Skip tiles where no query token can attend to any key token.
-      if use_causal_mask:
-        # Causal: max query position >= min key position
-        q_tile_max_pos = (i_q_seq_tile + 1) * q_seq_tile_size - 1
-        k_tile_min_pos = i_k_seq_tile * k_seq_tile_size
-        tile_required = q_tile_max_pos >= k_tile_min_pos
+        # Tile-level early exit: Skip tiles where no query token can attend to any key token.
+        if use_causal_mask:
+          # Causal: max query position >= min key position
+          q_tile_max_pos = (i_q_seq_tile + 1) * q_seq_tile_size - 1
+          k_tile_min_pos = i_k_seq_tile * k_seq_tile_size
+          tile_required = q_tile_max_pos >= k_tile_min_pos
 
-        if sliding_window > 0:
-          # Sliding window: max key position >= earliest position any query can attend to
-          q_tile_min_pos = i_q_seq_tile * q_seq_tile_size
-          k_tile_max_pos = (i_k_seq_tile + 1) * k_seq_tile_size - 1
-          earliest_attendable_pos = q_tile_min_pos - sliding_window + 1
-          tile_required = tile_required and (k_tile_max_pos >= earliest_attendable_pos)
-      else:
-        tile_required = True
+          if sliding_window > 0:
+            # Sliding window: max key position >= earliest position any query can attend to
+            q_tile_min_pos = i_q_seq_tile * q_seq_tile_size
+            k_tile_max_pos = (i_k_seq_tile + 1) * k_seq_tile_size - 1
+            earliest_attendable_pos = q_tile_min_pos - sliding_window + 1
+            tile_required = tile_required and (k_tile_max_pos >= earliest_attendable_pos)
+        else:
+          tile_required = True
 
-      if tile_required:
-        load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, head_id],
-                  q_ref_hbm_tile = q_ref[batch_id, head_id],
-                  dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
-                  d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
-                  q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
+        if tile_required:
+          load_dy_q(dy_ref_hbm_tile = dy_ref[batch_id, i_q_head + q_head_offset],
+                    q_ref_hbm_tile = q_ref[batch_id, i_q_head + q_head_offset],
+                    dy_local=dy_local, q_local=q_local, d_head_n_tiles=d_head_n_tiles,
+                    d_head_tile_size=d_head_tile_size, i_q_seq_tile=i_q_seq_tile,
+                    q_seq_tile_size=q_seq_tile_size, softmax_scale=softmax_scale)
 
-        logit_bias_tile = None
-        if logit_bias_ref is not None:
-          i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
-          logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
-                                       buffer=nl.sbuf, dtype=kernel_dtype)
-          logit_bias_tile[:, :] = nl.load(
-            logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+          logit_bias_tile = None
+          if logit_bias_ref is not None:
+            i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+            logit_bias_tile = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size),
+                                         buffer=nl.sbuf, dtype=kernel_dtype)
+            logit_bias_tile[:, :] = nl.load(
+              logit_bias_ref[0, 0, i_q_seq_dslice, i_k_seq_dslice])
+          
+          sink_sigma = None
+          if sinks is not None:
+            sink_sigma = nl.load(sinks[batch_id, i_q_head + q_head_offset], dtype=mixed_dtype)
 
-        _flash_attn_bwd_core(
-          q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
-          v_local=v_local, dy_local=dy_local,
-          dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced,
-          softmax_exp_bias=softmax_exp_bias, dy_o_sum=dy_o_sum,
-          local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
-          seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
-          use_causal_mask=use_causal_mask,
-          kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
-          softmax_scale=softmax_scale,
-          seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
-          logit_bias_tile=logit_bias_tile,
-          sliding_window=sliding_window,
-        )
+          _flash_attn_bwd_core(
+            q_local=q_local, k_local=k_local, transposed_k_local=transposed_k_local,
+            v_local=v_local, dy_local=dy_local,
+            dk_psum=dk_psum, dv_psum=dv_psum, dq_local_reduced=dq_local_reduced[i_q_head],
+            softmax_exp_bias=softmax_exp_bias[i_q_head], dy_o_sum=dy_o_sum[i_q_head],
+            local_i_q_seq_tile=i_q_seq_tile, local_i_k_seq_tile=i_k_seq_tile,
+            seqlen_q=seqlen_q, seqlen_k=seqlen_k, d_head=d_head, nheads=nheads,
+            use_causal_mask=use_causal_mask,
+            kernel_dtype=kernel_dtype, mixed_dtype=mixed_dtype,
+            softmax_scale=softmax_scale,
+            seed_local=seed_local, dropout_p=dropout_p, dropout_p_local=dropout_p_local,
+            logit_bias_tile=logit_bias_tile,
+            sliding_window=sliding_window,
+            sink_sigma=sink_sigma,
+            dsinks_rows_acc=dsinks_rows_acc[i_q_head],
+          )
 
     # Write dK, dV
     store_dk_dv(out_dk_ref_hbm_tile=out_dk_ref[batch_id, head_id],
@@ -748,16 +771,28 @@ def flash_attn_bwd(
                 d_head_n_tiles=d_head_n_tiles, d_head_tile_size=d_head_tile_size)
 
   # Write dQ
-  for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
-    for i_d_head_tile in nl.affine_range(d_head_n_tiles):
-      i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
-      i_d_head_dslice = nl.ds(i_d_head_tile * d_head_tile_size, d_head_tile_size)
-      nl.store(
-        out_dq_ref[batch_id, head_id, i_d_head_dslice, i_q_seq_dslice],
-        value=dq_local_reduced[i_q_seq_tile, i_d_head_tile, :, :],
-      )
+  for i_q_head in nl.affine_range(nheads_per_kv_head):
+    for i_q_seq_tile in nl.affine_range(q_seq_n_tiles):
+      for i_d_head_tile in nl.affine_range(d_head_n_tiles):
+        i_q_seq_dslice = nl.ds(i_q_seq_tile * q_seq_tile_size, q_seq_tile_size)
+        i_d_head_dslice = nl.ds(i_d_head_tile * d_head_tile_size, d_head_tile_size)
+        nl.store(
+          out_dq_ref[batch_id, i_q_head + q_head_offset, i_d_head_dslice, i_q_seq_dslice],
+          value=dq_local_reduced[i_q_head, i_q_seq_tile, i_d_head_tile, :, :],
+        )
 
-  return out_dq_ref, out_dk_ref, out_dv_ref
+  if sinks is not None:
+    for i_q_head in nl.affine_range(nheads_per_kv_head):
+      # Sum all Q tiles first, then reduce partition dimension
+      total_dsinks = nl.sum(dsinks_rows_acc[i_q_head], axis=1)  # Sum across Q tiles
+      reduced_dsinks = nisa.tensor_partition_reduce(np.add, total_dsinks)
+      nl.store(out_dsinks_ref[batch_id, i_q_head + q_head_offset], value=reduced_dsinks) 
+
+  # Return dsinks rows only if sinks provided
+  if sinks is not None:
+    return out_dq_ref, out_dk_ref, out_dv_ref, out_dsinks_ref
+  else:
+    return out_dq_ref, out_dk_ref, out_dv_ref
 
 
 @nki.jit(mode='trace')
@@ -845,7 +880,9 @@ def _flash_attn_bwd_core(
   softmax_scale,
   seed_local, dropout_p, dropout_p_local,
   logit_bias_tile=None,
-  sliding_window=-1):
+  sliding_window=-1,
+  sink_sigma=None,
+  dsinks_rows_acc=None):
   """
   The flash backward core function to calculate the gradients of Q, K and V
   of the given tiles. The result will be accumulated into the dk, dv, dq psum
@@ -942,6 +979,17 @@ def _flash_attn_bwd_core(
     nl.random_seed(seed=offset_seed, mask=mask)
     softmax_y[:, :] = nl.dropout(softmax_y[:, :], rate=dropout_p_local[:, 0], mask=mask)
     softmax_y[:, :] = nl.multiply(softmax_y[:, :], 1 / (1 - dropout_p), mask=mask)
+    
+  have_sink = sink_sigma is not None
+  if have_sink:
+    # broadcast sink_sigma (SBUF scalar) to a [par_dim(q), 1] tile; exp with row-wise bias
+    sigma_plane = nl.add(nl.zeros((par_dim(q_seq_tile_size), 1), dtype=mixed_dtype),
+                          sink_sigma, dtype=mixed_dtype)
+    p_sink = nisa.activation(np.exp,
+                              data=sigma_plane,
+                              bias=softmax_exp_bias[:, local_i_q_seq_tile],
+                              scale=1.0,
+                              mask=mask)  # [par_dim(q), 1]
 
   #####################################################################
   # Step 3.1 Calculate the backward gradients dL/dV, where y=softmax@V
@@ -973,6 +1021,8 @@ def _flash_attn_bwd_core(
   # Step 4 Calculate the softmax backward gradients dL/dx, where y=softmax(x)
   # dL/dx = y * (dL/dy - rowsum(dO_O)), where y = softmax(x)
   #####################################################################
+  if have_sink:
+    row_dot = nisa.tensor_reduce(np.add, nl.multiply(softmax_dy, softmax_y), axis=(1,), dtype=mixed_dtype)
   softmax_dx_local = nl.ndarray((par_dim(q_seq_tile_size), k_seq_tile_size), dtype=kernel_dtype, buffer=nl.sbuf)
   softmax_dx_local[:, :] = \
     nisa.scalar_tensor_tensor(data=softmax_dy[:, :],
@@ -981,6 +1031,18 @@ def _flash_attn_bwd_core(
                               op1=np.multiply,
                               operand1=softmax_y[:, :],
                               mask=mask)
+  
+  # sink gradient rows: dZ_sink = -(row_dot) * p_sink
+  if have_sink:
+    dZ_sink = nl.multiply(nl.multiply(row_dot, -1.0, mask=mask), p_sink, mask=mask)  # [par_dim(q), 1]
+    dZ_sink_rows = nisa.tensor_reduce(np.add, data=dZ_sink, axis=(1,), dtype=mixed_dtype)  # [par_dim(q)]
+    dsinks_rows_acc[:, local_i_q_seq_tile] = nl.loop_reduce(
+      dZ_sink_rows,
+      op=np.add,
+      loop_indices=(local_i_k_seq_tile,),
+      dtype=mixed_dtype,
+      mask=mask
+    )
 
   #####################################################################
   # Step 5.1 Calculate dK, with matmul(stationary=Q, moving=softmax_dx)

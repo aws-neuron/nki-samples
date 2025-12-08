@@ -3,6 +3,9 @@ on:
     issues:
        types: [closed]
 
+permissions:
+  issues: write
+
 jobs:
     auto_comment:
         runs-on: ubuntu-latest
