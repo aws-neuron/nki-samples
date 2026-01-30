@@ -12,12 +12,12 @@ import neuronxcc.nki.isa as nisa
 
 
 @nki.jit
-def nki_rmsnorm_kernel_lang(a_tensor, g_tensor, batch_invariant=True):
+def nki_rmsnorm_kernel_lang(a_tensor, g_tensor, deterministic=True):
     """
     RMSNorm with split reduction along hidden dimension
     
-    batch_invariant=True:  HIDDEN_TILE=256 (fewer chunks, fewer accumulations)
-    batch_invariant=False: HIDDEN_TILE=128 (more chunks, more accumulations)
+    deterministic=True:  HIDDEN_TILE=256 (fewer chunks, fewer accumulations)
+    deterministic=False: HIDDEN_TILE=128 (more chunks, more accumulations)
     
     This demonstrates REAL batch variance because different tile sizes
     change the order of floating-point additions during reduction.
@@ -33,10 +33,10 @@ def nki_rmsnorm_kernel_lang(a_tensor, g_tensor, batch_invariant=True):
     
     # CRITICAL: Tile size for REDUCTION dimension (hidden_dim)
     # Different sizes = different number of accumulations = variance!
-    if batch_invariant:
-        HIDDEN_TILE = 256  # Fewer chunks (e.g., 2 for hidden_dim=512)
+    if deterministic:
+        HIDDEN_TILE = 128  # Fixed - same accumulation order always
     else:
-        HIDDEN_TILE = 128  # More chunks (e.g., 4 for hidden_dim=512)
+        HIDDEN_TILE = min(64, hidden_dim) if hidden_dim <= 256 else (128 if hidden_dim <= 512 else 256)  # Adaptive
     
     ix = nl.arange(BATCH_TILE)[:, None]
     iw = nl.arange(1)[:, None]
@@ -101,12 +101,12 @@ def nki_rmsnorm_kernel_lang(a_tensor, g_tensor, batch_invariant=True):
 
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def nki_rmsnorm_kernel_isa(a_tensor, g_tensor, batch_invariant=True):
+def nki_rmsnorm_kernel_isa(a_tensor, g_tensor, deterministic=True):
     """
     RMSNorm with split reduction along hidden dimension
     
-    batch_invariant=True:  HIDDEN_TILE=256 (fewer chunks, fewer accumulations)
-    batch_invariant=False: HIDDEN_TILE=128 (more chunks, more accumulations)
+    deterministic=True:  HIDDEN_TILE=256 (fewer chunks, fewer accumulations)
+    deterministic=False: HIDDEN_TILE=128 (more chunks, more accumulations)
     
     This demonstrates REAL batch variance because different tile sizes
     change the order of floating-point additions during reduction.
@@ -122,10 +122,10 @@ def nki_rmsnorm_kernel_isa(a_tensor, g_tensor, batch_invariant=True):
     
     # CRITICAL: Tile size for REDUCTION dimension (hidden_dim)
     # Different sizes = different number of accumulations = variance!
-    if batch_invariant:
-        HIDDEN_TILE = 256  # Fewer chunks (e.g., 2 for hidden_dim=512)
+    if deterministic:
+        HIDDEN_TILE = 128  # Fixed - same accumulation order always
     else:
-        HIDDEN_TILE = 128  # More chunks (e.g., 4 for hidden_dim=512)
+        HIDDEN_TILE = min(64, hidden_dim) if hidden_dim <= 256 else (128 if hidden_dim <= 512 else 256)  # Adaptive
 
     # Create indices for chunked tile
     ix, iy = nl.mgrid[0:BATCH_TILE, 0:HIDDEN_TILE]

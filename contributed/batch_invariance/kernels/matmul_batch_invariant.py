@@ -11,12 +11,12 @@ import neuronxcc.nki.isa as nisa
 
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def nki_matmul_kernel_isa(a, b, batch_invariant=True):
+def nki_matmul_kernel_isa(a, b, deterministic=True):
     """
     Matrix multiplication with batch invariance parameter
     
-    batch_invariant=True:  Uses K_TILE=128 
-    batch_invariant=False: Dynamic K_TILE size used
+    deterministic=True:  Uses K_TILE=128 
+    deterministic=False: Dynamic K_TILE size used
     
     This demonstrates how different K tiling affects numerical results.
     """
@@ -25,10 +25,10 @@ def nki_matmul_kernel_isa(a, b, batch_invariant=True):
     M_TILE = 128
     
     # ONLY DIFFERENCE: K_TILE strategy
-    if batch_invariant:
+    if deterministic:
         K_TILE = 128  # Always hardcoded
     else:
-        K_TILE = 64 if K <= 512 else 128  # Adaptive
+        K_TILE = 64 if K <= 512 else 512 # Adaptive
 
     result = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
     
@@ -67,13 +67,14 @@ def nki_matmul_kernel_isa(a, b, batch_invariant=True):
     
     return result
 
+@nki.compiler.skip_middle_end_transformations
 @nki.jit
-def nki_matmul_kernel_lang(a, b, batch_invariant=True):
+def nki_matmul_kernel_lang(a, b, deterministic=True):
     """
     Matrix multiplication with batch invariance parameter
     
-    batch_invariant=True:  Uses K_TILE=128 
-    batch_invariant=False: Uses K_TILE=64  
+    deterministic=True:  Uses K_TILE=128 
+    deterministic=False: Uses K_TILE=64  
     
     This demonstrates how different K tiling affects numerical results.
     """
@@ -82,10 +83,10 @@ def nki_matmul_kernel_lang(a, b, batch_invariant=True):
     M_TILE = 128
     
     # ONLY DIFFERENCE: K_TILE strategy
-    if batch_invariant:
+    if deterministic:
         K_TILE = 128  # Always hardcoded
     else:
-        K_TILE = 64 if K <= 512 else 128  # Adaptive
+        K_TILE = 64 if K <= 512 else 512  # Adaptive
     
     result = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
     
