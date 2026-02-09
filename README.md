@@ -25,17 +25,6 @@ Documentation for NKI kernels are both inline (docstring) and available on the d
 
 ### src
 
-#### reference
-This folder contains the source code of the `neuronxcc.nki.kernels`, and they are optimized kernels from the Neuron Team serving as samples.
-
-All kernels located in this folder have numeric accuracy tests
-and performance benchmarks defined in the [test](test/) directory. We also demonstrate using these kernels end-to-end in our [integration tests](test/integration/).
-
-Note that these kernels are already being deployed as part of the Neuron stack. With flash attention as an example,
-[compiling Llama models with transformers-neuronx](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/transformers-neuronx/transformers-neuronx-developer-guide.html)
-will automatically invoke the `flash_fwd` kernel in [attention.py](src/nki_samples/reference/attention.py). Therefore, replacing the framework operators with these NKI kernels likely won't result in extra performance benefit.
-
-
 #### tutorials
 The [tutorial kernels](src/nki_samples/tutorials/) are for educational purpose and include the kernels that are used in NKI guides.
 You can clone these sample kernels and run them directly while reading through the
