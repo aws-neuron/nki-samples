@@ -42,16 +42,6 @@ The [contributed](contributed/) directory contains experimental and advanced NKI
 - Carry no compatibility guarantees
 - Behavior may be modified without prior notice
 
-### test
-
-#### unit
-The [unit tests](test/unit) directory contains unit tests and micro-benchmarks for standalone kernels. They run across multiple possible configurations,
-verify the numeric accuracy of the operation, and publish performance results to the [micro-benchmark](docs/benchmarks/micro-benchmark/) results.
-
-#### integration
-The [integration tests](tests/integration) folder contains integration tests of (selected) kernels. They verify the numeric accuracy of the model’s output,
-and publish end-to-end performance results into the [integration benchmarks](docs/benchmarks/integration) folder.
-
 ## Maintenance Policy
 NKI is currently released as **beta** while we gather feedback from our users and integrate it into the API. NKI API follow the [Neuron SDK Maintenance Policy](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/sdk-policy.html).
 
