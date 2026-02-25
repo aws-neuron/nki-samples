@@ -38,16 +38,25 @@ def nki_matmul_kernel_isa(a, b, deterministic=True):
         for k in nl.affine_range(K // K_TILE):
             # Allocate and load a: [K_TILE, M_TILE]
             a_tile = nl.ndarray((K_TILE, M_TILE), dtype=a.dtype, buffer=nl.sbuf)
+            a_start = k*K_TILE
+            a_end = min(K, a_start + K_TILE)
+
+            m_start = m*M_TILE
+            m_end = min(M, m_start + M_TILE)
+
             nisa.dma_copy(
+                src=a[a_start:a_end, m_start:m_end],
                 dst=a_tile,
-                src=a[k*K_TILE : (k+1)*K_TILE, m*M_TILE : (m+1)*M_TILE]
             )
             
             # Allocate and load b: [K_TILE, N]
+            b_start = k*K_TILE
+            b_end = min(K, b_start + K_TILE)
+
             b_tile = nl.ndarray((K_TILE, N), dtype=b.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
+                src=b[b_start:b_end, 0:N],
                 dst=b_tile,
-                src=b[k*K_TILE : (k+1)*K_TILE, 0:N]
             )
             # Matmul
             c_psum += nisa.nc_matmul(a_tile, b_tile)
@@ -55,9 +64,12 @@ def nki_matmul_kernel_isa(a, b, deterministic=True):
         # Store this M chunk
         c_sbuf = nl.ndarray((M_TILE, N), dtype=result.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(dst=c_sbuf, src=c_psum)
+
+        c_start = m*M_TILE
+        c_end = min(M, c_start + M_TILE)
         nisa.dma_copy(
-            dst=result[m*M_TILE : (m+1)*M_TILE, 0:N],
-            src=c_sbuf
+            src=c_sbuf,
+            dst=result[c_start:c_end, 0:N]
         )
     
     return result
