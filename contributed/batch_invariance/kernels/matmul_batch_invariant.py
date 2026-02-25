@@ -5,11 +5,10 @@ This kernel demonstrates batch invariance in matrix multiplication by controllin
 the M-dimension tiling strategy.
 """
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
+import nki
+import nki.isa as nisa
+import nki.language as nl
 
-@nki.compiler.skip_middle_end_transformations
 @nki.jit
 def nki_matmul_kernel_isa(a, b, deterministic=True):
     """
@@ -34,82 +33,31 @@ def nki_matmul_kernel_isa(a, b, deterministic=True):
     
     for m in nl.affine_range(M // M_TILE):
         # Accumulator for this M chunk
-        c_psum = nl.zeros((M_TILE, N), dtype=nl.float32, buffer=nl.psum)
-        
+        c_psum = nl.ndarray((M_TILE, N), dtype=nl.float32, buffer=nl.psum)
         # Reduction over K
         for k in nl.affine_range(K // K_TILE):
             # Allocate and load a: [K_TILE, M_TILE]
-            i_a_p, i_a_f = nl.mgrid[0:K_TILE, 0:M_TILE]
             a_tile = nl.ndarray((K_TILE, M_TILE), dtype=a.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
-                src=a[k*K_TILE + i_a_p, m*M_TILE + i_a_f],
-                dst=a_tile[i_a_p, i_a_f]
+                dst=a_tile,
+                src=a[k*K_TILE : (k+1)*K_TILE, m*M_TILE : (m+1)*M_TILE]
             )
             
             # Allocate and load b: [K_TILE, N]
-            i_b_p, i_b_f = nl.mgrid[0:K_TILE, 0:N]
             b_tile = nl.ndarray((K_TILE, N), dtype=b.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
-                src=b[k*K_TILE + i_b_p, i_b_f],
-                dst=b_tile[i_b_p, i_b_f]
+                dst=b_tile,
+                src=b[k*K_TILE : (k+1)*K_TILE, 0:N]
             )
-            
             # Matmul
             c_psum += nisa.nc_matmul(a_tile, b_tile)
         
         # Store this M chunk
-        i_out_p, i_out_f = nl.mgrid[0:M_TILE, 0:N]
-        c_sbuf = nl.copy(c_psum, dtype=result.dtype)
+        c_sbuf = nl.ndarray((M_TILE, N), dtype=result.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=c_sbuf, src=c_psum)
         nisa.dma_copy(
-            src=c_sbuf[i_out_p, i_out_f],
-            dst=result[m*M_TILE + i_out_p, i_out_f]
+            dst=result[m*M_TILE : (m+1)*M_TILE, 0:N],
+            src=c_sbuf
         )
-    
-    return result
-
-@nki.compiler.skip_middle_end_transformations
-@nki.jit
-def nki_matmul_kernel_lang(a, b, deterministic=True):
-    """
-    Matrix multiplication with batch invariance parameter
-    
-    deterministic=True:  Uses K_TILE=128 
-    deterministic=False: Uses K_TILE=64  
-    
-    This demonstrates how different K tiling affects numerical results.
-    """
-    M, K = a.shape
-    N = b.shape[1]
-    M_TILE = 128
-    
-    # ONLY DIFFERENCE: K_TILE strategy
-    if deterministic:
-        K_TILE = 128  # Always hardcoded
-    else:
-        K_TILE = 64 if K <= 512 else 512  # Adaptive
-    
-    result = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
-    
-    for m in nl.affine_range(M // M_TILE):
-        # Accumulator for this M chunk
-        c_psum = nl.zeros((M_TILE, N), dtype=nl.float32, buffer=nl.psum)
-        
-        # Reduction over K
-        for k in nl.affine_range(K // K_TILE):
-            # Load a: [M_TILE, K_TILE]
-            i_a_p, i_a_f = nl.mgrid[0:M_TILE, 0:K_TILE]
-            a_tile = nl.load(a[m*M_TILE + i_a_p, k*K_TILE + i_a_f])
-            
-            # Load b: [K_TILE, N]
-            i_b_p, i_b_f = nl.mgrid[0:K_TILE, 0:N]
-            b_tile = nl.load(b[k*K_TILE + i_b_p, i_b_f])
-            
-            # Matmul
-            c_psum += nl.matmul(a_tile, b_tile, transpose_x=False)
-        
-        # Store this M chunk
-        i_out_p, i_out_f = nl.mgrid[0:M_TILE, 0:N]
-        c_sbuf = nl.copy(c_psum, dtype=result.dtype)
-        nl.store(result[m*M_TILE + i_out_p, i_out_f], value=c_sbuf)
     
     return result
