@@ -1,133 +1,153 @@
 # NKI Batch Invariance Study
 
-A comprehensive study of batch invariance in Neuron Kernel Interface (NKI), replicating and extending [Thinking Machines' "Defeating Nondeterminism in LLM Inference"](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) research.
+A study of batch invariance in Neuron Kernel Interface (NKI), replicating and extending [Thinking Machines' "Defeating Nondeterminism in LLM Inference"](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) research.
+
+## What is Batch Invariance?
+
+Following [Thinking Machines' definition](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/):
+
+**Batch invariance** requires:
+1. **Run-to-run determinism**: Same prompt + same model + same inputs + same seed + same runtime config → bitwise-identical outputs across runs
+2. **Batching independence**: Changing inference batching behavior (batch size, request packing, continuous batching order) → no output change
+
+A batch-invariant system guarantees that the *way* you batch requests doesn't affect the numerical output—critical for reproducible LLM inference.
 
 ## Overview
 
-This project demonstrates how different NKI kernel implementations (`nki.lang` vs `nki.isa`) exhibit varying degrees of batch invariance, particularly when using reduced precision formats like bfloat16.
+This project demonstrates how different tile size configurations in NKI kernels can produce varying numerical results due to floating-point non-associativity. We test whether `nki.isa` operations maintain batch invariance when reduction tile sizes change—simulating what happens when a framework dynamically selects tile sizes based on input shape.
+
+### Baselines Used
+
+| Baseline Type | Purpose | Method |
+|---------------|---------|--------|
+| **CPU Reference** | Numerical parity | NKI kernel output vs PyTorch CPU (`torch.matmul`, manual RMSNorm) |
+| **NKI Self-Baseline** | Run-to-run determinism | Same kernel, 1000 iterations, verify bitwise-identical outputs |
+| **Tile Configuration Comparison** | Batching independence | Same kernel with different tile sizes (simulating shape-dependent selection) |
 
 ## Key Findings
 
-### 1. Batch Variance Occurs When Reduction Strategies Are Dynamic
+### 1. Run-to-Run Determinism Confirmed
 
-**Confirmed the core hypothesis**: Batch variance emerges when tile sizes for reduction dimensions are determined dynamically based on input shapes, exactly as described in the original paper.
+NKI ISA kernels produce bitwise-identical results across 1000 iterations with the same configuration.
 
-### 2. Precision Choice Dramatically Affects Variance Visibility
+### 2. Tile Size Invariance with `nki.isa`
 
-Our testing revealed significant amplification effects:
-- **MatMul (Lang)**: bfloat16 errors are **170x larger** than float32
-- **RMSNorm (Lang)**: bfloat16 errors are **21,845x larger** than float32
+**Critical finding**: `nki.isa` operations produce identical results regardless of tile size configuration in bfloat16 precision.
 
-### 3. NKI ISA Operations Show Superior Batch Invariance
+| Operation | K_TILE=128 vs K_TILE=64 | bfloat16 | float32 |
+|-----------|-------------------------|----------|---------|
+| **MatMul** | Tile invariant? | ✅ Yes (diff=0.0) | ✗ No (diff=6.1e-05) |
+| **RMSNorm** | Tile invariant? | ✅ Yes (diff=0.0) | ✗ No (diff=2.4e-07) |
 
-**Critical Discovery**: `nki.isa` operations demonstrate batch invariance in bfloat16 precision where `nki.lang` operations show variance.
+The bfloat16 invariance is the key result—reduced precision formats are where batch variance is most visible and problematic in practice, and ISA operations eliminate it entirely.
+
+### 3. Historical Note: `nki.lang` Showed Variance
+
+Prior to the NKI beta release, `nki.lang` operations exhibited tile-size-dependent variance:
 
 | Operation | Kernel Type | float32 | bfloat16 | Amplification |
 |-----------|-------------|---------|----------|---------------|
-| **MatMul** | `nki.lang` | ✗ Variance (4.6e-05) | ✗ Variance (0.0078) | 170.7x |
-| **MatMul** | `nki.isa` | ✗ Variance (6.1e-05) | ✅ **Invariant** (0.0000) | 0.0x |
+| **MatMul** | `nki.lang` | ✗ Variance (4.6e-05) | ✗ Variance (0.0078) | 170x |
 | **RMSNorm** | `nki.lang` | ✗ Variance (3.6e-07) | ✗ Variance (0.0078) | 21,845x |
-| **RMSNorm** | `nki.isa` | ✗ Variance (3.6e-07) | ✅ **Invariant** (0.0000) | 0.0x |
 
-### 4. NKI Design Patterns Naturally Promote Batch Invariance
+The bfloat16 amplification effect (errors 170-21,845x larger than float32) made variance highly visible in reduced precision formats. This behavior motivated the shift to `nki.isa` operations.
 
-NKI best practices emphasize static tile sizes, which inherently avoid batch variance. However, the framework doesn't prevent variance when dynamic strategies are implemented.
+## How Tile Size Selection Can Break Batch Invariance
 
-## Technical Analysis
+**The problem**: When reduction dimension tile sizes are selected based on input shape, the accumulation order changes. Due to floating-point non-associativity, different accumulation orders can produce different results:
 
-### Dynamic vs Static Tiling Strategies
 
-**Triton Split-K Approach** (Dynamic):
-```python
-num_pid_k ← tl.cdiv(k, block_k × split_k)  # Shape-dependent
-```
+(a + b) + c ≠ a + (b + c)  in finite precision
 
-**NKI Standard Approach** (Static):
-```python
-# Fixed tile sizes regardless of input shape
-TILES_IN_BLOCK_K = 4  # Static configuration
-```
+**Triton Split-K (Shape-Dependent)**:
+python
+num_pid_k ← tl.cdiv(k, block_k × split_k)  # Tile count varies with K dimension
 
-### Variance Demonstration
+**This Study's Simulation**:
+Our kernels use a `deterministic` flag to compare two fixed tile configurations, simulating what happens when a framework chooses tile sizes based on input shape:
 
-The same kernel with different K-tile configurations produces different results:
+python
+# MatMul kernel
+if deterministic:
+   K_TILE = 128                              # Fixed strategy
+else:
+   K_TILE = 64 if K <= 512 else 512          # Shape-dependent strategy
 
-```python
-# Different K-blocking strategies → different accumulation order
-result_1 = nki_matmul(lhs, rhs, TILES_IN_BLOCK_K=4)
-result_2 = nki_matmul(lhs, rhs, TILES_IN_BLOCK_K=8)
+# RMSNorm kernel
+HIDDEN_TILE = 128 if deterministic else 64    # Different accumulation granularity
 
-# Results differ due to floating-point non-associativity
-max_diff_bfloat16 = 4.000000    # Significant difference
-max_diff_float32 = 0.000244     # Smaller but still present
-```
+**Why this matters**: If an inference framework selects tile sizes based on batch dimensions, then changing batch size changes accumulation order—potentially breaking batch invariance even though each individual run is deterministic.
 
-## Experimental Results
+## Test Methodology
 
-### Test Configuration
-- **Matrix dimensions**: [256, 512] @ [512, 512] = [256, 512]
-- **Precision formats**: float32, bfloat16
-- **Kernel variants**: Lang (`nl.matmul`, `nl.sum`) vs ISA (`nisa.nc_matmul`, `nisa.tensor_reduce`)
+### What Each Test Validates
 
-### Batch Variance Summary
+| Test | Validates | Method |
+|------|-----------|--------|
+| `test_determinism()` | Run-to-run determinism | Same config → identical results across 1000 runs |
+| `test_tiling_invariance()` | Tile size independence | K_TILE=128 vs K_TILE=64 → same results? |
+| `test_matmul_parity()` | Numerical correctness | NKI output matches `torch.matmul` |
+| `test_rmsnorm_parity()` | Numerical correctness | NKI output matches PyTorch RMSNorm reference |
 
-```
-                          kernel  float32_error  bfloat16_error  amplification
-                Lang (nl.matmul)   4.577637e-05        0.007812     170.666667
-            ISA (nisa.nc_matmul)   6.103516e-05        0.000000       0.000000
-           RMSNorm Lang (nl.sum)   3.576279e-07        0.007812   21845.333333
-RMSNorm ISA (nisa.tensor_reduce)   3.576279e-07        0.000000       0.000000
-```
+### Tile Size Variance Demonstration
+
+python
+# Compare deterministic=True (K_TILE=128) vs deterministic=False (K_TILE=64)
+out_k128 = nki_matmul_kernel_isa(a, b, deterministic=True)
+out_k64  = nki_matmul_kernel_isa(a, b, deterministic=False)
+
+diff = (out_k128 - out_k64).abs().max().item()
+# With nki.isa: diff == 0.0 (batch invariant)
+
+## Running the Tests
+
+bash
+cd contributed/batch_invariance
+python test_batch_invariance.py
+
+### Expected Output
+
+1. **Determinism test**: 1000 iterations produce identical results
+2. **Parity tests**: NKI kernels match PyTorch reference within tolerance
+3. **Tiling invariance**: Different tile sizes produce identical results (diff=0.0)
+
+## Project Structure
+
+
+batch_invariance/
+├── README.md                           # This document
+├── test_batch_invariance.py            # Main test suite
+└── kernels/
+   ├── init.py
+   ├── matmul_batch_invariant.py       # MatMul ISA implementation
+   └── rmsnorm_batch_invariant.py      # RMSNorm ISA implementation
 
 ## Implications for LLM Inference
 
 ### For Deterministic Inference
-- **Use `nki.isa` operations** when batch invariance is critical
-- **Choose bfloat16 precision** with ISA kernels for deterministic results
-- **Implement static tiling strategies** to avoid shape-dependent variance
+- **Use `nki.isa` operations** for batch-invariant kernels
+- **bfloat16 precision** works reliably with ISA operations
+- **Fixed tile sizes** avoid shape-dependent variance (though ISA tolerates variation)
 
-### For Performance vs Determinism Trade-offs
-- `nki.lang` operations may offer performance benefits but sacrifice determinism
-- `nki.isa` operations provide determinism at potential performance cost
-- Precision choice significantly impacts the visibility of non-deterministic behavior
-
-## Running the Tests
-
-```bash
-cd contributed/batch_invariance
-python test_batch_invariance.py
-```
-
-### Expected Output
-The test will show:
-1. **Correctness verification**: Both kernels match PyTorch reference
-2. **Batch variance analysis**: Comparison of different tiling strategies
-3. **Precision impact**: Amplification effects between float32 and bfloat16
-
-## Project Structure
-
-```
-batch_invariance/
-├── README.md                           # This document
-├── test_batch_invariance.py           # Main test suite
-└── kernels/
-    ├── __init__.py
-    ├── matmul_batch_invariant.py      # MatMul implementations (Lang & ISA)
-    └── rmsnorm_batch_invariant.py     # RMSNorm implementations (Lang & ISA)
-```
+### Why This Matters
+Batch invariance ensures that:
+- Changing batch size doesn't change model outputs
+- Request packing order doesn't affect results
+- Continuous batching produces reproducible inference
+- Debugging and testing become tractable
 
 ## Future Work
 
 1. **Batch Invariant Attention**: Implement attention mechanisms using ISA operations
-2. **LLM Integration**: Compare standard NeuronLlama vs BatchInvariantLlama in full forward pass
-3. **Performance Analysis**: Quantify performance trade-offs between Lang and ISA approaches
-4. **Extended Precision Study**: Investigate other precision formats (fp16, int8)
+2. **LLM Integration**: Full forward pass comparison with varying batch configurations
+3. **Performance Analysis**: Quantify any performance trade-offs with ISA approach
+4. **Extended Precision Study**: Investigate fp16, int8 behavior
 
 ## Core Insight
 
-**Batch invariance is fundamentally a design choice, not a framework limitation.** While NKI's design patterns naturally encourage batch-invariant implementations through static tiling, the framework itself doesn't prevent variance when dynamic strategies are employed.
+**Batch invariance requires that accumulation order doesn't affect the final result.**
 
-The discovery that `nki.isa` operations maintain batch invariance in bfloat16 precision provides a clear path for deterministic LLM inference on Neuron hardware.
+Our tile size comparison (K_TILE=128 vs K_TILE=64) simulates shape-dependent tiling. The finding that `nki.isa` operations produce identical results regardless of tile configuration demonstrates a path to deterministic LLM inference on Neuron hardware—even when batching configurations change.
 
 ## References
 
@@ -139,4 +159,4 @@ The discovery that `nki.isa` operations maintain batch invariance in bfloat16 pr
 
 ## Author
 
-Implementation and analysis by Josh Longenecker based on the foundational work by Thinking Machines Lab.
+Implementation and analysis by Josh Longenecker, based on foundational work by Thinking Machines Lab.
