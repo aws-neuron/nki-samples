@@ -23,7 +23,6 @@ def nki_rmsnorm_kernel_isa(a, g, deterministic=True):
     for i in nl.affine_range(math.ceil(num_rows / BATCH_TILE)):
         b_start = i * BATCH_TILE
         b_end = min(num_rows, b_start + BATCH_TILE)
-        b_size = b_end - b_start
 
         sum_sq = nl.ndarray((BATCH_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=sum_sq, value=0.0)
@@ -32,11 +31,10 @@ def nki_rmsnorm_kernel_isa(a, g, deterministic=True):
         for h in nl.affine_range(math.ceil(hidden_dim / HIDDEN_TILE)):
             h_start = h * HIDDEN_TILE
             h_end = min(hidden_dim, h_start + HIDDEN_TILE)
-            h_size = h_end - h_start
 
             x = nl.ndarray((BATCH_TILE, HIDDEN_TILE), dtype=a.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
-                dst=x[0:b_size, 0:h_size], src=a[b_start:b_end, h_start:h_end]
+                dst=x, src=a[b_start:b_end, h_start:h_end]
             )
 
             x_sq = nl.ndarray(
@@ -68,15 +66,14 @@ def nki_rmsnorm_kernel_isa(a, g, deterministic=True):
         for h in nl.affine_range(math.ceil(hidden_dim / HIDDEN_TILE)):
             h_start = h * HIDDEN_TILE
             h_end = min(hidden_dim, h_start + HIDDEN_TILE)
-            h_size = h_end - h_start
 
             x = nl.ndarray((BATCH_TILE, HIDDEN_TILE), dtype=a.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
-                dst=x[0:b_size, 0:h_size], src=a[b_start:b_end, h_start:h_end]
+                dst=x, src=a[b_start:b_end, h_start:h_end]
             )
 
             g_tile = nl.ndarray((1, HIDDEN_TILE), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=g_tile[0:1, 0:h_size], src=g[0:1, h_start:h_end])
+            nisa.dma_copy(dst=g_tile, src=g[0:1, h_start:h_end])
 
             g_bcast = nl.ndarray(
                 (BATCH_TILE, HIDDEN_TILE), dtype=nl.float32, buffer=nl.psum
@@ -95,7 +92,7 @@ def nki_rmsnorm_kernel_isa(a, g, deterministic=True):
 
             nisa.dma_copy(
                 dst=out_tensor[b_start:b_end, h_start:h_end],
-                src=x_out[0:b_size, 0:h_size],
+                src=x_out,
             )
 
     return out_tensor

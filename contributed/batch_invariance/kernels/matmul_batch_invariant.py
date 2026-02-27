@@ -59,7 +59,8 @@ def nki_matmul_kernel_isa(a, b, deterministic=True):
                 dst=b_tile,
             )
             # Matmul
-            c_psum += nisa.nc_matmul(a_tile, b_tile)
+            nisa.nc_matmul(dst=c_psum, stationary=a_tile, moving=b_tile)
+            # c_psum += nisa.nc_matmul(a_tile, b_tile)
         
         # Store this M chunk
         c_sbuf = nl.ndarray((M_TILE, N), dtype=result.dtype, buffer=nl.sbuf)
