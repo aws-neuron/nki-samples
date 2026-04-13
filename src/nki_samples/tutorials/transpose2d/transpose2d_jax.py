@@ -1,5 +1,5 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 JAX implementation for transpose2d NKI tutorial.
 

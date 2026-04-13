@@ -1,13 +1,14 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 NKI baremetal implementation for transpose2d NKI tutorial.
 """
 
 import numpy as np
 # NKI_EXAMPLE_33_BEGIN
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+import nki
+import nki.language as nl
+import nki.isa as nisa
 
 
 @nki.jit
@@ -36,7 +37,6 @@ def tensor_transpose2D_kernel_(in_tensor, shape2D):
   Args:
     in_tensor: an input tensor
     shape2D: tuple representing the dimensions to be transposed: (#rows, #cols)
-    out_tensor: an output (transposed) tensor
   """
   out_tensor = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype,
                           buffer=nl.shared_hbm)
@@ -44,29 +44,27 @@ def tensor_transpose2D_kernel_(in_tensor, shape2D):
   sz_p, _ = in_tensor.shape
 
   # Load input data from external memory to on-chip memory
-  in_tile = nl.load(in_tensor)
+  in_tile = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=in_tile, src=in_tensor)
 
   # Performing f1/f2 transpose
   # ==========================
   # The desired transpose pattern is provided as an input:
   sz_f1, sz_f2 = shape2D
 
-  # We're going to need 3 indices to perform f1:f2 transpose.
-  # - i_p0 is the parallel index
-  # - i_f1 and i_f2 are both free-dim indices, and will be used to transpose between the f1/f2 axes
-  i_p0 = nl.arange(sz_p)[:, None, None]
-  i_f1 = nl.arange(sz_f1)[None, :, None]
-  i_f2 = nl.arange(sz_f2)[None, None, :]
-
-  # Perform the transposition via a SBUF-to-SBUF copy, with access-pattern manipulation
-  # Note that we have 2D tensors and 3 indices, since we need to represent a 2D access pattern *per partition*
-  # RHS traverses an F1 x F2 matrix in a row major manner
-  # LHS traverses an F2 x F1 (new) matrix in a row major manner
-  out_tile = nl.ndarray(shape=(sz_p, sz_f2*sz_f1), dtype=out_tensor.dtype)
-  out_tile[i_p0, i_f2*sz_f1+i_f1] = nl.copy(in_tile[i_p0, i_f1*sz_f2+i_f2])
+  # Perform the transposition via element-wise SBUF-to-SBUF copies
+  # with index arithmetic to scatter elements into transposed positions.
+  # RHS traverses an F1 x F2 matrix in row major order
+  # LHS traverses an F2 x F1 (transposed) matrix in row major order
+  out_tile = nl.ndarray(shape=(sz_p, sz_f2*sz_f1), dtype=in_tensor.dtype,
+                        buffer=nl.sbuf)
+  for i_f1 in nl.affine_range(sz_f1):
+    for i_f2 in nl.affine_range(sz_f2):
+      nisa.tensor_copy(dst=out_tile[:, nl.ds(i_f2*sz_f1+i_f1, 1)],
+                       src=in_tile[:, nl.ds(i_f1*sz_f2+i_f2, 1)])
 
   # Finally, we store out_tile to external memory
-  nl.store(out_tensor, value=out_tile)
+  nisa.dma_copy(dst=out_tensor, src=out_tile)
 
   return out_tensor
   # NKI_EXAMPLE_33_END

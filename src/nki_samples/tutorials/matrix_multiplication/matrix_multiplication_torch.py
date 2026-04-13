@@ -1,19 +1,19 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 PyTorch implementation for matrix multiplication NKI tutorial.
 
 """
 
 import torch
-from torch_xla.core import xla_model as xm
+import torch_xla
 
 from matrix_multiplication_nki_kernels import nki_matmul_basic_, nki_matmul_tiled_, nki_matmul_hoist_load_, nki_matmul_block_free_dimension_, nki_matmul_fully_optimized_
 
 if __name__ == "__main__":
 
   # NKI_EXAMPLE_17_BEGIN
-  device = xm.xla_device()
+  device = torch_xla.device()
   cpu = torch.device('cpu')
 
   # Test the small workload with basic kernel

@@ -1,5 +1,5 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 Mamba-v1 PyTorch Reference Implementation.
 
@@ -7,8 +7,7 @@ Mamba-v1 PyTorch Reference Implementation.
 
 # NKI_EXAMPLE_24_BEGIN
 import torch
-import torch_neuronx
-import torch_xla.core.xla_model as xm
+import torch_xla
 import os
 import argparse
 
@@ -82,7 +81,7 @@ if __name__ == "__main__":
 
     dtype = torch.float32
 
-    device = xm.xla_device()
+    device = torch_xla.device()
 
     delta = torch.ones(batch, channels, seq_len, dtype=dtype, device=device)
     u = torch.ones(batch, channels, seq_len, dtype=dtype, device=device)
@@ -96,9 +95,9 @@ if __name__ == "__main__":
 
     C = torch.ones(batch, state_size, seq_len, dtype=dtype, device=device)
 
-    xm.mark_step()
+    torch_xla.sync()
     torch_out = mamba_layer(delta, A, B, u, C)
-    xm.mark_step()
+    torch_xla.sync()
     print(torch_out)
     # NKI_EXAMPLE_24_END
 
@@ -106,9 +105,9 @@ if __name__ == "__main__":
         # Call NKI mamba_v1 kernel to check accuracy
         from mamba_nki_kernels import mamba_v1
 
-        xm.mark_step()
+        torch_xla.sync()
         nki_out = mamba_v1(delta, u, A, B, C)
-        xm.mark_step()
+        torch_xla.sync()
 
         allclose = torch.allclose(torch_out, nki_out, atol=1e-2, rtol=1e-2)
 

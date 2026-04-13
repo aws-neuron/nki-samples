@@ -1,5 +1,5 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 NKI implementation for matrix multiplication NKI tutorial.
 
@@ -28,8 +28,10 @@ def nki_matmul_basic_(lhsT, rhs):
   K, M = lhsT.shape
   K_, N = rhs.shape
 
-  # Check that the contraction dimension matches and all dimensions are what were expected.
-  assert K == K_, f"Expected contraction dimension to match on both lhsT ({K}) and rhs ({K})"
+  # Check that the contraction dimension matches and all dimensions
+  #are what were expected.
+  assert K == K_, \
+    f"Expected contraction dimension to match on both lhsT ({K}) and rhs ({K})"
   assert K == 128, f"Expected contraction dimension to be 128, but got {K}"
   assert M == 64, f"Expected lhsT matrix to have dimension M of 64, but got {M}"
   assert N == 512, f"Expected rhs matrix to have dimension N of 512, but got {N}"
@@ -47,18 +49,19 @@ def nki_matmul_basic_(lhsT, rhs):
   nisa.dma_copy(dst=lhs_tile, src=lhsT)
   nisa.dma_copy(dst=rhs_tile, src=rhs)
 
-  # Create a tensor in PSUM to accumulate the matrix multiple result in (not initialized)
+  # Create a tensor in PSUM to accumulate the result in (uninitialized)
   result_psum = nl.ndarray(result.shape, dtype=nl.float32, buffer=nl.psum)
 
   # Perform the matrix-multiplication
   # Note: A NKI matmul instruction always writes to PSUM in float32 data-type
   nisa.nc_matmul(result_psum, lhs_tile, rhs_tile)
 
-  # Create a tensor in SBUF and copy the result from PSUM back to SBUF, and cast to expected output data-type
+  # Create a tensor in SBUF and copy the result from PSUM back to SBUF, 
+  # and cast to expected output data-type
   result_sbuf = nl.ndarray(result_psum.shape, dtype=result.dtype, buffer=nl.sbuf)
-  nisa.tensor_copy(dst=result_sbuf, src=result_psum, dtype=result.dtype)
+  nisa.tensor_copy(dst=result_sbuf, src=result_psum)
 
-  # The result of a [64,128] x [128,512] matrix multiplication has a shape of [64, 512].
+  # The result of [64,128] x [128,512] matrix multiplication has a shape of [64, 512].
   # This dictates which indices to use to address the result tile.
   nisa.dma_copy(dst=result, src=result_sbuf)
 
@@ -93,9 +96,12 @@ def nki_matmul_tiled_(lhsT, rhs):
   TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
   # Verify that the input matrices are a multiple of the tile dimensions.
-  assert M % TILE_M == 0, f"Expected M, {M}, to be a multiple of stationary free-dimension max, {TILE_M}"
-  assert N % TILE_N == 0, f"Expected N, {N}, to be a multiple of moving free-dimension max, {TILE_N}"
-  assert K % TILE_K == 0, f"Expected K, {K}, to be a multiple of the partition dimension max, {TILE_K}"
+  assert M % TILE_M == 0, \
+    f"Expected M, {M}, to be a multiple of stationary free-dimension max, {TILE_M}"
+  assert N % TILE_N == 0, \
+    f"Expected N, {N}, to be a multiple of moving free-dimension max, {TILE_N}"
+  assert K % TILE_K == 0, \
+    f"Expected K, {K}, to be a multiple of the partition dimension max, {TILE_K}"
 
   # Create a space for the result in HBM (not initialized)
   result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
@@ -124,10 +130,12 @@ def nki_matmul_tiled_(lhsT, rhs):
 
       # Copy the result from PSUM back to SBUF, and cast to expected output data-type
       res_sb = nl.ndarray(res_psum.shape, dtype=result.dtype, buffer=nl.sbuf)
-      nisa.tensor_copy(dst=res_sb, src=res_psum, dtype=result.dtype)
+      nisa.tensor_copy(dst=res_sb, src=res_psum)
 
       # Copy the result from SBUF to HBM.
-      nisa.dma_copy(dst=result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N], src=res_sb)
+      nisa.dma_copy(dst=result[m * TILE_M:(m + 1) * TILE_M,
+                               n * TILE_N:(n + 1) * TILE_N],
+                    src=res_sb)
 
   return result
   # NKI_EXAMPLE_18_END
@@ -161,9 +169,12 @@ def nki_matmul_hoist_load_(lhsT, rhs):
   TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
   # Verify that the input matrices are a multiple of the tile dimensions.
-  assert M % TILE_M == 0, f"Expected M, {M}, to be a multiple of stationary free-dimension max, {TILE_M}"
-  assert N % TILE_N == 0, f"Expected N, {N}, to be a multiple of moving free-dimension max, {TILE_N}"
-  assert K % TILE_K == 0, f"Expected K, {K}, to be a multiple of the partition dimension max, {TILE_K}"
+  assert M % TILE_M == 0, \
+    f"Expected M, {M}, to be a multiple of stationary free-dimension max, {TILE_M}"
+  assert N % TILE_N == 0, \
+    f"Expected N, {N}, to be a multiple of moving free-dimension max, {TILE_N}"
+  assert K % TILE_K == 0, \
+    f"Expected K, {K}, to be a multiple of the partition dimension max, {TILE_K}"
 
   # Create a space for the result in HBM (not initialized)
   result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
@@ -204,10 +215,12 @@ def nki_matmul_hoist_load_(lhsT, rhs):
 
       # Copy the result from PSUM back to SBUF, and cast to expected output data-type
       res_sb = nl.ndarray(shape=(TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
-      nisa.tensor_copy(dst=res_sb, src=res_psum, dtype=result.dtype)
+      nisa.tensor_copy(dst=res_sb, src=res_psum)
 
       # Copy the result from SBUF to HBM.
-      nisa.dma_copy(dst=result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N], src=res_sb)
+      nisa.dma_copy(dst=result[m * TILE_M:(m + 1) * TILE_M,
+                               n * TILE_N:(n + 1) * TILE_N],
+                    src=res_sb)
 
   return result
   # NKI_EXAMPLE_19_END
@@ -263,7 +276,9 @@ def nki_matmul_block_free_dimension_(lhsT, rhs):
       lhsT_tiles_internal = []
       for k in nl.affine_range(K // TILE_K):
         # Allocate space in SBUF for the tile (uninitialized)
-        lhsT_tile = nl.ndarray(shape=(TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
+        lhsT_tile = nl.ndarray(shape=(TILE_K, TILE_M),
+                               dtype=lhsT.dtype,
+                               buffer=nl.sbuf)
         # Copy the tile from HBM to SBUF
         nisa.dma_copy(dst=lhsT_tile,
                       src=lhsT[k * TILE_K:(k + 1) * TILE_K,
@@ -283,7 +298,9 @@ def nki_matmul_block_free_dimension_(lhsT, rhs):
         rhs_tiles_internal = []
         for k in nl.affine_range(K // TILE_K):
           # Allocate space in SBUF for the tile (uninitialized)
-          rhs_tile = nl.ndarray(shape=(TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
+          rhs_tile = nl.ndarray(shape=(TILE_K, TILE_N),
+                                dtype=rhs.dtype,
+                                buffer=nl.sbuf)
           # Copy the tile from HBM to SBUF
           nisa.dma_copy(dst=rhs_tile,
                         src=rhs[k * TILE_K:(k + 1) * TILE_K,
@@ -298,13 +315,20 @@ def nki_matmul_block_free_dimension_(lhsT, rhs):
       for bm in nl.affine_range(TILES_IN_BLOCK_M):
         for bn in nl.affine_range(TILES_IN_BLOCK_N):
           # Allocate a tensor in PSUM
-          result_tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+          result_tile = nl.ndarray(shape=(TILE_M, TILE_N),
+                                   dtype=nl.float32,
+                                   buffer=nl.psum)
           for k in nl.affine_range(K // TILE_K):
             # Accumulate partial-sums into PSUM
-            nisa.nc_matmul(dst=result_tile, stationary=lhsT_tiles[bm][k], moving=rhs_tiles[bn][k])
+            nisa.nc_matmul(dst=result_tile,
+                           stationary=lhsT_tiles[bm][k],
+                           moving=rhs_tiles[bn][k])
   
-          # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-          result_tmp = nl.ndarray(shape=result_tile.shape, dtype=result.dtype, buffer=nl.sbuf)
+          # Copy the result from PSUM back to SBUF, and cast to expected
+          # output data-type
+          result_tmp = nl.ndarray(shape=result_tile.shape,
+                                  dtype=result.dtype,
+                                  buffer=nl.sbuf)
           nisa.tensor_copy(dst=result_tmp, src=result_tile)
 
           # Copy the result from SBUF to HBM.
@@ -362,9 +386,12 @@ def nki_matmul_fully_optimized_(
   BLOCK_K = TILE_K * TILES_IN_BLOCK_K
 
   # Verify the size is a multiple of block size
-  assert M % BLOCK_M == 0, f"Expected M {M} to be divisble by {BLOCK_M} when there are {TILES_IN_BLOCK_M}"
-  assert N % BLOCK_N == 0, f"Expected N {N} to be divisble by {BLOCK_N} when there are {TILES_IN_BLOCK_N}"
-  assert K % BLOCK_K == 0, f"Expected K {K} to be divisble by {BLOCK_K} when there are {TILES_IN_BLOCK_K}"
+  assert M % BLOCK_M == 0, \
+    f"Expected M {M} to be divisible by {BLOCK_M} when there are {TILES_IN_BLOCK_M}"
+  assert N % BLOCK_N == 0, \
+    f"Expected N {N} to be divisible by {BLOCK_N} when there are {TILES_IN_BLOCK_N}"
+  assert K % BLOCK_K == 0, \
+    f"Expected K {K} to be divisible by {BLOCK_K} when there are {TILES_IN_BLOCK_K}"
 
   # Create a space for the result in HBM (not initialized)
   result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
@@ -396,15 +423,17 @@ def nki_matmul_fully_optimized_(
       result_tmps.append(block_m)
 
     # Blocking K dimension (the contraction dimension)
-    # Use `sequential_range` because we do not want the compiler to change this loop by, 
-    # for example, vectorizing it
+    # Use `sequential_range` because we do not want the compiler
+    # to change this loop by, for example, vectorizing it
     for k in nl.sequential_range(NUM_BLOCK_K):
       # Loading tiles from rhs
       # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
       rhs_tiles = []
       for bk_r in range(TILES_IN_BLOCK_K):
         # Allocate rhs_tile tensor, TILE_K x BLOCK_N
-        rhs_tile = nl.ndarray(shape=(TILE_K, BLOCK_N), dtype=rhs.dtype, buffer=nl.sbuf)
+        rhs_tile = nl.ndarray(shape=(TILE_K, BLOCK_N),
+                              dtype=rhs.dtype,
+                              buffer=nl.sbuf)
         # Copy block tile from rhs, to rhs_tile.
         nisa.dma_copy(dst=rhs_tile[0:TILE_K, 0:BLOCK_N],
                       src=rhs[(TILES_IN_BLOCK_K * k + bk_r) *
@@ -420,7 +449,9 @@ def nki_matmul_fully_optimized_(
         lhsT_tiles = []
         for bk_l in nl.affine_range(TILES_IN_BLOCK_K):
           # Allocate lhsT_tile in SBUF (uninitialized)
-          lhsT_tile = nl.ndarray(shape=(TILE_K, BLOCK_M), dtype=lhsT.dtype, buffer=nl.sbuf)
+          lhsT_tile = nl.ndarray(shape=(TILE_K, BLOCK_M),
+                                 dtype=lhsT.dtype,
+                                 buffer=nl.sbuf)
           # Copy block tile from lhsT to lhsT_tile
           nisa.dma_copy(dst=lhsT_tile[0:TILE_K, 0:BLOCK_M],
                         src=lhsT[(TILES_IN_BLOCK_K * k + bk_l) *
@@ -433,12 +464,16 @@ def nki_matmul_fully_optimized_(
         for bn in nl.affine_range(TILES_IN_BLOCK_N):
           for bm in nl.affine_range(TILES_IN_BLOCK_M):
             # Allocate result_tile in PSUM (uninitialized)
-            result_tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            result_tile = nl.ndarray(shape=(TILE_M, TILE_N),
+                                     dtype=nl.float32,
+                                     buffer=nl.psum)
             for bk in nl.affine_range(TILES_IN_BLOCK_K):
               # Perform matrix multiply on a tile.
-              nisa.nc_matmul(dst=result_tile,
-                             stationary=lhsT_tiles[bk][0:TILE_K, bm * TILE_M:(bm + 1) * TILE_M],
-                             moving=rhs_tiles[bk][0:TILE_K, bn * TILE_N:(bn + 1) * TILE_N])
+              nisa.nc_matmul(
+                dst=result_tile,
+                stationary=lhsT_tiles[bk][0:TILE_K, bm * TILE_M:(bm + 1) * TILE_M],
+                moving=rhs_tiles[bk][0:TILE_K, bn * TILE_N:(bn + 1) * TILE_N]
+              )
             # Accumulate the result into the result_tmps tile.
             nisa.tensor_tensor(dst=result_tmps[m][bm][bn],
                                data1=result_tmps[m][bm][bn],
@@ -449,10 +484,13 @@ def nki_matmul_fully_optimized_(
     for m in nl.affine_range(NUM_BLOCK_M):
       for bm in nl.affine_range(TILES_IN_BLOCK_M):
         # coalesce result tiles for better DMA performance
-        result_packed = nl.ndarray(shape=(TILE_M, BLOCK_N), dtype=nl.float32, buffer=nl.sbuf)
+        result_packed = nl.ndarray(shape=(TILE_M, BLOCK_N),
+                                   dtype=nl.float32,
+                                   buffer=nl.sbuf)
         for bn in nl.affine_range(TILES_IN_BLOCK_N):
-          nisa.tensor_copy(dst=result_packed[0:TILE_M, bn * TILE_N:(bn + 1) * TILE_N],
-                           src=result_tmps[m][bm][bn][0:TILE_M, 0:TILE_N])
+          nisa.tensor_copy(
+            dst=result_packed[0:TILE_M, bn * TILE_N:(bn + 1) * TILE_N],
+            src=result_tmps[m][bm][bn][0:TILE_M, 0:TILE_N])
 
         # Copy packed result from SBUF to HBM.
         nisa.dma_copy(dst=result[(TILES_IN_BLOCK_M * m + bm) *
