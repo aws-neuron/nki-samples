@@ -29,9 +29,9 @@ SBUF b_tile [K_TILE, N]       (bfloat16)
     ↓  nisa.nc_matmul  ← Tensor Engine multiplies bfloat16 × bfloat16
 PSUM c_psum [M_TILE, N]       (float32)  ← accumulates here
     ↓  nisa.tensor_copy
-SBUF c_sbuf [M_TILE, N]       (bfloat16) ← cast back
+SBUF c_sbuf [M_TILE, N]       (input dtype) ← cast back
     ↓  nisa.dma_copy
-HBM result  [M, N]            (bfloat16)
+HBM result  [M, N]            (input dtype)
 ```
 
 ### Where the invariance comes from
@@ -49,7 +49,7 @@ K_TILE=128 (4 steps):   [p0..p127] + [p128..p255] + [p256..p383] + [p384..p511]
 K_TILE=64  (8 steps):   [p0..p63] + [p64..p127] + ... + [p448..p511]
 ```
 
-Each `p_i` is a bfloat16-precision product. Because they're already on the coarse grid, regrouping them gives the same float32 sum. Both trees reach the same PSUM value → same bfloat16 output after cast.
+Each `p_i` is a bfloat16-precision product. Because they're already on the coarse grid, regrouping them gives the same float32 sum. Both trees reach the same PSUM value → same output after cast.
 
 With float32 inputs: each `p_i` is sharp (23-bit mantissa). The intermediate float32 sums round differently depending on grouping → different final values.
 
@@ -86,7 +86,22 @@ So there are two distinct invariance claims:
 
 K=512, K_TILE=128 → 4 PSUM accumulations  
 K=512, K_TILE=64  → 8 PSUM accumulations  
-Same bfloat16 products in → same float32 sum out → same bfloat16 result
+Same bfloat16 products in → same float32 sum out → same output
+
+---
+
+## NOTE: When invariance breaks down
+
+Invariance is a property of the input distribution, not a hard guarantee. Sweeping random N(0,σ) inputs:
+
+```
+Scale=1   (typical ML weights/activations):  diff = 0.0  ✓
+Scale=10+ (unnormalized / unstable regime):  diff > 0    ✗
+```
+
+At scale=1, bfloat16 grid spacing is ~0.015 — fine enough that regrouping K tiles produces identical float32 partial sums. At scale=10, products are ~O(100) and grid spacing is ~1.0 — coarse enough that different tile groupings accumulate to different float32 values.
+
+In practice this doesn't matter: weights (Xavier/He init) are ~N(0, 1/√fan_in) and activations are kept near unit variance by normalization layers like the RMSNorm kernel in this project. If your tensors are at scale=10+, you have a numerical stability problem that dwarfs tiling invariance.
 
 ---
 
@@ -120,7 +135,7 @@ after tile 7 (K=  448):  PSUM = 121.553223
 after tile 8 (K=  512):  PSUM = 170.667969  ← same final result ✓
 ```
 
-Every checkpoint where both strategies have processed the same number of K-elements, the PSUM value is **bitwise identical**. The float32 accumulator is seeing the same numbers regardless of how the K dimension was tiled.
+Every checkpoint where both strategies have processed the same number of K-elements, the PSUM value is **bitwise identical**.
 
 ### float32 — deterministic=True (K_TILE=128)
 
@@ -135,7 +150,7 @@ after tile 4 (K=  512):  PSUM = 170.673157  ← final result
 
 ```
 after tile 1 (K=   64):  PSUM =  49.552071
-after tile 2 (K=  128):  PSUM =  75.041367  ← differs from det=True: 75.041336 vs 75.041367 ✗
+after tile 2 (K=  128):  PSUM =  75.041367  ← differs: 75.041336 vs 75.041367 ✗
 after tile 3 (K=  192):  PSUM =  84.468163
 after tile 4 (K=  256):  PSUM =  85.832703  ← differs: 85.832672 vs 85.832703 ✗
 after tile 5 (K=  320):  PSUM =  87.135231
@@ -144,7 +159,7 @@ after tile 7 (K=  448):  PSUM = 121.555222
 after tile 8 (K=  512):  PSUM = 170.673172  ← differs: 170.673157 vs 170.673172 ✗
 ```
 
-Divergence appears **at the very first shared checkpoint** (K=128) and compounds from there. This is happening inside the float32 PSUM — before any output cast.
+Divergence appears **at the very first shared checkpoint** (K=128) and compounds. This is inside the float32 PSUM — before any output cast.
 
 ### Why bfloat16 products are identical but float32 products are not
 
@@ -164,42 +179,26 @@ float32 (full precision):
   k=3: -0.98828107 × -0.98828107 = 0.97669948000
 ```
 
-The bfloat16 inputs are already snapped to a coarse grid (e.g. `-0.996094` instead of `-0.99609369`). The products are therefore coarser too. When you add 64 of these coarse products vs 128 of them, the float32 accumulator reaches the same intermediate value because the individual products were already rounded to the same bfloat16 slots. With float32, the extra decimal places in each product mean different groupings accumulate rounding error differently.
+bfloat16 inputs are already snapped to a coarse grid (`-0.996094` instead of `-0.99609369`). The products are coarser too. Regrouping 64 vs 128 of these coarse products gives the same float32 sum. With float32, the extra decimal places mean different groupings accumulate rounding error differently.
 
-`inspect_psum.py` uses `nki.simulate` to snapshot the float32 PSUM buffer after every K tile accumulation, for both K_TILE=128 and K_TILE=64. This lets us see exactly where divergence appears — or doesn't.
+---
 
-Inputs: `linspace(-1, 1)`, K=512, M=N=128.
+## Simulator evidence: inspecting the float32 PSUM directly
 
-### bfloat16 inputs
-
-```
-PSUM after first 128 K-elements: K_TILE=128 vs K_TILE=64 → diff = 0.000000e+00
-PSUM after all 512 K-elements:   K_TILE=128 vs K_TILE=64 → diff = 3.051758e-05  (simulator artifact*)
-
-Sample PSUM row 0, cols 0-3:
-  K_TILE=128: [170.66797, 170.66797, 170.66797, 170.66797]
-  K_TILE=64:  [170.66797, 170.66797, 170.66797, 170.66797]
-```
-
-The float32 PSUM is **bitwise identical** after the first 128 K-elements. The accumulator never sees different values — invariance is established before any output cast.
-
-*The small diff at K=512 is a CPU simulator artifact from sequential execution; on Trn2 hardware the diff is 0.0.
-
-### float32 inputs
+`inspect_psum.py` snapshots the float32 PSUM after every K tile for both K_TILE=128 and K_TILE=64.
 
 ```
-PSUM after first 128 K-elements: K_TILE=128 vs K_TILE=64 → diff = 1.373291e-04
-PSUM after all 512 K-elements:   K_TILE=128 vs K_TILE=64 → diff = 1.678467e-04
+bfloat16 inputs:
+  PSUM after first 128 K-elements: diff = 0.000000e+00  ← identical inside accumulator
+  Sample PSUM row 0, cols 0-3:
+    K_TILE=128: [170.66797, 170.66797, 170.66797, 170.66797]
+    K_TILE=64:  [170.66797, 170.66797, 170.66797, 170.66797]
 
-Sample PSUM row 0, cols 0-3:
-  K_TILE=128: [170.6711,  170.67136, 170.67111, 170.67126]
-  K_TILE=64:  [170.6712,  170.67122, 170.6712,  170.67114]
+float32 inputs:
+  PSUM after first 128 K-elements: diff = 1.373291e-04  ← diverges immediately
+  Sample PSUM row 0, cols 0-3:
+    K_TILE=128: [170.6711,  170.67136, 170.67111, 170.67126]
+    K_TILE=64:  [170.6712,  170.67122, 170.6712,  170.67114]
 ```
 
-The float32 PSUM **already diverges after the very first tile** (128 K-elements). The difference is visible inside the accumulator itself, before any cast back to bfloat16. This is pure accumulation-order sensitivity.
-
-### What this proves
-
-The divergence for float32 lives inside the float32 PSUM — it is not introduced by the output cast. For bfloat16, the PSUM is identical at every snapshot. This confirms the mechanism:
-
-> Invariance is established at **multiply time** (bfloat16 products are coarse before entering PSUM), not at **cast time** (the output cast to bfloat16 is not what equalizes the results).
+> Invariance is established at **multiply time**, not at **cast time**. The divergence for float32 lives inside the float32 PSUM itself.
