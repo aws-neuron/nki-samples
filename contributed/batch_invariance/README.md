@@ -41,7 +41,41 @@ NKI ISA kernels produce bitwise-identical results across 1000 iterations with th
 
 The bfloat16 invariance is the key result—reduced precision formats are where batch variance is most visible and problematic in practice, and ISA operations eliminate it entirely.
 
-### 3. Historical Note: `nki.lang` Showed Variance
+### 3. Attention Kernel — Invariant in bfloat16
+
+Scaled dot-product attention (`nki_attention_kernel_isa`) with KV_TILE=128 vs KV_TILE=64:
+
+| | bfloat16 | float32 |
+|---|---|---|
+| KV_TILE invariance | ✅ diff=0.0 | ✗ diff~3.5e-7 (expected) |
+| Run-to-run (10 runs) | ✅ diff=0.0 | ✅ diff=0.0 |
+| CPU parity | ✅ max_diff=1.9e-3 | ✅ max_diff=3.2e-6 |
+
+### 4. Full Forward Pass — Invariance Holds End-to-End
+
+Transformer block: RMSNorm → Attention → residual → RMSNorm → FFN → residual. All sub-ops use NKI ISA kernels. Tested on NKI `0.3.0` on Trainium hardware.
+
+| Test | bfloat16 | float32 |
+|---|---|---|
+| Run-to-run determinism (5 runs) | ✅ diff=0.0 | ✅ diff=0.0 |
+| Tile-size invariance (det vs non-det) | ✅ diff=0.0 | ✗ diff=1.5e-5 (expected) |
+| Batch position invariance | ✅ diff=0.0 | — |
+| CPU parity (7 chained ops) | ✅ max_diff=0.137 | ✅ max_diff=0.012 |
+
+### 5. Continuous Batching — Invariance Survives Request Packing
+
+Simulates a target sequence processed at different positions in a packed batch, with different neighbor content, and with varying total KV context lengths.
+
+| Test | bfloat16 | float32 |
+|---|---|---|
+| RMSNorm: target at pos 0,1,63,127 | ✅ diff=0.0 | ✅ diff=0.0 |
+| RMSNorm: different neighbor content | ✅ diff=0.0 | ✅ diff=0.0 |
+| Attention: KV_TILE=128 vs 64 across context lengths | ✅ diff=0.0 | ✗ diff~3.5e-7 (expected) |
+| Attention: run-to-run (10 runs) | ✅ diff=0.0 | ✅ diff=0.0 |
+
+**Conclusion**: batch invariance holds through the full forward pass and under continuous batching. In bfloat16, it holds even when tiling strategy changes — the bfloat16 cast from float32 PSUM absorbs sub-LSB accumulation-order differences. In float32, fixed tiling (`deterministic=True`) is required.
+
+### 6. Historical Note: `nki.lang` Showed Variance
 
 Prior to the NKI beta release, `nki.lang` operations exhibited tile-size-dependent variance:
 
@@ -113,14 +147,18 @@ python test_batch_invariance.py
 
 ## Project Structure
 
-
+```
 batch_invariance/
-├── README.md                           # This document
-├── test_batch_invariance.py            # Main test suite
+├── README.md
+├── EXPLAINER.md                            # Deep-dive on why bfloat16 gives invariance
+├── test_batch_sizes.py                     # Batch size invariance across MatMul/RMSNorm/Attention
+├── test_forward_pass.py                    # Full transformer block end-to-end invariance
+├── simulate_continuous_batching.py         # Request packing / continuous batching simulation
 └── kernels/
-   ├── init.py
-   ├── matmul_batch_invariant.py       # MatMul ISA implementation
-   └── rmsnorm_batch_invariant.py      # RMSNorm ISA implementation
+    ├── matmul_batch_invariant.py
+    ├── rmsnorm_batch_invariant.py
+    └── attention_batch_invariant.py        # Scaled dot-product attention ISA kernel
+```
 
 ## Implications for LLM Inference
 
@@ -138,8 +176,8 @@ Batch invariance ensures that:
 
 ## Future Work
 
-1. **Batch Invariant Attention**: Implement attention mechanisms using ISA operations
-2. **LLM Integration**: Full forward pass comparison with varying batch configurations
+1. ~~**Batch Invariant Attention**: Implement attention mechanisms using ISA operations~~  ✅ Done
+2. ~~**LLM Integration**: Full forward pass comparison with varying batch configurations~~ ✅ Done
 3. **Performance Analysis**: Quantify any performance trade-offs with ISA approach
 4. **Extended Precision Study**: Investigate fp16, int8 behavior
 

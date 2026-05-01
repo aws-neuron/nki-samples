@@ -41,15 +41,17 @@ def nki_matmul_kernel_isa(a, b, deterministic=True):
 
     # ONLY DIFFERENCE: K_TILE strategy (must be ≤128: partition dim constraint on stationary/moving)
     if deterministic:
-        K_TILE = 128  # Always hardcoded — same accumulation count regardless of K
+        K_TILE = min(128, K)  # Always hardcoded — same accumulation count regardless of K
     else:
-        K_TILE = 64   # Smaller tiles → more accumulations → different rounding
+        K_TILE = min(64, K)   # Smaller tiles → more accumulations → different rounding
+
+    assert K % K_TILE == 0, f"K={K} must be divisible by K_TILE={K_TILE}"
 
     result = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
 
     for m in nl.affine_range(M // M_TILE):
         # PSUM always accumulates in float32 regardless of input dtype
-        c_psum = nl.ndarray((M_TILE, N), dtype=nl.float32, buffer=nl.psum)
+        c_psum = nl.zeros((M_TILE, N), dtype=nl.float32, buffer=nl.psum)
 
         for k in nl.affine_range(K // K_TILE):
             a_start = k * K_TILE
