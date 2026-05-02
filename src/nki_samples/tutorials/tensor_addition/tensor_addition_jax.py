@@ -1,5 +1,5 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 JAX implementation for tensor addition NKI tutorial.
 
@@ -16,8 +16,8 @@ from tensor_addition_nki_kernels import nki_tensor_add
 if __name__ == "__main__":
 
   seed_a, seed_b = jax.random.split(jax.random.PRNGKey(42))
-  a = jax.random.uniform(seed_a, (256, 1024), dtype=jnp.bfloat16)
-  b = jax.random.uniform(seed_b, (256, 1024), dtype=jnp.bfloat16)
+  a = jax.random.uniform(seed_a, (256, 1024), dtype=jnp.float32)
+  b = jax.random.uniform(seed_b, (256, 1024), dtype=jnp.float32)
 
   output_nki = nki_tensor_add(a, b)
   print(f"output_nki={output_nki}")

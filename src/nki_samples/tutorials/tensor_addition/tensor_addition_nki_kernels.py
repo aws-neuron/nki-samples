@@ -1,17 +1,16 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 NKI implementation for tensor addition NKI tutorial.
 
 """
-import numpy as np
 # NKI_EXAMPLE_27_BEGIN
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-
+import nki as nki
+import nki.language as nl
+import nki.isa as nisa
 
 @nki.jit
-def nki_tensor_add_kernel_(a_input, b_input):
+def nki_tensor_add(a_input, b_input):
   """NKI kernel to compute element-wise addition of two input tensors
 
   This kernel assumes strict input/output sizes can be uniformly tiled to [128,512]
@@ -23,70 +22,54 @@ def nki_tensor_add_kernel_(a_input, b_input):
   Returns:
       c_output: an output tensor
   """
-  # Create output tensor shared between all SPMD instances as result tensor
+  # Create output tensor shared between all SPMD instances as 
+  # result tensor (uninitialized)
   c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
 
-  # Calculate tile offsets based on current 'program'
-  offset_i_x = nl.program_id(0) * 128
-  offset_i_y = nl.program_id(1) * 512
+  # Extract the dimensions for the a_input shape.
+  M, N = a_input.shape
 
-  # Generate tensor indices to index tensors a and b
-  ix = offset_i_x + nl.arange(128)[:, None]
-  iy = offset_i_y + nl.arange(512)[None, :]
+  # Set the tile dimensions, while the TILE_N is not, strictly speaking, limited to 
+  # 512 for the additiona operation, we stick with this size for simplicity.
+  TILE_M = 128
+  TILE_N = 512
 
-  # Load input data from device memory (HBM) to on-chip memory (SBUF)
-  # We refer to an indexed portion of a tensor as an intermediate tensor
-  a_tile = nl.load(a_input[ix, iy])
-  b_tile = nl.load(b_input[ix, iy])
+  # Check the input sizes match and match the tilable constraint.
+  assert a_input.shape == b_input.shape, \
+    f"Expected shaps {a_input.shape} and {b_input.shape} to match"
+  assert a_input.dtype == b_input.dtype, \
+    f"Expected data types {a_input.dtype} and {b_input.dtype} to match"
+  assert M % TILE_M == 0, \
+    f"Expected partition dimension ({M}) to be divisible by {TILE_M}"
+  assert N % TILE_N == 0, \
+    f"Expected partition dimension ({N}) to be divisible by {TILE_N}"
 
-  # compute a + b
-  c_tile = a_tile + b_tile
+  # Loop over each tile, load the tile, do the addition, and save it back to HBM.
+  for m in nl.affine_range(M // TILE_M):
+    for n in nl.affine_range(N // TILE_N):
+      # Allocte space for the a_tile and b_tile in sbuf (uninitialized)
+      a_tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=a_input.dtype, buffer=nl.sbuf)
+      b_tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=b_input.dtype, buffer=nl.sbuf)
 
-  # store the addition results back to device memory (c_output)
-  nl.store(c_output[ix, iy], value=c_tile)
+      # Load the a_tile and b_tile from HBM into SBUF.
+      nisa.dma_copy(dst=a_tile,
+                    src=a_input[m * TILE_M:(m + 1) * TILE_M,
+                                n * TILE_N:(n + 1) * TILE_N])
+      nisa.dma_copy(dst=b_tile,
+                    src=b_input[m * TILE_M:(m + 1) * TILE_M,
+                                n * TILE_N:(n + 1) * TILE_N])
+
+      # Allocate space for the c_tile in sbuf.
+      c_tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=a_input.dtype, buffer=nl.sbuf)
+
+      # Perform the addition using the element-wise tensor_tensor instruction.
+      nisa.tensor_tensor(dst=c_tile, data1=a_tile, data2=b_tile, op=nl.add)
+
+      # Copy the result to the output tensor.
+      nisa.dma_copy(dst=c_output[m * TILE_M:(m + 1) * TILE_M,
+                                 n * TILE_N:(n + 1) * TILE_N],
+                    src=c_tile)
 
   # Transfer the ownership of `c_output` to the caller
   return c_output
   # NKI_EXAMPLE_27_END
-
-
-# NKI_EXAMPLE_28_BEGIN
-def nki_tensor_add(a_input, b_input):
-  """NKI kernel caller to compute element-wise addition of two input tensors
-
-  This kernel caller lifts tile-size restriction, by applying the kernel on tiles of the inputs/outputs
-
-  Args:
-      a_input: a first input tensor, of shape [N*128, M*512]
-      b_input: a second input tensor, of shape [N*128, M*512]
-
-  Returns:
-      a tensor of shape [N*128, M*512], the result of a_input + b_input
-  """
-
-  # The SPMD launch grid denotes the number of kernel instances.
-  # In this case, we use a 2D grid where the size of each invocation is 128x512
-  grid_x = a_input.shape[0] // 128
-  grid_y = a_input.shape[1] // 512
-
-  return nki_tensor_add_kernel_[grid_x, grid_y](a_input, b_input)
-  # NKI_EXAMPLE_28_END
-
-
-if __name__ == "__main__":
-  a = np.random.rand(256, 1024).astype(np.float16)
-  b = np.random.rand(256, 1024).astype(np.float16)
-
-  output_nki = nki_tensor_add(a, b)
-  print(f"output_nki={output_nki}")
-
-  output_np = a + b
-  print(f"output_np={output_np}")
-
-  allclose = np.allclose(output_np, output_nki, atol=1e-4, rtol=1e-2)
-  if allclose:
-    print("NKI and NumPy match")
-  else:
-    print("NKI and NumPy differ")
-
-  assert allclose

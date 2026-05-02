@@ -1,14 +1,15 @@
 """
-Copyright (C) 2024, Amazon.com. All Rights Reserved
+Copyright (C) 2026, Amazon.com. All Rights Reserved
 
 NKI implementation for average pool 2D NKI tutorial.
 
 """
 import numpy as np
 # NKI_EXAMPLE_37_BEGIN
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-from neuronxcc.nki.typing import tensor
+import nki
+import nki.isa as nisa
+import nki.language as nl
+from nki.typing import tensor
 
 @nki.jit
 def tensor_avgpool_kernel(in_tensor, pool_size):
@@ -34,23 +35,31 @@ def tensor_avgpool_kernel(in_tensor, pool_size):
   sz_p = sz_cin
   sz_pool = pool_size
 
-  # Generate pool index patterns (requires two extra dimensions, for the pool window)
-  i0, i1, i2, i3, i4 = nl.mgrid[0:sz_p, 0:sz_hin//sz_pool, 0:sz_pool, 0:sz_win//sz_pool, 0:sz_pool]
+  # Use an access pattern to create a 5D view of the input:
+  # [sz_p, sz_hout, sz_wout, sz_pool, sz_pool]
+  # The pool dimensions are placed last so we can reduce over them.
 
   # Load input data from external memory to on-chip memory
-  in_tile: tensor[sz_p, sz_hin, sz_win] = nl.load(in_tensor)
+  in_tile = nl.ndarray(in_tensor.shape, dtype=in_tensor.dtype, buffer=nl.sbuf)
+  nisa.dma_copy(dst=in_tile, src=in_tensor)
 
-  # Perform the pooling operation:
-  # We use numpy's advanced indexing, in order to extend in_tile to 5D, and then reduce-average two dimension.
-  # axis[0] is the index for p_dim, and thus doesn't participate in the reduction operation.
-  # axis[1] and axis[2] together index the rows, with axis[2] responsible for inner strides
-  # (i.e. inside a pooling window), and axis[1] responsible for the outer strides. As such, we reduce over axis[2].
-  # Similarly, axis[3] and axis[4] together index the columns, and we thus reduce over axis[4].
-  out_tile : tensor[sz_p, sz_hout, sz_wout] = nl.sum(in_tile[i0, sz_pool*i1+i2, sz_pool*i3+i4],
-                                                     axis=[2,4]) / (pool_size*pool_size)
+  # Perform the pooling operation using an access pattern view:
+  # The .ap() creates a strided 5D view of the 3D input tile,
+  # grouping elements into pool windows for reduction.
+  pool_view = in_tile.ap([
+    [sz_hin * sz_win, sz_p],      # partition stride
+    [sz_pool * sz_win, sz_hin // sz_pool],  # outer row stride
+    [sz_pool, sz_win // sz_pool],            # outer col stride
+    [sz_win, sz_pool],             # inner row stride (within pool window)
+    [1, sz_pool],                  # inner col stride (within pool window)
+  ])
+  sum_tile = nl.sum(pool_view, axis=[3, 4])
+  out_tile = nl.ndarray(sum_tile.shape, dtype=sum_tile.dtype, buffer=nl.sbuf)
+  nisa.tensor_scalar(dst=out_tile, data=sum_tile, op0=nl.multiply,
+                     operand0=1.0 / (pool_size * pool_size))
 
   # Store the results back to hbm
-  nl.store(out_tensor, value=out_tile)
+  nisa.dma_copy(dst=out_tensor, src=out_tile)
 
   # Transfer the ownership of `out_tensor` to the caller
   return out_tensor

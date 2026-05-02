@@ -25,17 +25,6 @@ Documentation for NKI kernels are both inline (docstring) and available on the d
 
 ### src
 
-#### reference
-This folder contains the source code of the `neuronxcc.nki.kernels`, and they are optimized kernels from the Neuron Team serving as samples.
-
-All kernels located in this folder have numeric accuracy tests
-and performance benchmarks defined in the [test](test/) directory. We also demonstrate using these kernels end-to-end in our [integration tests](test/integration/).
-
-Note that these kernels are already being deployed as part of the Neuron stack. With flash attention as an example,
-[compiling Llama models with transformers-neuronx](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/transformers-neuronx/transformers-neuronx-developer-guide.html)
-will automatically invoke the `flash_fwd` kernel in [attention.py](src/nki_samples/reference/attention.py). Therefore, replacing the framework operators with these NKI kernels likely won't result in extra performance benefit.
-
-
 #### tutorials
 The [tutorial kernels](src/nki_samples/tutorials/) are for educational purpose and include the kernels that are used in NKI guides.
 You can clone these sample kernels and run them directly while reading through the
@@ -52,16 +41,6 @@ The [contributed](contributed/) directory contains experimental and advanced NKI
 - Have not been extensively tested across all input configurations
 - Carry no compatibility guarantees
 - Behavior may be modified without prior notice
-
-### test
-
-#### unit
-The [unit tests](test/unit) directory contains unit tests and micro-benchmarks for standalone kernels. They run across multiple possible configurations,
-verify the numeric accuracy of the operation, and publish performance results to the [micro-benchmark](docs/benchmarks/micro-benchmark/) results.
-
-#### integration
-The [integration tests](tests/integration) folder contains integration tests of (selected) kernels. They verify the numeric accuracy of the model’s output,
-and publish end-to-end performance results into the [integration benchmarks](docs/benchmarks/integration) folder.
 
 ## Maintenance Policy
 NKI is currently released as **beta** while we gather feedback from our users and integrate it into the API. NKI API follow the [Neuron SDK Maintenance Policy](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/sdk-policy.html).
