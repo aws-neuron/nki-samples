@@ -55,7 +55,7 @@ import nki.language as nl
 
 
 @nki.jit
-def nki_attention_kernel_isa(q, k, v, deterministic=True):
+def nki_attention_kernel_isa(q, k, v, deterministic=True, attn_bias=None):
     """
     Scaled dot-product attention: out = softmax(Q K^T / sqrt(d)) V
 
@@ -65,6 +65,8 @@ def nki_attention_kernel_isa(q, k, v, deterministic=True):
         v:             [seq_k, d_head]
         deterministic: True  -> KV_TILE=128 in scores@V (batch-invariant)
                        False -> KV_TILE=64  in scores@V (more accumulations)
+        attn_bias:     optional [seq_q, seq_k] float32 HBM tensor added to
+                       QK^T scores before softmax (use -1e9 to mask positions)
 
     Returns:
         out: [seq_q, d_head], same dtype as inputs
@@ -111,8 +113,18 @@ def nki_attention_kernel_isa(q, k, v, deterministic=True):
             nisa.nc_matmul(dst=qk_psum, stationary=q_t, moving=k_t)
             qk_sbuf = nl.ndarray((Q_TILE, KV_TILE_SOFTMAX), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=qk_sbuf, data=qk_psum, op0=nl.multiply, operand0=scale)
-            nisa.dma_copy(dst=scores_sbuf[0:Q_TILE, kv_start:kv_start + KV_TILE_SOFTMAX],
-                          src=qk_sbuf)
+            if attn_bias is not None:
+                bias_tile = nl.ndarray((Q_TILE, KV_TILE_SOFTMAX), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=bias_tile,
+                              src=attn_bias[q_start:q_start + Q_TILE,
+                                            kv_start:kv_start + KV_TILE_SOFTMAX])
+                qk_biased = nl.ndarray((Q_TILE, KV_TILE_SOFTMAX), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(dst=qk_biased, data1=qk_sbuf, data2=bias_tile, op=nl.add)
+                nisa.dma_copy(dst=scores_sbuf[0:Q_TILE, kv_start:kv_start + KV_TILE_SOFTMAX],
+                              src=qk_biased)
+            else:
+                nisa.dma_copy(dst=scores_sbuf[0:Q_TILE, kv_start:kv_start + KV_TILE_SOFTMAX],
+                              src=qk_sbuf)
 
         # ── Row max (fixed KV_TILE_SOFTMAX) ──────────────────────────────────
         row_max = nl.ndarray((Q_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
