@@ -45,6 +45,8 @@ def interpolate_bilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 10) -> Non
     assert c_src == c_dst, "Input channel and output channel sizes must be identical"
     assert h_dst == 2 * h_src, "Output height must be twice the input height"
     assert w_dst == 2 * w_src, "Output width must be twice the input width"
+    assert chunk_size >= 2, "chunk_size must be >= 2 (step_size = chunk_size - 1 must be positive)"
+    assert h_src >= chunk_size, "h_src must be >= chunk_size to form at least one chunk"
     n, c = n_src, c_src
 
     weight_1d = 1 / 4 # specific to scaling_factor=2.0 & align_corners=False

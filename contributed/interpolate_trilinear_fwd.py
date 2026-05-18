@@ -53,6 +53,8 @@ def interpolate_trilinear_2x_fwd(src_arr: nt.tensor, chunk_size: int = 4) -> nt.
     assert d_dst == 2 * d_src, "Output depth must be twice the input depth"
     assert h_dst == 2 * h_src, "Output height must be twice the input height"
     assert w_dst == 2 * w_src, "Output width must be twice the input width"
+    assert chunk_size >= 2, "chunk_size must be >= 2 (step_size = chunk_size - 1 must be positive)"
+    assert d_src >= chunk_size, "d_src must be >= chunk_size to form at least one chunk"
 
     n, c = n_src, c_src
     
