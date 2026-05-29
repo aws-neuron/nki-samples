@@ -22,6 +22,7 @@ def tensor_avgpool_kernel(in_tensor, pool_size):
   Return:
       out_tensor: the resulting output tensor, of shape C x (H/pool_size) x (W/pool_size)
   """
+  ssert pool_size >= 1, "pool_size must be >= 1"
 
   # Get input/output dimensions
   sz_cin, sz_hin, sz_win = in_tensor.shape
