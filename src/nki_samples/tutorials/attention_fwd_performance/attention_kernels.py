@@ -158,7 +158,7 @@ def attn_fwd_v3(q, k, v):
     v_sbuf = nl.load(v)
 
     # Tile along seqlen_q #
-    # for this example we assume that seqlen_q is divisible by PMAX and 
+    # for this example we assume that seqlen_q is divisible by PMAX and
     # seqlen_kv is divisible by FMAX_MOVING, otherwise need to use mask or "final multiplication"
     qk = nl.ndarray((seqlen_q // PMAX, seqlen_kv // FMAX_MOVING, PMAX, FMAX_MOVING),
                      dtype=nl.float32, buffer=nl.shared_hbm)
@@ -166,7 +166,7 @@ def attn_fwd_v3(q, k, v):
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING): # loop on moving_free
             # Q @ K, contract along d_head #
             qk_psum = nl.ndarray((PMAX, FMAX_MOVING), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=qk_psum, 
+            nisa.nc_matmul(dst=qk_psum,
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
             qk_sbuf = nl.ndarray((PMAX, FMAX_MOVING), dtype=nl.float32, buffer=nl.sbuf)
@@ -183,7 +183,7 @@ def attn_fwd_v3(q, k, v):
             qk_tile = nl.ndarray((PMAX, FMAX_MOVING), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=qk_tile, src=qk[i_tile_q, i_tile_kv, :, :])
             nisa.tensor_reduce(dst=row_max_kv[:, nl.ds(i_tile_kv, 1)], op=nl.maximum, data=qk_tile, axis=(1,))
- 
+
         nisa.tensor_reduce(dst=row_max[:, nl.ds(i_tile_q, 1)], op=nl.maximum, data=row_max_kv[:, :], axis=(1,))
 
     # subtract max from row
@@ -194,7 +194,7 @@ def attn_fwd_v3(q, k, v):
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
             qk_tile_sub = nl.ndarray((PMAX, FMAX_MOVING), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=qk_tile_sub, src=qk[i_tile_q, i_tile_kv, :, :])
-            nisa.tensor_scalar(dst=norm_buf[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.tensor_scalar(dst=norm_buf[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 data=qk_tile_sub,
                 op0=nl.subtract,
                 operand0=row_max[:, nl.ds(i_tile_q, 1)])
@@ -220,7 +220,7 @@ def attn_fwd_v3(q, k, v):
     # reciprocal of sum_row, tile shape is [PMAX, seqlen_q // PMAX]
     inverse_sum_row = nl.ndarray(sum_row.shape, dtype=nl.float32, buffer=nl.sbuf)
     nisa.reciprocal(dst=inverse_sum_row, data=sum_row)
-    
+ 
     scores = nl.ndarray((seqlen_q // PMAX, PMAX, seqlen_kv), dtype=nl.float32, buffer=nl.shared_hbm)
     for i_tile_q in nl.affine_range(seqlen_q // PMAX):
         scores_buf = nl.ndarray(shape=(PMAX, seqlen_kv), dtype=nl.float32, buffer=nl.sbuf)
@@ -229,7 +229,7 @@ def attn_fwd_v3(q, k, v):
                                                op0=nl.multiply,
                                                operand0=inverse_sum_row[:, i_tile_q])
         nl.store(scores[i_tile_q], scores_buf[:,:])
-        
+
     # v has the wrong layout
     v_t = nl.ndarray((seqlen_kv // PMAX, PMAX, d_head), dtype=nl.float32, buffer=nl.shared_hbm)
     for i_tile_kv in nl.affine_range(seqlen_kv // PMAX):
@@ -273,8 +273,8 @@ def attn_fwd_v3(q, k, v):
 
 ####################################################################
 # v4: Loop fusion
-# combines QK matrix multiplication, all softmax steps, and V 
-# multiplication to compute attention scores & output under one 
+# combines QK matrix multiplication, all softmax steps, and V
+# multiplication to compute attention scores & output under one
 # common loop.
 ####################################################################
 @nki.jit
@@ -316,7 +316,7 @@ def attn_fwd_v4(q, k, v):
 
         for i_tile_kv in range(num_kv_tiles): # loop on moving_free
             # Q @ K, contract along d_head #
-            nisa.nc_matmul(dst=qk_tiles[i_tile_kv], 
+            nisa.nc_matmul(dst=qk_tiles[i_tile_kv],
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
@@ -334,7 +334,7 @@ def attn_fwd_v4(q, k, v):
         norm_row = nl.ndarray((PMAX, seqlen_kv),
                             dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in range(num_kv_tiles):
-            nisa.tensor_scalar(dst=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.tensor_scalar(dst=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 data=qk_tiles[i_tile_kv],
                 op0=nl.subtract,
                 operand0=row_max)
@@ -342,13 +342,13 @@ def attn_fwd_v4(q, k, v):
         # exponentiation
         exp_row = nl.ndarray((PMAX, seqlen_kv), dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op=nl.exp, data=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
         # sum of exp results
         sum_row_kv = nl.ndarray((PMAX, seqlen_kv // FMAX_MOVING), dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-            nisa.tensor_reduce(dst=sum_row_kv[:, nl.ds(i_tile_kv, 1)], 
+            nisa.tensor_reduce(dst=sum_row_kv[:, nl.ds(i_tile_kv, 1)],
                 op=nl.add,
                 data=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], axis=(1,))
 
@@ -363,7 +363,7 @@ def attn_fwd_v4(q, k, v):
 
         scores = nl.ndarray((PMAX, seqlen_kv), dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-            nisa.tensor_scalar(dst=scores[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.tensor_scalar(dst=scores[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 data=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op0=nl.multiply,
                 operand0=inverse_sum_row)
@@ -432,7 +432,7 @@ def attn_fwd_v5(q, k, v):
 
         for i_tile_kv in range(num_kv_tiles): # loop on moving_free
             # Q @ K, contract along d_head #
-            nisa.nc_matmul(dst=qk_tiles[i_tile_kv], 
+            nisa.nc_matmul(dst=qk_tiles[i_tile_kv],
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
@@ -450,7 +450,7 @@ def attn_fwd_v5(q, k, v):
         norm_row = nl.ndarray((PMAX, seqlen_kv),
                             dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in range(num_kv_tiles):
-            nisa.tensor_scalar(dst=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.tensor_scalar(dst=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 data=qk_tiles[i_tile_kv],
                 op0=nl.subtract,
                 operand0=row_max)
@@ -458,13 +458,13 @@ def attn_fwd_v5(q, k, v):
         # exponentiation
         exp_row = nl.ndarray((PMAX, seqlen_kv), dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op=nl.exp, data=norm_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
         # sum of exp results
         sum_row_kv = nl.ndarray((PMAX, seqlen_kv // FMAX_MOVING), dtype=nl.float32, buffer=nl.sbuf)
         for i_tile_kv in nl.affine_range(seqlen_kv // FMAX_MOVING):
-            nisa.tensor_reduce(dst=sum_row_kv[:, nl.ds(i_tile_kv, 1)], 
+            nisa.tensor_reduce(dst=sum_row_kv[:, nl.ds(i_tile_kv, 1)],
                 op=nl.add,
                 data=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], axis=(1,))
 
@@ -496,7 +496,7 @@ def attn_fwd_v5(q, k, v):
                                             moving=v_sbuf_t[:, i_tile_kv, :])
 
         # notice how here the division is done on the final attention output
-        # directly comparing to the previous implementation, we save on having to 
+        # directly comparing to the previous implementation, we save on having to
         # loop all the i_tile_kvs, meaning we do less divsion operations as our
         # attention block is already collapsed.
         nisa.tensor_scalar(dst=attn_out, data=attn_out_psum, op0=nl.multiply,
@@ -548,7 +548,7 @@ def attn_fwd_v6(q, k, v):
 
         for i_tile_kv in range(num_kv_tiles): # loop on moving_free
             # Q @ K, contract along d_head #
-            nisa.nc_matmul(dst=qk_tiles[i_tile_kv], 
+            nisa.nc_matmul(dst=qk_tiles[i_tile_kv],
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
@@ -566,14 +566,14 @@ def attn_fwd_v6(q, k, v):
         exp_row = nl.ndarray((PMAX, seqlen_kv),
                             dtype=nl.float32, buffer=nl.sbuf)
         sum_row_tiles = nl.ndarray((PMAX, num_kv_tiles), dtype=nl.float32, buffer=nl.sbuf)
-        
+
         # We leverage scalar engine's hardware capability of applying reduce after activation
-        # with no extra performance cost to compute the max_val subtraction and sum reduction 
+        # with no extra performance cost to compute the max_val subtraction and sum reduction
         # in one step, saving on extra loops that were previously required.
         #
         # At the same time the vector engine is freed up from compute, giving it more idle time
         for i_tile_kv in range(num_kv_tiles):
-            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op=nl.exp,
                 data=qk_tiles[i_tile_kv],
                 bias=row_max,
@@ -661,7 +661,7 @@ def attn_fwd_v7(q, k, v):
 
         for i_tile_kv in range(num_kv_tiles): # loop on moving_free
             # Q @ K, contract along d_head #
-            nisa.nc_matmul(dst=qk_tiles[i_tile_kv], 
+            nisa.nc_matmul(dst=qk_tiles[i_tile_kv],
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
@@ -681,7 +681,7 @@ def attn_fwd_v7(q, k, v):
         sum_row_tiles = nl.ndarray((PMAX, num_kv_tiles), dtype=nl.float32, buffer=nl.sbuf)
 
         for i_tile_kv in range(num_kv_tiles):
-            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op=nl.exp,
                 data=qk_tiles[i_tile_kv],
                 bias=row_max,
@@ -727,8 +727,8 @@ def attn_fwd_v7(q, k, v):
 # v8: Use tensor_scalar_reduce on VectorE
 # In short, this evicts PSUM earlier allowing other Q@K tiles
 # to potentially be computed, freeing up the tensor engine to do
-# compute. This does lead to a slowdown compared to the v7 kernel, 
-# which is the fastest attention kernel we have thus far, but it 
+# compute. This does lead to a slowdown compared to the v7 kernel,
+# which is the fastest attention kernel we have thus far, but it
 # sets us up for software-pipelining and manual allocation, which
 # should outweight the cost penalty.
 ####################################################################
@@ -770,7 +770,7 @@ def attn_fwd_v8(q, k, v):
 
         for i_tile_kv in range(num_kv_tiles): # loop on moving_free
             # Q @ K, contract along d_head #
-            nisa.nc_matmul(dst=qk_tiles[i_tile_kv], 
+            nisa.nc_matmul(dst=qk_tiles[i_tile_kv],
                 stationary=q_sbuf[0:PMAX, nl.ds(i_tile_q*FMAX_STATIONARY, FMAX_STATIONARY)],
                 moving=k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)])
 
@@ -787,7 +787,7 @@ def attn_fwd_v8(q, k, v):
             nisa.tensor_copy(dst=qk_tile_sb, src=qk_tiles[i_tile_kv])
             nisa.tensor_scalar_reduce(dst=qk_sbuf[:, i_tile_kv, :], data=qk_tile_sb, op0=nl.multiply, operand0=1.0,
                                                                     reduce_op=nl.maximum, reduce_res=row_max_kv[:, nl.ds(i_tile_kv, 1)])
-                                                                    
+
         nisa.tensor_reduce(dst=row_max[:, :], op=nl.maximum, data=row_max_kv[:, :], axis=(1,), negate=True)
 
         # subtract max from row
@@ -796,7 +796,7 @@ def attn_fwd_v8(q, k, v):
         sum_row_tiles = nl.ndarray((PMAX, num_kv_tiles), dtype=nl.float32, buffer=nl.sbuf)
 
         for i_tile_kv in range(num_kv_tiles):
-            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], 
+            nisa.activation(dst=exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
                 op=nl.exp,
                 data=qk_tiles[i_tile_kv],
                 bias=row_max,
@@ -929,3 +929,206 @@ def attn_fwd_v8a(q, k, v):
         nl.store(dst=kernel_out[nl.ds(i_tile_q*PMAX, PMAX), :], value=attn_out)
 
     return kernel_out
+
+class MemManager(nl.NKIObject):
+    def __init__(self, start=0):
+        self.offset = start
+
+    def get_dtype_size(self, dtype):
+        if dtype == nl.float32:
+            return 4
+        elif dtype == nl.bfloat16:
+            return 2
+        else:
+            assert False, f"Unsupported dtype: {dtype}"
+
+    def alloc_sbuf(self, shape, dtype=nl.bfloat16, alignment=32):
+        address = self.offset
+        free_elems = 1
+        for d in shape[1:]:
+            free_elems *= d
+        size_bytes = free_elems * self.get_dtype_size(dtype)
+        self.offset += size_bytes
+        self.offset = ((self.offset + alignment - 1) // alignment) * alignment
+        return nl.ndarray(shape, dtype=dtype, buffer=nl.sbuf, address=(0, address))
+
+    def alloc_psum_bank(self, bank_idx, size, dtype=nl.float32):
+        PMAX = nl.tile_size.pmax
+        PSUM_BANK_SIZE = 2048
+        return nl.ndarray(
+            (PMAX, size),
+            dtype=dtype,
+            buffer=nl.psum,
+            address=(0, bank_idx * PSUM_BANK_SIZE),
+        )
+
+class AttnInternalConfigs(nl.NKIObject):
+    num_tile_q = None
+
+class AttnInternalBuffers(nl.NKIObject):
+    q_sbuf = None
+    k_sbuf = None
+    v_sbuf = None
+    v_sbuf_t = None
+    v_psum_t = None
+    qk_sbuf = None
+    row_max_kv = None
+    row_max = None
+    exp_row = None
+    sum_row_tiles = None
+    sum_row = None
+    inverse_sum_row = None
+    scores_sbuf_t = None
+    attn_out = None
+    attn_out_sbuf = None
+    qk_psum = None
+    attn_out_psum = None
+    kernel_out = None
+
+def qk_max_2xbuf(i_tile_q, configs, bufs):
+    if (i_tile_q < 0 or i_tile_q > configs.num_tile_q -1):
+        return
+    # Note: QK and max are working on tile i_tile_q+2, while PV is working on tile i_tile_q
+    PMAX = configs.PMAX
+    FMAX_MOVING = configs.FMAX_MOVING
+    q_2xbuf_idx = i_tile_q % 2
+    for i_tile_kv in nl.static_range(configs.seqlen_kv // FMAX_MOVING):
+        # QK psum banks wrap around at 7 since we reserve one psum bank for PV matmul 
+        qk_psum_bank = i_tile_kv % 7
+        # Q @ K, contract along d_head
+        nisa.nc_matmul(
+                dst=bufs.qk_psum[:, nl.ds(qk_psum_bank*FMAX_MOVING, FMAX_MOVING)],
+                stationary=bufs.q_sbuf[0:PMAX, nl.ds(i_tile_q*PMAX, PMAX)],
+                moving=bufs.k_sbuf[0:PMAX, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)], accumulate=False)
+
+        # Softmax, reduce max along seqlen_k
+        nisa.tensor_scalar_reduce(dst=bufs.qk_sbuf[:, q_2xbuf_idx, i_tile_kv, :],
+                                  data=bufs.qk_psum[:, nl.ds(qk_psum_bank*FMAX_MOVING, FMAX_MOVING)],
+                                  op0=nl.multiply,
+                                  operand0=1.0,
+                                  reduce_op=nl.maximum,
+                                  reduce_res=bufs.row_max_kv[:, i_tile_kv])
+
+    nisa.tensor_reduce(dst=bufs.row_max[:, :], op=nl.maximum, data=bufs.row_max_kv[:, :], axis=1, negate=True)
+
+# subtract max from row
+def exp_row_sum(i_tile_q, configs, bufs):
+    if (i_tile_q < 0 or i_tile_q > configs.num_tile_q -1):
+        return
+    PMAX = configs.PMAX
+    FMAX_MOVING = configs.FMAX_MOVING
+    q_2xbuf_idx = i_tile_q % 2
+    for i_tile_kv in nl.static_range(configs.seqlen_kv // FMAX_MOVING):
+        nisa.activation(
+            dst=bufs.exp_row[:, nl.ds(i_tile_kv*FMAX_MOVING, FMAX_MOVING)],
+            op=nl.exp,
+            data=bufs.qk_sbuf[:, q_2xbuf_idx, i_tile_kv, :],
+            bias=bufs.row_max[:, :],
+            reduce_op=nl.add,
+            reduce_res=bufs.sum_row_tiles[:, q_2xbuf_idx, i_tile_kv],
+            reduce_cmd=nisa.reduce_cmd.reset_reduce,
+            )
+
+# scores has the wrong layout
+def transpose_scores(i_tile_q, configs, bufs):
+    if (i_tile_q < 0 or i_tile_q > configs.num_tile_q -1):
+        return
+    PMAX = configs.PMAX
+    for i_tile_kv in nl.static_range(configs.seqlen_kv // PMAX):
+        nisa.dma_transpose(dst=bufs.scores_sbuf_t[:, i_tile_kv, :], src=bufs.exp_row[:, nl.ds(i_tile_kv*PMAX, PMAX)], axes=(1, 0))
+
+# scores @ V, contract along seqlen_kv
+def pv_matmul(i_tile_q, configs, bufs):
+    if (i_tile_q < 0 or i_tile_q > configs.num_tile_q - 1):
+        return
+    PMAX = configs.PMAX
+    for i_tile_kv in nl.static_range(configs.seqlen_kv // PMAX):
+        nisa.nc_matmul(dst=bufs.attn_out_psum[:, :],
+                       stationary=bufs.scores_sbuf_t[:, i_tile_kv, :],
+                       moving=bufs.v_sbuf_t[:, i_tile_kv, :],
+                       accumulate=(i_tile_kv != 0))
+    nisa.tensor_copy(dst=bufs.attn_out_sbuf[:, :], src=bufs.attn_out_psum[:, :], engine=nisa.vector_engine)
+
+def write_back(i_tile_q, configs, bufs):
+    if (i_tile_q < 0 or i_tile_q > configs.num_tile_q -1):
+        return
+    PMAX = configs.PMAX
+    q_2xbuf_idx = i_tile_q % 2
+    nisa.tensor_reduce(dst=bufs.sum_row[:, :], op=nl.add, data=bufs.sum_row_tiles[:, q_2xbuf_idx, :], axis=1)
+
+    # reciprocal of sum_row [seqlen_q, 1]
+    nisa.reciprocal(dst=bufs.inverse_sum_row[:, :], data=bufs.sum_row[:, :])
+
+    nisa.tensor_scalar(dst=bufs.attn_out[:, :], data=bufs.attn_out_sbuf[:, :], op0=nl.multiply,
+                                    operand0=bufs.inverse_sum_row[:, :], engine=nisa.vector_engine)
+
+    # store output
+    nl.store(dst=bufs.kernel_out[nl.ds(i_tile_q*PMAX, PMAX), :], value=bufs.attn_out[:, :])
+
+####################################################################
+# v10: alloc & software pipelining scheduling
+####################################################################
+@nki.jit
+def attn_fwd_v10(q, k, v):
+    d_head, seqlen_q = q.shape
+    seqlen_kv = seqlen_q
+
+    PMAX = nl.tile_size.pmax
+    FMAX_MOVING = nl.tile_size.gemm_moving_fmax
+
+    #assert q.shape == k.shape == v.shape
+    assert d_head == PMAX
+    assert seqlen_q >= 512
+
+    mem = MemManager()
+    bufs = AttnInternalBuffers()
+    configs = AttnInternalConfigs()
+    configs.seqlen_kv = seqlen_kv
+    configs.num_tile_q = seqlen_q // PMAX
+    configs.PMAX = PMAX
+    configs.FMAX_MOVING = FMAX_MOVING
+
+    bufs.kernel_out = nl.ndarray((seqlen_q, d_head), dtype=q.dtype, buffer=nl.shared_hbm)
+
+    bufs.q_sbuf = mem.alloc_sbuf((d_head, seqlen_q), dtype=q.dtype)
+    bufs.k_sbuf = mem.alloc_sbuf((d_head, seqlen_kv), dtype=k.dtype)
+    bufs.v_sbuf = mem.alloc_sbuf((d_head, seqlen_kv), dtype=v.dtype)
+
+    # load inputs into SBUF:
+    nisa.dma_copy(dst=bufs.q_sbuf, src=q)
+    nisa.dma_copy(dst=bufs.k_sbuf, src=k)
+    nisa.dma_copy(dst=bufs.v_sbuf, src=v)
+
+    # v has the wrong layout, so need to transpose it
+    bufs.v_sbuf_t = mem.alloc_sbuf((PMAX, seqlen_kv // PMAX, PMAX), dtype=nl.bfloat16)
+    bufs.v_psum_t = mem.alloc_psum_bank(0, seqlen_kv, dtype=bufs.v_sbuf.dtype)
+    for i_tile_kv in nl.affine_range(seqlen_kv // PMAX):
+        nisa.nc_transpose(dst=bufs.v_psum_t[:, nl.ds(i_tile_kv*PMAX, PMAX)], data=bufs.v_sbuf[:, nl.ds(i_tile_kv*PMAX, PMAX)])
+        nisa.tensor_copy(dst=bufs.v_sbuf_t[:, i_tile_kv, :], src=bufs.v_psum_t[:, nl.ds(i_tile_kv*PMAX, PMAX)])
+
+    # SBUF allocations
+    bufs.qk_sbuf = mem.alloc_sbuf((PMAX, 2, seqlen_kv // FMAX_MOVING, FMAX_MOVING), dtype=nl.float32)
+    bufs.row_max_kv = mem.alloc_sbuf((PMAX, seqlen_kv // FMAX_MOVING), dtype=nl.float32)
+    bufs.row_max = mem.alloc_sbuf((PMAX, 1), dtype=nl.float32)
+    bufs.exp_row = mem.alloc_sbuf((PMAX, seqlen_kv), dtype=nl.bfloat16)
+    bufs.sum_row_tiles = mem.alloc_sbuf((PMAX, 2, seqlen_kv // FMAX_MOVING), dtype=nl.float32)
+    bufs.sum_row = mem.alloc_sbuf((PMAX, 1), dtype=nl.float32)
+    bufs.inverse_sum_row = mem.alloc_sbuf((PMAX, 1), dtype=nl.float32)
+    bufs.scores_sbuf_t = mem.alloc_sbuf((PMAX, seqlen_kv // PMAX, PMAX), dtype=nl.bfloat16)
+    bufs.attn_out = mem.alloc_sbuf((PMAX, PMAX), dtype=nl.float32)
+    bufs.attn_out_sbuf = mem.alloc_sbuf((PMAX, PMAX), dtype=nl.float32)
+
+    # PSUM allocations
+    bufs.qk_psum = mem.alloc_psum_bank(0, 7*FMAX_MOVING)
+    bufs.attn_out_psum = mem.alloc_psum_bank(7, PMAX)
+
+    # Tile along seqlen_q
+    with nl.no_reorder():
+        for i_tile_q in nl.sequential_range(0, configs.num_tile_q + 2):
+            exp_row_sum(i_tile_q-1, configs, bufs)
+            qk_max_2xbuf(i_tile_q, configs, bufs)
+            pv_matmul(i_tile_q-2, configs, bufs)
+            transpose_scores(i_tile_q-1, configs, bufs)
+            write_back(i_tile_q-2, configs, bufs)
+
+    return bufs.kernel_out
