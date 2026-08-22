@@ -27,10 +27,10 @@ Status:
 import math
 import numpy as np
 
-import neuronxcc.nki as nki
+import nki
 # nisa - Neuron Instruction Set Architecture. This is the low-level API to Neuron hardware.
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.language as nl
+import nki.isa as nisa
+import nki.language as nl
 
 # =====================================================================
 # Milestone A: single-head, single-tile decode (MHA).
@@ -86,22 +86,26 @@ def decode_attention_fwd(q, k, v, softmax_scale=None):
     # and is meant to hold tensor-engine matmul outputs, so the recommended practice is 
     # to evict to SBUF as soon as possible and free the bank for the next matmul. 
     # nc_matmul already accumulates in fp32; keeping it fp32 here keeps the softmax numerically stable.
-    qk_sbuf = nisa.tensor_copy(qk_psum, dtype=nl.float32)
+    qk_sbuf = nl.ndarray(qk_psum.shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(qk_sbuf, qk_psum)
 
-    # (seqlen_q, seqlen_kv) = (1, seqlen_kv); tensor_scalar returns the scaled tile
-    qk_scaled = nisa.tensor_scalar(qk_sbuf, op0=nl.multiply, operand0=softmax_scale)
+    # (seqlen_q, seqlen_kv) = (1, seqlen_kv); tensor_scalar writes the scaled tile
+    qk_scaled = nl.ndarray(qk_sbuf.shape, dtype=qk_sbuf.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(qk_scaled, qk_sbuf, op0=nl.multiply, operand0=softmax_scale)
 
     # softmax over seqlen_kv (the cached tokens). Reduce along axis=1 with keepdims
     # collapses seqlen_kv -> 1, so row_max has shape (seqlen_q, 1) = (1, 1).
     row_max = nl.max(qk_scaled, axis=1, keepdims=True)      # find max (stability)
-    norm = nisa.tensor_scalar(qk_scaled, op0=nl.subtract, operand0=row_max)   # subtract max
+    norm = nl.ndarray(qk_scaled.shape, dtype=qk_scaled.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(norm, qk_scaled, op0=nl.subtract, operand0=row_max)   # subtract max
 
     # softmax(x) = exp(x) / Σexp(x); scores = softmax(qk_scaled)
     exp_row = nl.exp(norm)                                 # exponentiate [seqlen_q, seqlen_kv]
     sum_row = nl.sum(exp_row, axis=1, keepdims=True)       # denominator [seqlen_q, 1]
     inv_sum = nl.reciprocal(sum_row)                 # 1 / denominator
 
-    scores = nisa.tensor_scalar(exp_row, op0=nl.multiply, operand0=inv_sum)
+    scores = nl.ndarray(exp_row.shape, dtype=exp_row.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(scores, exp_row, op0=nl.multiply, operand0=inv_sum)
 
     # output = Σⱼ scoreⱼ · vⱼ
     v_t_psum = nl.transpose(v_sbuf)           # (d, N) -> (seqlen_kv, d) = [N, d]
@@ -109,13 +113,16 @@ def decode_attention_fwd(q, k, v, softmax_scale=None):
     # nl.transpose runs on the Tensor Engine, so its result lands in PSUM. 
     # nc_matmul must read its inputs from SBUF, so we evacuate the transposed result 
     # from PSUM to SBUF before the final matmul. Hence, tensor_copy.
-    v_t = nisa.tensor_copy(v_t_psum, dtype=v_sbuf.dtype)
+    v_t = nl.ndarray(v_t_psum.shape, dtype=v_sbuf.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(v_t, v_t_psum)
 
     scores_t_psum = nl.transpose(scores)           # [seqlen_kv, seqlen_q]
-    scores_t = nisa.tensor_copy(scores_t_psum, dtype=nl.float32)
+    scores_t = nl.ndarray(scores_t_psum.shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(scores_t, scores_t_psum)
 
     attn_psum = nl.matmul(scores_t, v_t, transpose_x=True)        # [seqlen_q, d] = (1, d)
-    attn_sbuf = nisa.tensor_copy(attn_psum, dtype=q.dtype)      # PSUM -> SBUF
+    attn_sbuf = nl.ndarray(attn_psum.shape, dtype=q.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(attn_sbuf, attn_psum)      # PSUM -> SBUF
 
     nl.store(out, value=attn_sbuf)      # copy output from SBUF -> HBM
     return out
@@ -196,8 +203,10 @@ def decode_attention_gqa_fwd(q, k, v, n_q_heads, n_kv_heads, softmax_scale=None)
             # logits  qk = scale * (q_groupᵀ @ k_tile)
             # contract over d (the partition axis) -> [group, TILE_KV]
             qk_psum = nl.matmul(q_group, k_tile, transpose_x=True)    # PSUM [group, TILE_KV]
-            qk = nisa.tensor_copy(qk_psum, dtype=nl.float32)          # PSUM -> SBUF
-            qk = nisa.tensor_scalar(qk, op0=nl.multiply, operand0=softmax_scale)
+            qk_unscaled = nl.ndarray(qk_psum.shape, dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(qk_unscaled, qk_psum)                    # PSUM -> SBUF
+            qk = nl.ndarray(qk_unscaled.shape, dtype=qk_unscaled.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(qk, qk_unscaled, op0=nl.multiply, operand0=softmax_scale)
 
             # online-softmax update
             tile_max = nl.max(qk, axis=1, keepdims=True)             # [group, 1] max logit in THIS tile per query head
@@ -209,32 +218,39 @@ def decode_attention_gqa_fwd(q, k, v, n_q_heads, n_kv_heads, softmax_scale=None)
             #   exp(logit - m_old) * exp(m_old - m_new) => exp(logit - m_new)
             # Always in (0, 1] because m_new >= m_old, so the exponent is always <= 0.
             # First tile: m_old = -inf -> rebase_factor = 0 (wipes the empty state cleanly).
-            rebase_exp_in = nisa.tensor_scalar(m_state, op0=nl.subtract, operand0=new_m)
+            rebase_exp_in = nl.ndarray(m_state.shape, dtype=m_state.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(rebase_exp_in, m_state, op0=nl.subtract, operand0=new_m)
             rebase_factor = nl.exp(rebase_exp_in)
 
             # p = exp(qk - new_m); new_m (a per-row scalar) broadcasts on the free axis
-            norm = nisa.tensor_scalar(qk, op0=nl.subtract, operand0=new_m)
+            norm = nl.ndarray(qk.shape, dtype=qk.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(norm, qk, op0=nl.subtract, operand0=new_m)
             p = nl.exp(norm)                                         # [group, TILE_KV]
             tile_l = nl.sum(p, axis=1, keepdims=True)               # [group,1]
 
             # l_state = l_state*rebase_factor + tile_l    (the denominator)
-            l_scaled = nisa.tensor_scalar(l_state, op0=nl.multiply, operand0=rebase_factor)
+            l_scaled = nl.ndarray(l_state.shape, dtype=l_state.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(l_scaled, l_state, op0=nl.multiply, operand0=rebase_factor)
             new_l = nl.add(l_scaled, tile_l)                        # [group,1]
 
             # P @ V, contracting over TILE_KV
             # the contraction axis must sit on partition, so transpose both
             # operands to [TILE_KV, *] and evacuate (PSUM can't feed a matmul).
             p_t_psum = nl.transpose(p)                              # PSUM [TILE_KV, group]
-            p_t = nisa.tensor_copy(p_t_psum, dtype=nl.float32)
+            p_t = nl.ndarray(p_t_psum.shape, dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(p_t, p_t_psum)
 
             v_t_psum = nl.transpose(v_tile)                        # PSUM [TILE_KV, d]
-            v_t = nisa.tensor_copy(v_t_psum, dtype=v_tile.dtype)
+            v_t = nl.ndarray(v_t_psum.shape, dtype=v_tile.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(v_t, v_t_psum)
 
             pv_psum = nl.matmul(p_t, v_t, transpose_x=True)        # PSUM [group, d]
-            pv = nisa.tensor_copy(pv_psum, dtype=nl.float32)
+            pv = nl.ndarray(pv_psum.shape, dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(pv, pv_psum)
 
             # fold this tile into the accumulator: acc = acc*rebase_factor + pv
-            acc_scaled = nisa.tensor_scalar(acc, op0=nl.multiply, operand0=rebase_factor)
+            acc_scaled = nl.ndarray(acc.shape, dtype=acc.dtype, buffer=nl.sbuf)
+            nisa.tensor_scalar(acc_scaled, acc, op0=nl.multiply, operand0=rebase_factor)
             new_acc = nl.add(acc_scaled, pv)                       # [group, d]
 
             # commit the loop-carried state in place (all olds were read above).
@@ -244,7 +260,8 @@ def decode_attention_gqa_fwd(q, k, v, n_q_heads, n_kv_heads, softmax_scale=None)
 
         # finalize this group: o = acc / l
         inv_l = nl.reciprocal(l_state)               # [group, 1]
-        o_group = nisa.tensor_scalar(acc, op0=nl.multiply, operand0=inv_l, dtype=q.dtype)
+        o_group = nl.ndarray(acc.shape, dtype=q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(o_group, acc, op0=nl.multiply, operand0=inv_l)
 
         nl.store(out[i_kv * group:(i_kv + 1) * group, :], value=o_group)
 
