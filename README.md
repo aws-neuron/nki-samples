@@ -5,7 +5,7 @@ purpose built for AI workloads.
 At the core of the Neuron SDK is the Neuron Compiler, which takes computation graphs from frameworks like PyTorch and JAX and converts
 them into highly optimized machine code.
 
-[NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki) is a Python-based programming environment designed for the compiler which
+[NKI](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/) is a Python-based programming environment designed for the compiler which
 adopts commonly used NumPy and Triton-like syntax along with tile-level semantics.
 NKI also interoperates with the Neuron Profiler, providing insights into performance bottlenecks and instruction latencies.
 It offers tensor printing support, standard error messaging, and built-in kernel simulation capabilities for efficient debugging purposes.
@@ -14,8 +14,6 @@ NKI Language ([nki.language](https://awsdocs-neuron.readthedocs-hosted.com/en/la
 NKI Instruction Set Architecture ([nki.isa](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/nki.isa.html)),
 enabling bare-metal access to the chip for full control.
 
-![alt "High-level flow of NKI in the Neuron Compiler. NKI emits IR immediately before the backend-IR compilation stage"](doc_assets/high-level-nki-flow.png#center "High-Level NKI Flow")
-
 ## Documentation
 The latest NKI documentation can be found on the AWS Documentation site, [here](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/).
 Documentation for NKI kernels are both inline (docstring) and available on the documentation site's
@@ -23,9 +21,7 @@ Documentation for NKI kernels are both inline (docstring) and available on the d
 
 ## Repository Structure
 
-### src
-
-#### tutorials
+### src/nki_samples/tutorials
 The [tutorial kernels](src/nki_samples/tutorials/) are for educational purpose and include the kernels that are used in NKI guides.
 You can clone these sample kernels and run them directly while reading through the
 [NKI documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/tutorials.html). These kernels are not necessarily high-performance,

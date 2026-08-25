@@ -34,12 +34,18 @@ def numpy_attention(q, k, v):
 ####################################################################
 # Test each attention kernel version
 ####################################################################
-def test_attn_version(version, seqlen=1024):
+from ml_dtypes import bfloat16
+def test_attn_version(version, seqlen=1024, bf16_inputs=False):
     d_head = 128
     np.random.seed(42)
-    q = np.random.rand(d_head, seqlen).astype(np.float32)
-    k = np.random.rand(d_head, seqlen).astype(np.float32)
-    v = np.random.rand(d_head, seqlen).astype(np.float32)
+    if bf16_inputs:
+        q = np.random.rand(d_head, seqlen).astype(bfloat16)
+        k = np.random.rand(d_head, seqlen).astype(bfloat16)
+        v = np.random.rand(d_head, seqlen).astype(bfloat16)
+    else:
+        q = np.random.rand(d_head, seqlen).astype(np.float32)
+        k = np.random.rand(d_head, seqlen).astype(np.float32)
+        v = np.random.rand(d_head, seqlen).astype(np.float32)
 
     numpy_output = numpy_attention(q, k, v)
     attn_out = np.array(version(q, k, v))
@@ -55,6 +61,8 @@ if __name__ == "__main__":
     for v in [attn_fwd_v3, attn_fwd_v4, attn_fwd_v5, attn_fwd_v6,
               attn_fwd_v7, attn_fwd_v8, attn_fwd_v8a]:
         results.append(test_attn_version(v, seqlen=1024))
+    for v in [attn_fwd_v10]:
+        results.append(test_attn_version(v, seqlen=4096, bf16_inputs=True))
 
     passed = sum(results)
     total = len(results)
