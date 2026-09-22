@@ -154,7 +154,7 @@ def kernel_copy_strided_quantize_matmul_mx(stationary_hbm, moving_hbm, mx_dtype,
   MAX_TILE_N = nl.tile_size.gemm_moving_fmax  # 512  
 
   # Ensure input tensors are in HBM.
-  assert stationary_hbm.buffer == moving_hbm.buffer == nl.hbm
+  assert stationary_hbm.buffer == moving_hbm.buffer and stationary_hbm.buffer in (nl.hbm, nl.shared_hbm)
 
   # Sanity check the shapes. We expect contraction dimension of the unquantized tile to be 4x.
   assert stationary_hbm.shape == (MAX_TILE_K*4, MAX_TILE_M)
@@ -216,7 +216,7 @@ def kernel_copy_strided_quantize_matmul_mx_packed_scale(stationary_hbm, moving_h
   MAX_TILE_N = nl.tile_size.gemm_moving_fmax  # 512  
 
   # Ensure input tensors are in HBM.
-  assert stationary_hbm.buffer == moving_hbm.buffer == nl.hbm
+  assert stationary_hbm.buffer == moving_hbm.buffer and stationary_hbm.buffer in (nl.hbm, nl.shared_hbm)
 
   # Sanity check the shapes. We expect contraction dimension of the unquantized tile to be 4x.
   assert stationary_hbm.shape == (MAX_TILE_K*4, MAX_TILE_M)
