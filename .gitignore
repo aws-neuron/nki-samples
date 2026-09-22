@@ -4,3 +4,5 @@ doc/_apidoc
 doc/generated
 __pycache__
 venv
+*.neff
+*.ntff
