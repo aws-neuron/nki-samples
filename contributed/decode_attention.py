@@ -21,9 +21,7 @@ Validation:
    - No latency numbers here. Timing a plain kernel(*args) call measures the
      compiler rather than the kernel: on NKI 0.6.0 the standalone path re-runs
      the frontend on every invocation, ~1.5 s per call on Inf2.
-     Latency lives in decode_attention_benchmark.py, which compiles once
-     through the parser frontend and replays the NEFF. It needs a device;
-     the checks here do not, which is why the two are separate files.
+     A compile-once benchmark is a separate change.
 
    Requires NKI 0.6.0 or newer (Neuron SDK 2.32+). Earlier releases exposed
    nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone now;
