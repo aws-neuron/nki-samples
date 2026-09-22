@@ -215,7 +215,12 @@ def decode_attention_gqa_fwd(q, k, v, n_q_heads, n_kv_heads, softmax_scale=None)
 
     # One KV head at a time; its 'group' query heads ride together on the free axis 
     # so the shared K/V tile is loaded ONCE per group.
-    for i_kv in nl.affine_range(n_kv_heads):
+    # Plain builtin range: on NKI 0.6.0 nl.affine_range / nl.sequential_range /
+    # nl.static_range are deprecated aliases whose backend implementations all
+    # `return range(start, stop, step)` verbatim, so the name carries no meaning
+    # to the compiler. Iterations here are independent anyway: each gets its own
+    # softmax state and touches disjoint slices of q and out.
+    for i_kv in range(n_kv_heads):
         # grouping the query heads: slice grabs the group w.r.t. n_kv_heads, then load from HBM -> SBUF.
         q_group = nl.load(q[:, i_kv * group:(i_kv + 1) * group])
 
@@ -227,8 +232,9 @@ def decode_attention_gqa_fwd(q, k, v, n_q_heads, n_kv_heads, softmax_scale=None)
         
         l_state = nl.zeros((group, 1), dtype=nl.float32, buffer=nl.sbuf)        # running sum of exp(logits - m) -> denominator (normalizer)
 
-        # sequential_range cuz tile i_t depends on tile i_t-1's (m, l, acc).
-        for i_t in nl.sequential_range(num_tiles):
+        # Order matters here: tile i_t reads tile i_t-1's (m, l, acc). The loop is
+        # unrolled in program order, which is what keeps the carried state correct.
+        for i_t in range(num_tiles):
             kv_lo = i_t * TILE_KV
 
             k_tile = nl.load(k[i_kv, :, kv_lo:kv_lo + TILE_KV])   # [d, TILE_KV] since NKI wants d on the partition axis
