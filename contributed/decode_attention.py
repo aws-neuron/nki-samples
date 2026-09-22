@@ -11,9 +11,30 @@ adds grouped-query attention (GQA) so query heads sharing a KV head also share i
 
 Author: Varun (varuntej.dev@gmail.com)
 
+Validation:
+   - Numerics are checked against the NumPy references in this file, via
+     check_correct / check_correct_gqa. The same checks run two ways:
+     on CPU through nki.simulate, which needs no device, and on a NeuronDevice
+     by calling the kernel directly.
+   - Validated on Trn2 during upstream review of #129, and on Inf2
+     (NeuronCore-v2) by the on-device path added here.
+   - No latency numbers here. Timing a plain kernel(*args) call measures the
+     compiler rather than the kernel: on NKI 0.6.0 the standalone path re-runs
+     the frontend on every invocation, ~1.5 s per call on Inf2.
+     A compile-once benchmark is a separate change.
+
+   Requires NKI 0.6.0 or newer (Neuron SDK 2.32+). Earlier releases exposed
+   nki.simulate_kernel / nki.baremetal / nki.benchmark, which are gone now;
+   the neuronxcc.nki versions that remain cannot drive a top-level @nki.jit kernel.
+
+   Inputs are fp32. bf16 does not compile on NeuronCore-v2, because the
+   tensor engine requires an fp32 matmul destination there and nl.matmul
+   takes its destination dtype from the operands. See BF16_SUPPORTED.
+
+   Run `python decode_attention.py` for the numeric checks; the backend is
+   auto-detected, so it simulates on a machine with no Neuron device.
+
 WARNING: These kernels:
-   - Are validated against a NumPy reference via nki.simulate_kernel,
-     not yet on Neuron hardware
    - Have not been tested across all input configurations
    - Carry no compatibility guarantees
    - May change without prior notice
@@ -24,13 +45,24 @@ Status:
    - [C] planned: flash-decoding split-KV for long context
 
 """
+import argparse
 import math
+import os
+import sys
+
 import numpy as np
 
 import nki
 # nisa - Neuron Instruction Set Architecture. This is the low-level API to Neuron hardware.
 import nki.isa as nisa
 import nki.language as nl
+
+# bf16 inputs need ml_dtypes for the NumPy side.
+# Optional: without it the file still runs, it just skips the bf16 cases.
+try:
+    from ml_dtypes import bfloat16
+except ImportError:
+    bfloat16 = None
 
 # =====================================================================
 # Milestone A: single-head, single-tile decode (MHA).
@@ -311,72 +343,217 @@ def numpy_decode_gqa_reference(q, k_cache, v_cache, n_q_heads, n_kv_heads, scale
 
 
 # =====================================================================
-# Local correctness check: runs on CPU via nki.simulate_kernel (no device).
-# On a real Neuron instance, swap to:
-#   out = nki.baremetal()(decode_attention_fwd)(q_t, k_t, v_t, scale)
+# Test harness.
 # =====================================================================
-def check_correct():
-    np.random.seed(42)
-    d, seqlen_kv = 128, 128
+# Two ways to run a kernel:
+#
+#   simulate   nki.simulate(kernel)(*args)   CPU, no device. Real outputs. Slow.
+#   device     kernel(*args)                 NeuronDevice. Real outputs.
+#
+# On NKI 0.6.0 a @nki.jit kernel called with numpy arrays
+# "compiles and executes standalone, without a framework" (nki.jit's own docstring),
+# so a plain call IS the on-device path. That is why nki.baremetal no longer exists.
+# nki.simulate_kernel is gone the same way, replaced by nki.simulate.
+#
+# Note for anyone porting older NKI samples: nki.baremetal, nki.benchmark and
+# nki.simulate_kernel still exist under the deprecated neuronxcc.nki namespace,
+# but they cannot drive a kernel decorated with the current top-level @nki.jit.
+# They raise AttributeError: 'Kernel' object has no attribute 'grid',
+# because they expect the older TraceKernel object.
+#
+# There is deliberately no latency benchmark here. The standalone path
+# recompiles on every call: nki/framework/compiled.py passes enable_cache=False
+# to compile_kernel_to_nir, so timing kernel(*args) measures the compiler, not
+# the kernel. Measured that way a decode step over a 1 MB cache "takes" ~1.5 s
+# steady state (~10 s on the first call), against tens of microseconds of
+# actual kernel time.
+#
+# A compile-once benchmark is possible. It goes through the parser frontend,
+# ParserFrontend().compile() -> CompiledKernel.from_frontend() -> CompiledKernel.benchmark(),
+# which is the path @nki.jit itself takes. Note that nki.compiler.kernel_builder.compile_kernel
+# is NOT that path: it is a separate authoring API whose kernel arguments arrive as TileViews,
+# so a kernel written against nl/nisa cannot be compiled by it. Benchmarks are a
+# separate change rather than a silently wrong column in this one.
+
+# bf16 inputs do not compile on NeuronCore-v2 (gen2: inf2, trn1).
+# nl.matmul infers its PSUM destination dtype from the operands,
+# and the tensor engine rejects a non-fp32 matmul destination on gen2:
+#
+#   `nc_matmul dst dtype must be float32 on gen2, got bfloat16`
+#
+# Fixing it means replacing nl.matmul with an explicit fp32 PSUM tile plus nisa.nc_matmul
+# at all four matmul sites, and passing dtype=nl.float32 to nl.transpose at the
+# four transpose sites, since a transpose also runs on the tensor engine.
+# That is a change to the kernels
+# rather than to this harness, so it is left for a follow-up. gen3 (trn2) appears to accept a
+# bf16 destination, which is why upstream review on Trn2 never hit this.
+BF16_SUPPORTED = False
+
+
+def _dtype_name(dtype):
+    return np.dtype(dtype).name
+
+
+def _quantize(x, dtype):
+    """Round fp32 data to the kernel's input dtype, then back to fp32.
+
+    The kernel gets the low-precision values; the NumPy reference gets the
+    *same* values widened back to fp32. That isolates what we actually want
+    to measure (kernel error given low-precision inputs) from NumPy's own
+    low-precision arithmetic, which is a different question.
+    """
+    narrowed = x.astype(dtype)
+    return narrowed, narrowed.astype(np.float32)
+
+
+def _make_mha_inputs(d=128, seqlen_kv=128, dtype=np.float32, seed=42):
+    """Build inputs for decode_attention_fwd. Returns (args, ref, meta)."""
+    rng = np.random.default_rng(seed)
     scale = 1.0 / math.sqrt(d)
 
-    # natural-layout random inputs (where the numbers come from is irrelevant)
-    q = np.random.randn(d).astype(np.float32)
-    k_cache = np.random.randn(seqlen_kv, d).astype(np.float32)
-    v_cache = np.random.randn(seqlen_kv, d).astype(np.float32)
+    q = rng.standard_normal(d).astype(np.float32)
+    k_cache = rng.standard_normal((seqlen_kv, d)).astype(np.float32)
+    v_cache = rng.standard_normal((seqlen_kv, d)).astype(np.float32)
 
-    ref = numpy_decode_reference(q, k_cache, v_cache, scale)        # (d,)
+    q, q_ref = _quantize(q, dtype)
+    k_cache, k_ref = _quantize(k_cache, dtype)
+    v_cache, v_ref = _quantize(v_cache, dtype)
 
-    # kernel layout: d on the partition axis -> transpose K, V
-    q_t = q.reshape(d, 1).astype(np.float32)                       # (d, 1)
-    k_t = np.ascontiguousarray(k_cache.T)                         # (d, seqlen_kv)
-    v_t = np.ascontiguousarray(v_cache.T)                         # (d, seqlen_kv)
+    ref = numpy_decode_reference(q_ref, k_ref, v_ref, scale)        # (d,)
 
-    out = nki.simulate_kernel(decode_attention_fwd, q_t, k_t, v_t, scale)
-    out = np.asarray(out).reshape(-1)                             # (d,)
+    # kernel layout: d on the partition axis -> transpose K, V.
+    # ascontiguousarray is load-bearing: nl.load slices assume a C-contiguous
+    # HBM tensor in exactly this layout, and a bare .T is only a view.
+    q_t = q.reshape(d, 1)                                          # (d, 1)
+    k_t = np.ascontiguousarray(k_cache.T)                          # (d, seqlen_kv)
+    v_t = np.ascontiguousarray(v_cache.T)                          # (d, seqlen_kv)
+
+    meta = dict(kernel="mha", d=d, seqlen_kv=seqlen_kv, n_q_heads=1,
+                n_kv_heads=1, group=1, dtype=dtype)
+    return (q_t, k_t, v_t, scale), ref, meta
+
+
+def _make_gqa_inputs(d=128, seqlen_kv=512, n_q_heads=8, n_kv_heads=2,
+                     dtype=np.float32, seed=42):
+    """Build inputs for decode_attention_gqa_fwd. Returns (args, ref, meta)."""
+    rng = np.random.default_rng(seed)
+    scale = 1.0 / math.sqrt(d)
+
+    q = rng.standard_normal((n_q_heads, d)).astype(np.float32)
+    k_cache = rng.standard_normal((n_kv_heads, seqlen_kv, d)).astype(np.float32)
+    v_cache = rng.standard_normal((n_kv_heads, seqlen_kv, d)).astype(np.float32)
+
+    q, q_ref = _quantize(q, dtype)
+    k_cache, k_ref = _quantize(k_cache, dtype)
+    v_cache, v_ref = _quantize(v_cache, dtype)
+
+    ref = numpy_decode_gqa_reference(q_ref, k_ref, v_ref,
+                                     n_q_heads, n_kv_heads, scale)
+
+    # kernel layout: d on the partition axis -> move d to the front.
+    q_t = np.ascontiguousarray(q.T)                                # (d, n_q_heads)
+    k_t = np.ascontiguousarray(k_cache.transpose(0, 2, 1))         # (n_kv, d, seqlen_kv)
+    v_t = np.ascontiguousarray(v_cache.transpose(0, 2, 1))         # (n_kv, d, seqlen_kv)
+
+    meta = dict(kernel="gqa", d=d, seqlen_kv=seqlen_kv, n_q_heads=n_q_heads,
+                n_kv_heads=n_kv_heads, group=n_q_heads // n_kv_heads, dtype=dtype)
+    return (q_t, k_t, v_t, n_q_heads, n_kv_heads, scale), ref, meta
+
+
+def _run(kernel, args, backend="simulate"):
+    """Run kernel(*args) and return its output as an ndarray."""
+    if backend == "simulate":
+        return np.asarray(nki.simulate(kernel)(*args))
+    if backend == "baremetal":
+        # A plain call is the on-device path on NKI 0.6.0. See the note at
+        # the top of this section.
+        return np.asarray(kernel(*args))
+    raise ValueError(f"unknown backend: {backend!r}")
+
+
+def _check_dtypes():
+    """Which input dtypes this host can actually run, and why if fewer."""
+    if not BF16_SUPPORTED:
+        print("note: bf16 skipped. nl.matmul cannot target a non-fp32 PSUM "
+              "destination on gen2 (inf2/trn1). See BF16_SUPPORTED.")
+    elif bfloat16 is None:
+        print("note: bf16 skipped, ml_dtypes not installed "
+              "(pip install ml_dtypes).")
+    else:
+        return [np.float32, bfloat16]
+    return [np.float32]
+
+
+def check_correct(backend="simulate", dtype=np.float32, d=128, seqlen_kv=128):
+    """Milestone A: single head, single KV tile."""
+    args, ref, _ = _make_mha_inputs(d=d, seqlen_kv=seqlen_kv, dtype=dtype)
+    out = _run(decode_attention_fwd, args, backend=backend)
+    out = out.reshape(-1).astype(np.float32)                       # (d,)
 
     max_diff = float(np.abs(out - ref).max())
     ok = np.allclose(out, ref, atol=1e-2, rtol=1e-2)
-    print(f"[check_correct] d={d} seqlen_kv={seqlen_kv}  max|diff|={max_diff:.3e}")
-    print("PASS" if ok else "FAIL")
+    print(f"[check_correct] {backend:9s} {_dtype_name(dtype):8s} "
+          f"d={d} seqlen_kv={seqlen_kv} max|diff|={max_diff:.3e}  "
+          f"{'PASS' if ok else 'FAIL'}")
     return ok
 
 
-def check_correct_gqa():
-    np.random.seed(42)
-    d = 128
-    seqlen_kv = 512                  # 4 tiles of TILE_KV=128 -> exercises online softmax
-    n_q_heads, n_kv_heads = 8, 2     # group = 4 (real GQA). Try (4, 4) for group=1 first.
-    scale = 1.0 / math.sqrt(d)
+def check_correct_gqa(backend="simulate", dtype=np.float32, d=128,
+                      seqlen_kv=512, n_q_heads=8, n_kv_heads=2):
+    """Milestone B: KV tiling + online softmax + GQA.
 
-    # natural-layout random inputs
-    q = np.random.randn(n_q_heads, d).astype(np.float32)
-    k_cache = np.random.randn(n_kv_heads, seqlen_kv, d).astype(np.float32)
-    v_cache = np.random.randn(n_kv_heads, seqlen_kv, d).astype(np.float32)
-
-    ref = numpy_decode_gqa_reference(q, k_cache, v_cache, n_q_heads, n_kv_heads, scale)
-
-    # kernel layout: d on the partition axis -> move d to the front
-    q_t = np.ascontiguousarray(q.T)                          # (d, n_q_heads)
-    k_t = np.ascontiguousarray(k_cache.transpose(0, 2, 1))   # (n_kv_heads, d, seqlen_kv)
-    v_t = np.ascontiguousarray(v_cache.transpose(0, 2, 1))   # (n_kv_heads, d, seqlen_kv)
-
-    out = nki.simulate_kernel(decode_attention_gqa_fwd, q_t, k_t, v_t, n_q_heads, n_kv_heads, scale)
-    out = np.asarray(out)            # (n_q_heads, d)
+    seqlen_kv=512 is four TILE_KV tiles, so the online-softmax rescale path
+    actually runs. group=4 makes it real GQA rather than the degenerate case.
+    """
+    args, ref, meta = _make_gqa_inputs(d=d,
+                                       seqlen_kv=seqlen_kv,
+                                       n_q_heads=n_q_heads,
+                                       n_kv_heads=n_kv_heads,
+                                       dtype=dtype
+                                       )
+    out = _run(decode_attention_gqa_fwd, args, backend=backend)
+    out = out.astype(np.float32)                                   # (n_q_heads, d)
 
     max_diff = float(np.abs(out - ref).max())
     ok = np.allclose(out, ref, atol=1e-2, rtol=1e-2)
-    print(f"[check_correct_gqa] d={d} seqlen_kv={seqlen_kv} "
-          f"group={n_q_heads // n_kv_heads}  max|diff|={max_diff:.3e}")
-    print("PASS" if ok else "FAIL")
     
+    print(f"[check_correct_gqa] {backend:9s} {_dtype_name(dtype):8s} "
+          f"d={d} seqlen_kv={seqlen_kv} group={meta['group']}  "
+          f"max|diff|={max_diff:.3e}  {'PASS' if ok else 'FAIL'}")
     return ok
 
 
-def main():
-    check_correct()        # Milestone A
-    check_correct_gqa()    # Milestone B
+def check_all(backend="simulate"):
+    """Both kernels, every input dtype this host supports."""
+    results = []
+    for dtype in _check_dtypes():
+        results.append(check_correct(backend=backend, dtype=dtype))
+        results.append(check_correct_gqa(backend=backend, dtype=dtype))
+
+    print(f"\n{sum(results)}/{len(results)} checks passed")
+    return all(results)
+
+
+# =====================================================================
+
+def _auto_backend():
+    """Use the device if there is one, otherwise fall back to CPU simulation,
+    so `python decode_attention.py` does the right thing either way."""
+    return "baremetal" if os.path.exists("/dev/neuron0") else "simulate"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Decode (flash-decoding) attention kernels: correctness checks.")
+
+    parser.add_argument("--backend",
+                        choices=("simulate", "baremetal"),
+                        default=None,
+                        help="default: baremetal if a Neuron device is present")
+    args = parser.parse_args(argv)
+
+    return 0 if check_all(backend=args.backend or _auto_backend()) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
