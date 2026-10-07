@@ -9,7 +9,7 @@ from mx_cpu_utils import generate_stabilized_mx_data, nc_matmul_mx_golden, quant
 from mx_kernels import kernel_offline_quantized_mx_matmul, kernel_on_device_quantize_matmul_mx, kernel_copy_strided_quantize_matmul_mx, kernel_copy_strided_quantize_matmul_mx_packed_scale
 
 # Global compiler flags
-NEURON_CC_BASE_FLAGS = " --target trn3 --pipeline compile SaveTemps --internal-compiler-debug-mode=all --internal-backend-options='--print-format=json,condensed' "
+NEURON_CC_BASE_FLAGS = " --target trn3 --logical-nc-config=1 --pipeline compile SaveTemps --internal-compiler-debug-mode=all --internal-backend-options='--print-format=json,condensed' "
 
 device = None
 cpu = None
