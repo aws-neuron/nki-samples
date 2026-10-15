@@ -412,7 +412,7 @@ def nki_matmul_fully_optimized_(
         block_n = []
         for bn_idx in range(TILES_IN_BLOCK_N):
           # Create the result tile (uninitialized)
-          tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=lhsT.dtype, buffer=nl.sbuf)
+          tile = nl.ndarray(shape=(TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
           # Initialize the tile 0.0
           nisa.memset(dst=tile, value=0.0)
           # Append the tile to block_n array.
